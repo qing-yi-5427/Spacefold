@@ -13,7 +13,7 @@ class Counters(ctypes.Structure):
     _fields_=[('cb',ctypes.c_ulong),('faults',ctypes.c_ulong)]+[(name,ctypes.c_size_t) for name in ('peakWorkingSet','workingSet','peakPaged','paged','peakNonPaged','nonPaged','pagefile','peakPagefile','private')]
 class IoCounters(ctypes.Structure):
     _fields_=[(name,ctypes.c_ulonglong) for name in ('readOperations','writeOperations','otherOperations','readBytes','writeBytes','otherBytes')]
-def run(name,command,report=None,database=None):
+def run(name,command,report=None,database=None,completion_expected=None):
     start=time.perf_counter();first=None;first_report=None;output=bytearray();samples=[];peak=0;wal_peak=0;wal_observed=False
     startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
     process=subprocess.Popen([str(v) for v in command],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,startupinfo=startup)
@@ -37,11 +37,32 @@ def run(name,command,report=None,database=None):
             samples.append({'seconds':round(time.perf_counter()-start,4),'rssBytes':rss})
         except psutil.Error:pass
         time.sleep(.01)
-    reader.join();elapsed=time.perf_counter()-start;counter=Counters();counter.cb=ctypes.sizeof(counter)
-    if report is not None and first_report is None and report.exists() and report.stat().st_size>0:first_report=elapsed
+    reader.join();process_exit_elapsed=time.perf_counter()-start
+    text=output.decode('utf-8',errors='replace')
+    completion={'verified':process.returncode==0,'processExited':True}
+    wal_after_exit=None
+    if database is not None:
+        wal=Path(str(database)+'-wal');wal_after_exit=wal.stat().st_size if wal.exists() else 0
+        completion.update({'walBytesAfterExit':wal_after_exit,'immutableMainOnly':True})
+        try:
+            scan=json.loads(text.strip().splitlines()[-1])['scan']
+            with closing(sqlite3.connect(database.as_uri()+'?mode=ro&immutable=1',uri=True)) as db:
+                state=db.execute('SELECT status,discovered,error_count,finished FROM scans WHERE id=?',(scan['scanId'],)).fetchone()
+                node_count=db.execute('SELECT COUNT(*) FROM nodes WHERE scan_id=?',(scan['scanId'],)).fetchone()[0]
+                root=db.execute('SELECT logical_total,file_count,dir_count,incomplete FROM nodes WHERE scan_id=? AND id=1',(scan['scanId'],)).fetchone()
+            completion.update({'mainScanState':state,'mainNodeCount':node_count,'mainRoot':root})
+            exp=completion_expected
+            completion['verified']=bool(completion['verified'] and wal_after_exit==0 and state and state[0]=='completed' and state[1]==exp['entriesExcludingRoot']+1 and state[2]==0 and state[3] and node_count==exp['entriesExcludingRoot']+1 and root==(int(exp['logicalBytes']),exp['files'],exp['directories'],0))
+        except (sqlite3.Error,KeyError,ValueError,TypeError) as error:
+            completion.update({'verified':False,'error':str(error)})
+    if report is not None:
+        completion['reportBytes']=report.stat().st_size if report.exists() else 0
+        completion['verified']=completion['verified'] and completion['reportBytes']>0
+        if first_report is None and completion['reportBytes']>0:first_report=process_exit_elapsed
+    elapsed=time.perf_counter()-start;counter=Counters();counter.cb=ctypes.sizeof(counter)
     ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.c_void_p(int(process._handle)),ctypes.byref(counter),ctypes.sizeof(counter))
-    text=output.decode('utf-8',errors='replace');(OUT/f'{name}.log').write_text(text,encoding='utf-8')
-    result={'name':name,'command':[str(v) for v in command],'exitCode':process.returncode,'elapsedSeconds':round(elapsed,4),'firstOutputSeconds':None if first is None else round(first,4),'firstNonemptyReportSeconds':None if first_report is None else round(first_report,4),'peakParentWorkingSetBytes':counter.peakWorkingSet,'peakSampledProcessTreeWorkingSetBytes':peak,'sampleIntervalMs':10,'samples':samples}
+    (OUT/f'{name}.log').write_text(text,encoding='utf-8')
+    result={'name':name,'command':[str(v) for v in command],'exitCode':process.returncode,'elapsedSeconds':round(elapsed,4),'gateElapsedSeconds':round(elapsed,4),'processExitElapsedSeconds':round(process_exit_elapsed,4),'completionAuditElapsedMs':round((elapsed-process_exit_elapsed)*1000,3),'completionAudit':completion,'firstOutputSeconds':None if first is None else round(first,4),'firstNonemptyReportSeconds':None if first_report is None else round(first_report,4),'peakParentWorkingSetBytes':counter.peakWorkingSet,'peakSampledProcessTreeWorkingSetBytes':peak,'sampleIntervalMs':10,'samples':samples}
     handle=ctypes.c_void_p(int(process._handle));created=ctypes.c_ulonglong();exited=ctypes.c_ulonglong();kernel=ctypes.c_ulonglong();user=ctypes.c_ulonglong()
     if ctypes.windll.kernel32.GetProcessTimes(handle,ctypes.byref(created),ctypes.byref(exited),ctypes.byref(kernel),ctypes.byref(user)):
         result.update({'parentKernelCpuSeconds':kernel.value/10000000,'parentUserCpuSeconds':user.value/10000000,'parentTotalCpuSeconds':(kernel.value+user.value)/10000000})
@@ -49,7 +70,7 @@ def run(name,command,report=None,database=None):
     if ctypes.windll.kernel32.GetProcessIoCounters(handle,ctypes.byref(io)):
         result['parentOsReportedIo']={field:getattr(io,field) for field,_ in IoCounters._fields_}
         result['ioBoundary']='OS parent-process counters, not physical device bytes; all children remain in sampled process-tree memory.'
-    if database is not None:result.update({'peakSampledWalBytes':wal_peak if wal_observed else None,'walSampledPeakIsLowerBound':True,'walBytesAfterExit':Path(str(database)+'-wal').stat().st_size if Path(str(database)+'-wal').exists() else 0})
+    if database is not None:result.update({'peakSampledWalBytes':wal_peak if wal_observed else None,'walSampledPeakIsLowerBound':True,'walBytesAfterExit':wal_after_exit})
     (OUT/f'{name}.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     assert process.returncode==0,(name,text[:1000])
     return result,text
@@ -188,7 +209,7 @@ for dataset,source in sources.items():
             elif tool=='spacefold-kernel':command=[SF,'kernel',source]
             elif tool=='spacefold-old-sqlite':command=[args.comparison_probe,'scan',data,source]
             else:command=[SF,'scan',data,source]
-            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None,data/'spacefold.sqlite3' if tool in ('spacefold-sqlite','spacefold-old-sqlite') else None);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
+            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None,data/'spacefold.sqlite3' if tool in ('spacefold-sqlite','spacefold-old-sqlite') else None,exp);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
             if tool=='gdu-summary':assert int(re.search(r'^\s*(\d+)',text).group(1))==int(exp['logicalBytes'])
             elif tool=='gdu-full-tree':
                 doc=json.loads(report.read_text(encoding='utf-8'));assert doc[3][0]['asize']==int(exp['logicalBytes']);assert count_gdu(doc)==exp['entriesExcludingRoot']+1
@@ -211,7 +232,7 @@ for dataset,source in sources.items():
                 if 'firstResultElapsedMs' in doc:result['firstResultElapsedMs']=doc['firstResultElapsedMs']
                 if 'elapsedMs' in doc:result['internalElapsedMs']=doc['elapsedMs']
             result['correctnessVerified']=True;result.pop('samples',None);all_results.append(result)
-            (OUT/'results.json').write_text(json.dumps({'cachePolicy':'Prepared fixture plus expected reference walk; natural warm caches, no cache flushing or security changes. Rotated order per round.','ordinaryUserToken':True,'rounds':args.rounds,'externalPollingIntervalMs':10,'probeTerminalPollingIntervalMs':50,'timingBoundary':'Process launch through exit and output reader completion; independent correctness read excluded, persistence and indexed terminal state included.','fingerprints':fingerprints,'results':all_results},indent=2),encoding='utf-8')
+            (OUT/'results.json').write_text(json.dumps({'cachePolicy':'Prepared fixture plus expected reference walk; natural warm caches, no cache flushing or security changes. Rotated order per round.','ordinaryUserToken':True,'rounds':args.rounds,'externalPollingIntervalMs':10,'probeTerminalPollingIntervalMs':50,'timingBoundary':'Gate includes process launch, exit/stdout join, and minimal immutable main-only completion or completed-report existence audit. Process-exit elapsed stored separately. Full-tree correctness read excluded. No checkpoint repair performed.','fingerprints':fingerprints,'results':all_results},indent=2),encoding='utf-8')
             print(json.dumps({k:v for k,v in result.items() if k not in ('command','expected')},ensure_ascii=False),flush=True)
         if dataset=='small100k' and round_index==1 and {'windirstat-full-tree','spacefold-sqlite'}<=set(tools):
             early={tool:statistics.median(r['elapsedSeconds'] for r in all_results if r['dataset']==dataset and r['tool']==tool) for tool in ('windirstat-full-tree','spacefold-sqlite')}
@@ -227,4 +248,5 @@ for dataset in sources:
     summary[dataset]={tool:{'medianSeconds':statistics.median(r['elapsedSeconds'] for r in all_results if r['dataset']==dataset and r['tool']==tool),'roundsSeconds':[r['elapsedSeconds'] for r in all_results if r['dataset']==dataset and r['tool']==tool]} for tool in tools}
 (OUT/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
 assert fingerprints=={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in executables},'Executable changed during benchmark'
+assert all(result['completionAudit']['verified'] for result in all_results),'Completion boundary failed; keep every raw run, entire group fails without replacing individual rounds'
 
