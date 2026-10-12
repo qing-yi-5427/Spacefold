@@ -14,6 +14,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 default = ["desktop"]
 desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:arboard"]
 custom-protocol = ["tauri/custom-protocol"]
+scan-reference = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -914,6 +914,133 @@ pub fn insert_node_shallow(
 ) -> Result<()> {
     insert_node_inner(tx, scan_id, id, parent, path, depth, m, error, false)
 }
+
+#[derive(Default)]
+pub struct InsertTimings {
+    pub encode_ms: f64,
+    pub sql_ms: f64,
+    pub pending_ms: f64,
+}
+
+/// Complete derived fields, prepared without SQLite ownership. Raw UTF-16 is
+/// unchanged; the display and search strings remain separate from that path.
+pub struct EncodedNode {
+    raw_path: Vec<u8>,
+    payload: String,
+    name: String,
+    extension: String,
+    display_path: String,
+}
+impl EncodedNode {
+    pub fn bytes(&self) -> usize {
+        self.raw_path.capacity()
+            + self.payload.capacity()
+            + self.name.capacity()
+            + self.extension.capacity()
+            + self.display_path.capacity()
+    }
+}
+pub fn encode_node(path: &Path, m: &platform::Metadata) -> Result<EncodedNode> {
+    Ok(EncodedNode {
+        raw_path: platform::encode_path(path),
+        payload: serde_json::to_string(&TinyPayload::from_meta(m))?,
+        name: path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| platform::display(path)),
+        extension: if m.kind == "file" {
+            path.extension()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        display_path: platform::display(path),
+    })
+}
+
+/// A batch owns its prepared statements until every row has been bound. This
+/// avoids a cache lookup/reset and return for every discovered file, while
+/// retaining the same columns, constraints, indexes and transaction boundary.
+pub struct NodeInserter<'a> {
+    insert: rusqlite::CachedStatement<'a>,
+    pending: rusqlite::CachedStatement<'a>,
+    pub timings: Option<InsertTimings>,
+}
+impl<'a> NodeInserter<'a> {
+    pub fn new(tx: &'a Transaction<'_>, profile: bool) -> Result<Self> {
+        Ok(Self {
+            insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,?15,?16,?17)")?,
+            pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES(?1,?2,?3,?4)")?,
+            timings: profile.then(InsertTimings::default),
+        })
+    }
+    #[allow(clippy::too_many_arguments)] // The persisted node's column contract.
+    pub fn insert(
+        &mut self,
+        scan_id: &str,
+        id: i64,
+        parent: Option<i64>,
+        path: &Path,
+        depth: u32,
+        m: &platform::Metadata,
+        error: Option<&AppError>,
+    ) -> Result<()> {
+        let started = self.timings.as_ref().map(|_| std::time::Instant::now());
+        let encoded = encode_node(path, m)?;
+        if let (Some(timings), Some(started)) = (&mut self.timings, started) {
+            timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        self.insert_encoded(scan_id, id, parent, depth, m, error, &encoded)
+    }
+    #[allow(clippy::too_many_arguments)] // Same persisted node, precomputed fields.
+    pub fn insert_encoded(
+        &mut self,
+        scan_id: &str,
+        id: i64,
+        parent: Option<i64>,
+        depth: u32,
+        m: &platform::Metadata,
+        error: Option<&AppError>,
+        encoded: &EncodedNode,
+    ) -> Result<()> {
+        let logical = integer(m.logical)?;
+        let allocated = m.allocated.map(integer).transpose()?.unwrap_or(0);
+        let isfile = m.kind == "file";
+        let started = self.timings.as_ref().map(|_| std::time::Instant::now());
+        self.insert.execute(params![
+            scan_id,
+            id,
+            parent,
+            encoded.raw_path,
+            encoded.payload,
+            encoded.name,
+            m.kind,
+            encoded.extension,
+            depth,
+            m.modified,
+            logical,
+            allocated,
+            m.allocated.is_none(),
+            isfile,
+            error.map(|e| &e.code),
+            encoded.display_path,
+            m.recurse || error.is_some()
+        ])?;
+        if let (Some(timings), Some(started)) = (&mut self.timings, started) {
+            timings.sql_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        if m.recurse {
+            let started = self.timings.as_ref().map(|_| std::time::Instant::now());
+            self.pending
+                .execute(params![scan_id, id, encoded.raw_path, depth])?;
+            if let (Some(timings), Some(started)) = (&mut self.timings, started) {
+                timings.pending_ms += started.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        Ok(())
+    }
+}
 #[allow(clippy::too_many_arguments)] // Independently checked integer aggregates.
 pub fn aggregate_batch(
     tx: &Transaction<'_>,
@@ -953,19 +1080,9 @@ fn insert_node_inner(
     let logical = integer(m.logical)?;
     let allocated = m.allocated.map(integer).transpose()?.unwrap_or(0);
     let isfile = m.kind == "file";
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| platform::display(path));
-    let extension = if isfile {
-        path.extension()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let payload = serde_json::to_string(&TinyPayload::from_meta(m))?;
-    tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,?15,?16,?17)")?.execute(params![scan_id,id,parent,platform::encode_path(path),payload,name,m.kind,extension,depth,m.modified,logical,allocated,m.allocated.is_none(),isfile,error.map(|e|&e.code),platform::display(path),m.recurse||error.is_some()])?;
+    let mut inserter = NodeInserter::new(tx, false)?;
+    inserter.insert(scan_id, id, parent, path, depth, m, error)?;
+    drop(inserter);
     if aggregate {
         if let Some(parent) = parent {
             let parents = Repository::ancestors_conn(tx, scan_id, id)?;
@@ -986,12 +1103,6 @@ fn insert_node_inner(
         tx.execute(
             "UPDATE scans SET discovered=discovered+1 WHERE id=?1",
             [scan_id],
-        )?;
-    }
-    if m.recurse {
-        tx.execute(
-            "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES(?1,?2,?3,?4)",
-            params![scan_id, id, platform::encode_path(path), depth],
         )?;
     }
     Ok(())

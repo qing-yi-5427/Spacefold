@@ -35,6 +35,29 @@ fn run() -> Result<()> {
     }
     let service = Service::new(&PathBuf::from(&args[1]))?;
     match args[0].as_str() {
+        #[cfg(feature = "scan-reference")]
+        "scan-reference" => {
+            let elapsed = Instant::now();
+            let root = platform::absolute(&PathBuf::from(
+                args.get(2)
+                    .ok_or_else(|| AppError::new("USAGE", "SOURCE required"))?,
+            ))?;
+            let id = service.repo.new_scan_id()?;
+            service.repo.insert_scan(&id, &root, false)?;
+            let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+            let scan = spacefold_lib::scan_reference::scan_sync(&service, &id, &root, &job)?;
+            output(
+                serde_json::json!({"scan":scan,"elapsedMs":elapsed.elapsed().as_millis(),"mode":"test_only_synchronous_reference"}),
+            );
+        }
+        "storage" => {
+            let c = service.repo.connect()?;
+            let mut statement = c.prepare("SELECT name,COUNT(*),SUM(pgsize),SUM(payload),SUM(unused) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC")?;
+            let tables = statement.query_map([], |row| Ok(serde_json::json!({"name":row.get::<_,String>(0)?,"pages":row.get::<_,i64>(1)?,"bytes":row.get::<_,i64>(2)?,"payloadBytes":row.get::<_,i64>(3)?,"unusedBytes":row.get::<_,i64>(4)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            output(
+                serde_json::json!({"pageSize":c.query_row("PRAGMA page_size",[],|r|r.get::<_,i64>(0))?,"pageCount":c.query_row("PRAGMA page_count",[],|r|r.get::<_,i64>(0))?,"tables":tables}),
+            );
+        }
         "scan" => {
             let elapsed = Instant::now();
             let first = std::sync::Arc::new(std::sync::Mutex::new(None::<u128>));
