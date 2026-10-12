@@ -23,7 +23,7 @@ fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("version") {
         output(
-            serde_json::json!({"sqliteVersion":rusqlite::version(),"sqliteVersionNumber":rusqlite::version_number()}),
+            serde_json::json!({"sqliteVersion":rusqlite::version(),"sqliteVersionNumber":rusqlite::version_number(),"sqliteThreadsafe":unsafe{rusqlite::ffi::sqlite3_threadsafe()},"sqliteCompileOptions":{"defaultMemstatus0":unsafe{rusqlite::ffi::sqlite3_compileoption_used(c"DEFAULT_MEMSTATUS=0".as_ptr())!=0},"threadsafe1":unsafe{rusqlite::ffi::sqlite3_compileoption_used(c"THREADSAFE=1".as_ptr())!=0},"enableApiArmor":unsafe{rusqlite::ffi::sqlite3_compileoption_used(c"ENABLE_API_ARMOR".as_ptr())!=0}}}),
         );
         return Ok(());
     }
