@@ -35,6 +35,13 @@ fn run() -> Result<()> {
     }
     let service = Service::new(&PathBuf::from(&args[1]))?;
     match args[0].as_str() {
+        "database-info" => {
+            let c = service.repo.connect()?;
+            let filename: String = c.query_row("PRAGMA database_list", [], |r| r.get(2))?;
+            output(
+                serde_json::json!({"databaseFilename":filename,"pageSize":c.query_row("PRAGMA page_size",[],|r|r.get::<_,i64>(0))?,"journalMode":c.query_row("PRAGMA journal_mode",[],|r|r.get::<_,String>(0))?}),
+            );
+        }
         #[cfg(feature = "scan-reference")]
         "scan-reference" => {
             let elapsed = Instant::now();

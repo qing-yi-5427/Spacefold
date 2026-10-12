@@ -19,18 +19,187 @@ pub fn page_cursor_key(
         2u8, scan_id, revision, parent, sort, filter,
     ))?)
 }
+
+#[cfg(windows)]
+fn ordinary_database_filename(canonical_dir: &Path) -> Result<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    let unsupported = || {
+        AppError::new("DATABASE_PATH_UNSUPPORTED","扫描数据库需要普通本地数据目录；网络、过长或特殊名称位置不支持，原数据库已保留。扫描来源仍支持长路径和网络目录。")
+    };
+    let mut components = canonical_dir.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(unsupported());
+    };
+    let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+        return Err(unsupported());
+    };
+    if !drive.is_ascii_alphabetic() || components.next() != Some(Component::RootDir) {
+        return Err(unsupported());
+    }
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(unsupported());
+        };
+        let name = name.to_str().ok_or_else(unsupported)?;
+        if name.ends_with(['.', ' ']) || name.chars().any(|c| c < ' ' || "<>:\"|?*".contains(c)) {
+            return Err(unsupported());
+        }
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        let device = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|tail| {
+                matches!(
+                    tail,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+        if device {
+            return Err(unsupported());
+        }
+    }
+    let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
+    // Mapped network drives also cannot host this application's WAL database.
+    let kind = unsafe {
+        windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root.as_ptr()))
+    };
+    if !matches!(kind, 2 | 3 | 6) {
+        return Err(unsupported());
+    }
+    let wide = canonical_dir.as_os_str().encode_wide().collect::<Vec<_>>();
+    if !wide.starts_with(&[92, 92, 63, 92]) {
+        return Err(unsupported());
+    }
+    let ordinary =
+        PathBuf::from(std::ffi::OsString::from_wide(&wide[4..])).join("spacefold.sqlite3");
+    // MAX_PATH includes NUL; reserve the longest SQLite sidecar, '-journal'.
+    if ordinary.as_os_str().encode_wide().count() > 251 {
+        return Err(unsupported());
+    }
+    Ok(ordinary)
+}
+
+fn verified_sqlite_filename(canonical_dir: &Path, canonical_db: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let ordinary = ordinary_database_filename(canonical_dir)?;
+        let unsupported = || {
+            AppError::new(
+                "DATABASE_PATH_UNSUPPORTED",
+                "数据目录的普通路径不能与原位置无损匹配；原数据库已保留。",
+            )
+        };
+        let source = platform::metadata(canonical_dir)?;
+        let candidate = platform::metadata(ordinary.parent().ok_or_else(unsupported)?)?;
+        if source.kind != "directory"
+            || source.cloud_state.is_some()
+            || source.identity.is_none()
+            || source.identity != candidate.identity
+        {
+            return Err(unsupported());
+        }
+        let existing = match std::fs::symlink_metadata(canonical_db) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if existing {
+            let source = platform::metadata(canonical_db)?;
+            let candidate = platform::metadata(&ordinary)?;
+            if source.kind != "file"
+                || source.reparse_tag != 0
+                || source.cloud_state.is_some()
+                || source.identity.is_none()
+                || source.identity != candidate.identity
+            {
+                return Err(unsupported());
+            }
+        }
+        Ok(ordinary)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = canonical_dir;
+        Ok(canonical_db.to_path_buf())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod database_path_tests {
+    use super::*;
+    use std::os::windows::ffi::OsStringExt;
+    #[test]
+    fn unc_devices_nonunicode_and_sidecar_budget_are_rejected_before_open() {
+        for path in [
+            r"\\?\UNC\localhost\share\app-data",
+            r"\\?\C:\app\NUL.txt",
+            r"\\?\C:\app\CONIN$",
+            r"\\?\C:\app\LPT².dat",
+            r"\\?\C:\app\trailing.",
+            r"\\?\C:\app\trailing ",
+            r"\\?\C:\app\bad:name",
+        ] {
+            assert_eq!(
+                ordinary_database_filename(Path::new(path))
+                    .unwrap_err()
+                    .code,
+                "DATABASE_PATH_UNSUPPORTED"
+            );
+        }
+        let mut raw = r"\\?\C:\app\".encode_utf16().collect::<Vec<_>>();
+        raw.push(0xd800);
+        assert_eq!(
+            ordinary_database_filename(&PathBuf::from(std::ffi::OsString::from_wide(&raw)))
+                .unwrap_err()
+                .code,
+            "DATABASE_PATH_UNSUPPORTED"
+        );
+        let base = r"\\?\C:\";
+        let accepted = PathBuf::from(format!("{base}{}", "a".repeat(230)));
+        assert_eq!(
+            ordinary_database_filename(&accepted)
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .count(),
+            251
+        );
+        let rejected = PathBuf::from(format!("{base}{}", "a".repeat(231)));
+        assert_eq!(
+            ordinary_database_filename(&rejected).unwrap_err().code,
+            "DATABASE_PATH_UNSUPPORTED"
+        );
+    }
+}
+
 pub struct Repository {
     pub path: PathBuf,
     pub data_dir: PathBuf,
+    // SQLite's Windows VFS treats a leading \\ as UNC, including local \\?\
+    // names. Use only an identity-verified ordinary local name for SQLite;
+    // retain the canonical paths above for scanning and operation protection.
+    sqlite_path: PathBuf,
     id_allocator: std::sync::Mutex<()>,
 }
 impl Repository {
     pub fn new(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let data_dir = std::fs::canonicalize(data_dir)?;
+        let path = data_dir.join("spacefold.sqlite3");
+        let sqlite_path = verified_sqlite_filename(&data_dir, &path)?;
         let repo = Self {
-            path: data_dir.join("spacefold.sqlite3"),
+            path,
             data_dir,
+            sqlite_path,
             id_allocator: std::sync::Mutex::new(()),
         };
         let c = repo.connect()?;
@@ -96,7 +265,7 @@ impl Repository {
         Ok(repo)
     }
     pub fn connect(&self) -> Result<Connection> {
-        let c = Connection::open(&self.path)?;
+        let c = Connection::open(&self.sqlite_path)?;
         c.busy_timeout(Duration::from_secs(10))?;
         c.execute_batch("PRAGMA foreign_keys=ON;PRAGMA synchronous=NORMAL;PRAGMA wal_autocheckpoint=8000;PRAGMA cache_size=-16384;PRAGMA temp_store=FILE;")?;
         Ok(c)
@@ -350,7 +519,10 @@ impl Repository {
                     .map_err(|_| AppError::new("INVALID_CURSOR", "分页游标无效"))
             })
             .transpose()?;
-        if cursor.as_ref().is_some_and(|c| c.key != key) {
+        if cursor
+            .as_ref()
+            .is_some_and(|c| c.key != key || c.size < 0 || c.id <= 0)
+        {
             return Err(AppError::new("INVALID_CURSOR", "分页游标与查询范围不符"));
         }
         let mut args = vec![Value::Text(r.scan_id.clone())];

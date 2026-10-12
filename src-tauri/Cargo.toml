@@ -1,6 +1,6 @@
 [package]
 name = "spacefold"
-version = "0.1.0"
+version = "0.1.1"
 description = "Spacefold local disk space analyzer"
 edition = "2021"
 default-run = "spacefold"

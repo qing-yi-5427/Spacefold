@@ -911,6 +911,31 @@ fn keyset_pages_have_no_gaps_or_duplicates_and_locate_target_for_every_sort() {
         service.repo.page(&old_query, false).unwrap_err().code,
         "INVALID_CURSOR"
     );
+    for sort in ["size_asc", "size_desc"] {
+        old_query.sort = Some(sort.into());
+        old_query.cursor = None;
+        let page = service.repo.page(&old_query, false).unwrap();
+        let valid: serde_json::Value =
+            serde_json::from_str(page.next_cursor.as_ref().unwrap()).unwrap();
+        for (field, value) in [("size", i64::MIN), ("size", -1), ("id", 0), ("id", -1)] {
+            let mut malformed = valid.clone();
+            malformed[field] = value.into();
+            old_query.cursor = Some(malformed.to_string());
+            assert_eq!(
+                service.repo.page(&old_query, false).unwrap_err().code,
+                "INVALID_CURSOR",
+                "{sort}/{field}/{value}"
+            );
+        }
+        let mut boundary = valid.clone();
+        boundary["size"] = i64::MAX.into();
+        boundary["id"] = i64::MAX.into();
+        old_query.cursor = Some(boundary.to_string());
+        assert!(
+            service.repo.page(&old_query, false).is_ok(),
+            "{sort} accepts nonnegative integer boundary"
+        );
+    }
 }
 
 #[test]
@@ -961,6 +986,130 @@ fn duplicate_size_index_migration_preserves_old_history_and_page_size() {
             .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
             .unwrap(),
         "ok"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn sqlite_uses_verified_ordinary_filename_and_concurrent_reads_preserve_history() {
+    let (_temp, service, scan) = fixture();
+    assert!(service
+        .repo
+        .path
+        .as_os_str()
+        .to_string_lossy()
+        .starts_with("\\\\?\\"));
+    let c = service.repo.connect().unwrap();
+    let filename: String = c
+        .query_row("PRAGMA database_list", [], |r| r.get(2))
+        .unwrap();
+    assert!(!filename.starts_with("\\\\"));
+    assert_eq!(
+        platform::metadata(&service.repo.path).unwrap().identity,
+        platform::metadata(Path::new(&filename)).unwrap().identity
+    );
+    let root_before: Vec<u8> = c
+        .query_row(
+            "SELECT root_path FROM scans WHERE id=?1",
+            [&scan.scan_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(c);
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let service = &service;
+            let scan = &scan;
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..200 {
+                    let current = service.repo.scan(&scan.scan_id).unwrap();
+                    assert_eq!(current.status, "completed");
+                    assert_eq!(current.logical_total_bytes, "76");
+                }
+            });
+        }
+        let barrier = barrier.clone();
+        let service = &service;
+        let scan = &scan;
+        scope.spawn(move || {
+            let mut c = service.repo.connect().unwrap();
+            barrier.wait();
+            for _ in 0..400 {
+                let _writer = service.writer.lock().unwrap();
+                let tx = c.transaction().unwrap();
+                // Durable writes while leaving all history values unchanged.
+                tx.execute(
+                    "UPDATE scans SET revision=revision WHERE id=?1",
+                    [&scan.scan_id],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE nodes SET logical_total=logical_total WHERE scan_id=?1 AND id=1",
+                    [&scan.scan_id],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                std::thread::yield_now();
+            }
+        });
+    });
+    let reopened = Repository::new(&service.repo.data_dir).unwrap();
+    let after = reopened.scan(&scan.scan_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&scan).unwrap()
+    );
+    let c = reopened.connect().unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT root_path FROM scans WHERE id=?1",
+            [&scan.scan_id],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        root_before
+    );
+    assert_eq!(
+        c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn unsupported_database_locations_keep_their_original_files() {
+    use std::os::windows::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let base = platform::absolute(temp.path()).unwrap();
+    for name in ["cache.", "cache ", "CON.txt", "COM¹.bin"] {
+        let data = base.join(name);
+        fs::create_dir_all(&data).unwrap();
+        let original = data.join("spacefold.sqlite3");
+        fs::write(&original, b"original database sentinel").unwrap();
+        let error = match Repository::new(&data) {
+            Ok(_) => panic!("unsupported directory opened: {name}"),
+            Err(e) => e,
+        };
+        assert_eq!(error.code, "DATABASE_PATH_UNSUPPORTED");
+        assert_eq!(fs::read(original).unwrap(), b"original database sentinel");
+    }
+    let long = base.join("a".repeat(100)).join("b".repeat(100));
+    fs::create_dir_all(&long).unwrap();
+    let original = long.join("spacefold.sqlite3");
+    assert!(original.as_os_str().encode_wide().count() > 251);
+    fs::write(&original, b"long original database sentinel").unwrap();
+    let error = match Repository::new(&long) {
+        Ok(_) => panic!("over-budget database opened"),
+        Err(e) => e,
+    };
+    assert_eq!(error.code, "DATABASE_PATH_UNSUPPORTED");
+    assert_eq!(
+        fs::read(original).unwrap(),
+        b"long original database sentinel"
     );
 }
 
