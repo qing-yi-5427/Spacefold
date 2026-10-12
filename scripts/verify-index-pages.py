@@ -40,6 +40,7 @@ def main():
                         default=Path('src-tauri/target/release/spacefold-probe.exe'))
     parser.add_argument('--page-size', type=int, default=200)
     parser.add_argument('--full-traversal', action='store_true')
+    parser.add_argument('--minimum-rows', type=int, default=2)
     args = parser.parse_args()
     source, output, probe = (args.source_database.resolve(), args.output.resolve(),
                              args.probe.resolve())
@@ -60,7 +61,7 @@ def main():
         rows = db.execute('SELECT id,name,logical_total,modified FROM nodes WHERE scan_id=? AND parent_id=1',
                           (scan_id,)).fetchall()
         original_indexes = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='index'")]
-    assert len(rows) > 1
+    assert len(rows) >= args.minimum_rows
 
     def request(sort, cursor=None):
         return {'scanId': scan_id, 'parentId': '1', 'revision': revision,
@@ -144,8 +145,29 @@ def main():
             for offset in [0, len(rows) // 2, len(rows) - 1]:
                 value, wall = invoke('node-page', scan_id, ordered[offset][0], sort, args.page_size)
                 check_page(value, ordered[offset:offset + args.page_size])
+                target = ordered[offset]
+                if sort.startswith('size_'):
+                    fields = 'sort_size,name COLLATE NOCASE,id'
+                    relation = '<' if sort == 'size_desc' else '>'
+                    ordering = ('sort_size DESC,name COLLATE NOCASE DESC,id DESC'
+                                if sort == 'size_desc' else 'sort_size,name COLLATE NOCASE,id')
+                    placeholders, params = '?,?,?', (-target[2], target[1], target[0])
+                else:
+                    fields = 'name COLLATE NOCASE,id'
+                    relation = '<' if sort == 'name_asc' else '>'
+                    ordering = ('name COLLATE NOCASE DESC,id DESC'
+                                if sort == 'name_asc' else 'name COLLATE NOCASE,id')
+                    placeholders, params = '?,?', (target[1], target[0])
+                # Match the production node_page predecessor SQL, separately
+                # from the Python oracle; report the actual tie-group plan.
+                with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+                    plan = db.execute(
+                        'EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id=? AND parent_id=1 '
+                        f'AND ({fields}){relation}({placeholders}) ORDER BY {ordering} LIMIT 1',
+                        (scan_id, *params)).fetchall()
                 locates.append({'targetOffset': offset, 'nodeId': ordered[offset][0],
-                                'pageMs': value['pageElapsedMs'], 'wallSeconds': wall})
+                                'pageMs': value['pageElapsedMs'], 'wallSeconds': wall,
+                                'predecessorQueryPlan': plan})
         else:
             invoke('node-page', scan_id, ordered[0][0], sort, args.page_size,
                    expected_error='INVALID_SORT')
