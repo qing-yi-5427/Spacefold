@@ -1,0 +1,1096 @@
+use spacefold_lib::{
+    export, file_ops,
+    model::*,
+    platform,
+    repository::{insert_node, Repository},
+    service::{JobRuntime, Service},
+};
+use std::{
+    fs,
+    path::Path,
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
+};
+
+fn fixture() -> (tempfile::TempDir, Arc<Service>, Scan) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("source");
+    fs::create_dir_all(root.join("中文🧭/nested")).unwrap();
+    fs::create_dir_all(root.join("empty")).unwrap();
+    fs::write(root.join("root.bin"), [1u8; 17]).unwrap();
+    fs::write(root.join("中文🧭/nested/a.bin"), [2u8; 31]).unwrap();
+    fs::write(root.join("中文🧭/=SUM(1,2).txt"), [3u8; 11]).unwrap();
+    fs::write(root.join("zero.bin"), []).unwrap();
+    fs::hard_link(root.join("root.bin"), root.join("hard.bin")).unwrap();
+    let service = Service::new(&dir.path().join("db")).unwrap();
+    let s = service
+        .start_scan(platform::absolute(&root).unwrap(), None)
+        .unwrap();
+    let scan = wait_scan(&service, &s.scan_id);
+    assert_eq!(scan.status, "completed");
+    assert_eq!(scan.logical_total_bytes, "76");
+    (dir, service, scan)
+}
+fn wait_scan(service: &Service, id: &str) -> Scan {
+    let start = Instant::now();
+    loop {
+        let s = service.repo.scan(id).unwrap();
+        if !matches!(s.status.as_str(), "queued" | "running" | "cancelling") {
+            return s;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "scan timeout");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn wait_job(service: &Service, id: &str) -> JobEvent {
+    let start = Instant::now();
+    loop {
+        let j = service.job(id).unwrap();
+        if j.terminal() {
+            return j.snapshot();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "job timeout {:?}",
+            j.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn find(service: &Service, scan: &Scan, name: &str) -> Node {
+    service
+        .repo
+        .page(
+            &PageRequest {
+                scan_id: scan.scan_id.clone(),
+                revision: scan.revision,
+                parent_id: None,
+                sort: None,
+                filter: Some(Filter {
+                    keyword: Some(name.into()),
+                    ..Default::default()
+                }),
+                cursor: None,
+                page_size: Some(200),
+            },
+            true,
+        )
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|n| n.name == name)
+        .unwrap()
+}
+fn request(scan: &Scan, format: &str) -> ExportRequest {
+    ExportRequest {
+        scan_id: scan.scan_id.clone(),
+        revision: scan.revision,
+        scope: "all".into(),
+        scope_id: "1".into(),
+        selected_ids: vec![],
+        recursive: true,
+        fields: export::FIELDS.iter().map(|s| s.to_string()).collect(),
+        format: format.into(),
+        target_path: None,
+        html_row_budget: None,
+    }
+}
+#[test]
+fn real_scan_hardlinks_empty_root_children_and_selection() {
+    let (_dir, service, mut scan) = fixture();
+    let root = service
+        .repo
+        .node(&scan.scan_id, "1", Some(scan.revision))
+        .unwrap();
+    assert_eq!(root.node.file_count, "5");
+    assert_eq!(root.node.directory_count, "3");
+    assert!(
+        rusqlite::version_number() >= 3_051_003,
+        "SQLite {} is missing the WAL-reset fix",
+        rusqlite::version()
+    );
+    for (search, kind, total) in [
+        (false, "file", "3"),
+        (false, "directory", "2"),
+        (true, "file", "5"),
+        (true, "directory", "3"),
+    ] {
+        let page = service
+            .repo
+            .page(
+                &PageRequest {
+                    scan_id: scan.scan_id.clone(),
+                    revision: scan.revision,
+                    parent_id: Some("1".into()),
+                    sort: None,
+                    cursor: None,
+                    page_size: Some(200),
+                    filter: Some(Filter {
+                        kind: Some(kind.into()),
+                        ..Default::default()
+                    }),
+                },
+                search,
+            )
+            .unwrap();
+        assert_eq!(page.total_count, total);
+        assert_eq!(page.nodes.len(), total.parse::<usize>().unwrap());
+    }
+    let folder = find(&service, &scan, "中文🧭");
+    let child = find(&service, &scan, "a.bin");
+    let summary = service
+        .repo
+        .selection(
+            &scan.scan_id,
+            &[folder.node_id.clone(), child.node_id.clone()],
+            scan.revision,
+        )
+        .unwrap();
+    assert_eq!(summary.count, "1");
+    assert_eq!(summary.logical_total_bytes, "42");
+    assert_eq!(summary.covered_ids, vec![child.node_id]);
+    assert_eq!(find(&service, &scan, "empty").logical_total_bytes, "0");
+    assert_eq!(root.node.allocated_unknown_count, "5");
+    let hard = find(&service, &scan, "hard.bin");
+    let (measured, revision) = service
+        .measure_node(&scan.scan_id, &hard.node_id, scan.revision)
+        .unwrap();
+    assert!(measured.allocated_bytes.is_some());
+    scan.revision = revision;
+    assert_eq!(
+        service
+            .repo
+            .node(&scan.scan_id, "1", Some(revision))
+            .unwrap()
+            .node
+            .allocated_unknown_count,
+        "4"
+    );
+    assert!(
+        measured
+            .link_count
+            .as_deref()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 2
+    );
+    let page = service
+        .repo
+        .page(
+            &PageRequest {
+                scan_id: scan.scan_id.clone(),
+                parent_id: Some("1".into()),
+                revision: scan.revision,
+                sort: None,
+                filter: None,
+                cursor: None,
+                page_size: Some(2),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(page.nodes.len(), 2);
+    assert!(page.next_cursor.is_some());
+    assert!(
+        service
+            .repo
+            .node(&scan.scan_id, "1", Some(scan.revision - 1))
+            .unwrap_err()
+            .code
+            == "REVISION_CHANGED"
+    );
+}
+#[test]
+fn four_reports_read_back_and_shared_range() {
+    let (dir, service, scan) = fixture();
+    for format in ["csv", "json", "html", "xlsx"] {
+        let r = request(&scan, format);
+        let target = dir.path().join(format!("report.{format}"));
+        let job = JobRuntime::new(
+            JobEvent::new("test", &scan.scan_id, "export", scan.revision),
+            None,
+        );
+        let preview = export::preview(&service, &r).unwrap();
+        let count = export::write_report(&service, &r, &target, &job).unwrap();
+        assert_eq!(count.to_string(), preview.record_count);
+        match format {
+            "json" => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+                assert_eq!(v["rows"].as_array().unwrap().len(), count as usize);
+                assert_eq!(v["metadata"]["totalLogicalBytes"], "76");
+                assert!(v["rows"][0]["pathEncoding"].is_string());
+            }
+            "csv" => {
+                let b = fs::read(&target).unwrap();
+                assert_eq!(&b[..3], &[0xef, 0xbb, 0xbf]);
+                let mut reader = csv::Reader::from_reader(&b[3..]);
+                let records = reader
+                    .records()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(records.len(), count as usize + 1);
+                assert_eq!(&records[0][0], "metadata");
+                let meta: serde_json::Value = serde_json::from_str(&records[0][1]).unwrap();
+                assert_eq!(meta["recordCount"], count.to_string());
+                assert!(records
+                    .iter()
+                    .any(|r| r.iter().any(|v| v.starts_with("'=SUM"))));
+            }
+            "html" => {
+                let html = fs::read_to_string(&target).unwrap();
+                assert!(html.contains("<!doctype html>"));
+                assert!(html.contains("Spacefold"));
+                assert_eq!(html.matches("<tr>").count(), count as usize + 1);
+            }
+            "xlsx" => {
+                use std::io::Read;
+                let mut zip = zip::ZipArchive::new(fs::File::open(&target).unwrap()).unwrap();
+                let mut xml = String::new();
+                zip.by_name("xl/worksheets/sheet2.xml")
+                    .unwrap()
+                    .read_to_string(&mut xml)
+                    .unwrap();
+                assert_eq!(xml.matches("<row ").count(), count as usize + 1);
+                assert!(xml.contains("autoFilter"));
+                assert!(xml.contains("frozen"));
+                assert!(!xml.contains("<f>"));
+            }
+            _ => unreachable!(),
+        }
+    }
+    let folder = find(&service, &scan, "中文🧭");
+    let child = find(&service, &scan, "a.bin");
+    let mut r = request(&scan, "json");
+    r.scope = "selected".into();
+    r.selected_ids = vec![folder.node_id.clone(), child.node_id.clone()];
+    let preview = export::preview(&service, &r).unwrap();
+    assert_eq!(preview.logical_total_bytes, "42");
+    assert_eq!(preview.record_count, "4");
+    r.recursive = false;
+    assert_eq!(export::preview(&service, &r).unwrap().record_count, "1");
+}
+#[test]
+fn export_cancel_and_limits_preserve_prior_target() {
+    let (dir, service, scan) = fixture();
+    let target = dir.path().join("original.html");
+    fs::write(&target, "ORIGINAL").unwrap();
+    let mut r = request(&scan, "html");
+    r.html_row_budget = Some(1);
+    let job = JobRuntime::new(
+        JobEvent::new("test", &scan.scan_id, "export", scan.revision),
+        None,
+    );
+    assert_eq!(
+        export::write_report(&service, &r, &target, &job)
+            .unwrap_err()
+            .code,
+        "HTML_ROW_BUDGET"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "ORIGINAL");
+    job.cancel.store(true, Ordering::Release);
+    assert_eq!(
+        export::write_report(&service, &request(&scan, "json"), &target, &job)
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "ORIGINAL");
+    assert_eq!(
+        fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .count(),
+        0
+    );
+}
+#[test]
+fn integer_precision_sql_range_and_settings_recovery() {
+    let (dir, service, _scan) = fixture();
+    let root = dir.path().join("synthetic");
+    fs::create_dir(&root).unwrap();
+    let id = "precise";
+    service.repo.insert_scan(id, &root, true).unwrap();
+    let mut c = service.repo.connect().unwrap();
+    let tx = c.transaction().unwrap();
+    let m = platform::metadata(&root).unwrap();
+    insert_node(&tx, id, 1, None, &root, 0, &m, None).unwrap();
+    let mut file = m.clone();
+    file.kind = "file".into();
+    file.recurse = false;
+    file.logical = 9_007_199_254_740_993;
+    file.allocated = Some(0);
+    insert_node(&tx, id, 2, Some(1), &root.join("large"), 1, &file, None).unwrap();
+    tx.commit().unwrap();
+    let scan = service.repo.finish(id, "completed").unwrap();
+    assert_eq!(scan.logical_total_bytes, "9007199254740993");
+    let target = dir.path().join("precise.json");
+    export::write_report(
+        &service,
+        &request(&scan, "json"),
+        &target,
+        &JobRuntime::new(JobEvent::new("t", id, "export", scan.revision), None),
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(target).unwrap()).unwrap();
+    assert_eq!(value["rows"][0]["logical_bytes"], "9007199254740993");
+    assert_eq!(integer(u64::MAX).unwrap_err().code, "SIZE_OUT_OF_RANGE");
+    let settings = Settings {
+        accent: "rose".into(),
+        ..Default::default()
+    };
+    service.save_settings(settings).unwrap();
+    assert_eq!(service.read_settings().accent, "rose");
+    fs::write(service.repo.data_dir.join("settings.json"), "broken").unwrap();
+    assert_eq!(service.read_settings().accent, "purple");
+}
+#[test]
+fn recovery_marks_running_scan_interrupted() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::new(temp.path()).unwrap();
+    repo.insert_scan("interrupted", temp.path(), false).unwrap();
+    let c = repo.connect().unwrap();
+    c.execute(
+        "UPDATE scans SET status='running' WHERE id='interrupted'",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    drop(repo);
+    let reopened = Repository::new(temp.path()).unwrap();
+    let s = reopened.scan("interrupted").unwrap();
+    assert_eq!(s.status, "interrupted");
+    assert!(s.incomplete && s.stale);
+}
+fn operation_request(
+    scan: &Scan,
+    node: &Node,
+    kind: &str,
+    dest: Option<&Path>,
+    name: Option<&str>,
+    policy: &str,
+) -> OperationRequest {
+    OperationRequest {
+        scan_id: scan.scan_id.clone(),
+        node_ids: vec![node.node_id.clone()],
+        expected_revision: scan.revision,
+        kind: kind.into(),
+        destination_ref: None,
+        destination_path: dest.map(platform::display),
+        new_name: name.map(str::to_owned),
+        conflict_policy: Some(policy.into()),
+    }
+}
+#[cfg(windows)]
+#[test]
+fn real_copy_rename_move_auto_refresh_and_conflicts() {
+    let (dir, service, scan) = fixture();
+    let dest = dir.path().join("destination");
+    fs::create_dir(&dest).unwrap();
+    let node = find(&service, &scan, "root.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "copy", Some(&dest), None, "skip"),
+    )
+    .unwrap();
+    assert!(plan.items[0].error.is_none(), "{:?}", plan);
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    assert_eq!(
+        done.results.as_ref().unwrap()[0].status,
+        "success",
+        "{done:?}"
+    );
+    assert_eq!(fs::read(dest.join("root.bin")).unwrap(), vec![1u8; 17]);
+    let scan = service.repo.scan(&scan.scan_id).unwrap();
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "copy", Some(&dest), None, "skip"),
+    )
+    .unwrap();
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    assert_eq!(
+        wait_job(&service, &job.job_id).results.unwrap()[0].status,
+        "skipped"
+    );
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "rename", None, Some("renamed.bin"), "skip"),
+    )
+    .unwrap();
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    assert_eq!(
+        done.results.as_ref().unwrap()[0].status,
+        "success",
+        "{done:?}"
+    );
+    assert!(dir.path().join("source/renamed.bin").exists());
+    let scan = service.repo.scan(&scan.scan_id).unwrap();
+    assert!(!scan.stale);
+    assert_eq!(scan.logical_total_bytes, "76");
+    let rename = find(&service, &scan, "renamed.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &rename, "move", Some(&dest), None, "skip"),
+    )
+    .unwrap();
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    assert_eq!(
+        done.results.as_ref().unwrap()[0].status,
+        "success",
+        "{done:?}"
+    );
+    let scan = service.repo.scan(&scan.scan_id).unwrap();
+    assert_eq!(scan.logical_total_bytes, "59");
+    assert!(!scan.stale);
+}
+#[cfg(windows)]
+#[test]
+fn source_replacement_and_late_destination_are_rejected() {
+    let (dir, service, scan) = fixture();
+    let dest = dir.path().join("destination");
+    fs::create_dir(&dest).unwrap();
+    let node = find(&service, &scan, "zero.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "move", Some(&dest), None, "skip"),
+    )
+    .unwrap();
+    fs::rename(
+        dir.path().join("source/zero.bin"),
+        dir.path().join("source/old.bin"),
+    )
+    .unwrap();
+    fs::write(dir.path().join("source/zero.bin"), "replacement").unwrap();
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    assert_eq!(
+        done.results.unwrap()[0].error.as_ref().unwrap().code,
+        "SOURCE_CHANGED"
+    );
+    assert!(dir.path().join("source/zero.bin").exists());
+    let node = find(&service, &scan, "root.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "copy", Some(&dest), None, "skip"),
+    )
+    .unwrap();
+    fs::write(dest.join("root.bin"), "foreign").unwrap();
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    assert_eq!(
+        done.results.unwrap()[0].error.as_ref().unwrap().code,
+        "DESTINATION_CONFLICT"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.join("root.bin")).unwrap(),
+        "foreign"
+    );
+}
+#[test]
+fn scan_cancellation_keeps_partial_and_terminal_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("source");
+    fs::create_dir(&root).unwrap();
+    for i in 0..2000 {
+        fs::write(root.join(format!("f{i}")), [1u8; 1]).unwrap();
+    }
+    let service = Service::new(&dir.path().join("db")).unwrap();
+    let scan = service
+        .start_scan(platform::absolute(&root).unwrap(), None)
+        .unwrap();
+    assert!(service.repo.node(&scan.scan_id, "1", Some(1)).is_ok());
+    let cancel_started = Instant::now();
+    service.cancel_job(&scan.scan_id).unwrap();
+    let done = wait_scan(&service, &scan.scan_id);
+    assert_eq!(done.status, "cancelled");
+    assert!(done.incomplete);
+    // The durable status commits before the channel event. Observe the final
+    // event rather than imposing atomicity across two independent interfaces.
+    let final_event = wait_job(&service, &scan.scan_id);
+    assert_eq!(final_event.status, "cancelled");
+    assert_eq!(final_event.revision, done.revision);
+    assert_eq!(final_event.discovered_count, done.discovered_count);
+    assert_eq!(final_event.logical_total_bytes, done.logical_total_bytes);
+    assert!(cancel_started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(windows)]
+#[test]
+fn real_recycle_returns_item_result_and_refreshes_scan() {
+    let (dir, service, scan) = fixture();
+    let node = find(&service, &scan, "zero.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "trash", None, None, "skip"),
+    )
+    .unwrap();
+    assert!(plan.items[0].error.is_none(), "{plan:?}");
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let event = wait_job(&service, &job.job_id);
+    assert_eq!(
+        event.results.as_ref().unwrap()[0].status,
+        "success",
+        "{event:?}"
+    );
+    assert!(!dir.path().join("source/zero.bin").exists());
+    let refreshed = service.repo.scan(&scan.scan_id).unwrap();
+    assert_eq!(refreshed.discovered_count, "8");
+    assert!(!refreshed.stale);
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_is_not_followed_and_changed_parent_rejects_operation() {
+    let (dir, service, scan) = fixture();
+    let parent = dir.path().join("source/中文🧭/nested");
+    let target = dir.path().join("moved-original");
+    let destination = dir.path().join("destination");
+    fs::create_dir(&destination).unwrap();
+    let node = find(&service, &scan, "a.bin");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &node, "move", Some(&destination), None, "skip"),
+    )
+    .unwrap();
+    fs::rename(&parent, &target).unwrap();
+    let result = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(parent.to_string_lossy().replace('/', "\\"))
+        .arg(target.to_string_lossy().replace('/', "\\"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let event = wait_job(&service, &job.job_id);
+    assert_eq!(
+        event.results.as_ref().unwrap()[0].status,
+        "failed",
+        "{event:?}"
+    );
+    assert_eq!(
+        event.results.as_ref().unwrap()[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .code,
+        "SOURCE_CHANGED"
+    );
+    assert!(target.join("a.bin").exists());
+    let latest = service
+        .start_scan(
+            platform::absolute(&dir.path().join("source")).unwrap(),
+            None,
+        )
+        .unwrap();
+    let latest = wait_scan(&service, &latest.scan_id);
+    assert_eq!(latest.logical_total_bytes, "45");
+    let link = find(&service, &latest, "nested");
+    assert_eq!(link.kind, "junction");
+    assert_eq!(link.children_count, "0");
+    fs::remove_dir(&parent).unwrap();
+}
+
+#[test]
+fn app_work_directory_excluded_and_export_cannot_overwrite_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("visible.txt"), "123").unwrap();
+    let service = Service::new(&root.join("app-data")).unwrap();
+    let scan = service
+        .start_scan(platform::absolute(&root).unwrap(), None)
+        .unwrap();
+    let scan = wait_scan(&service, &scan.scan_id);
+    assert_eq!(scan.discovered_count, "2");
+    assert_eq!(scan.logical_total_bytes, "3");
+    let job = JobRuntime::new(
+        JobEvent::new("t", &scan.scan_id, "export", scan.revision),
+        None,
+    );
+    assert_eq!(
+        export::write_report(&service, &request(&scan, "json"), &service.repo.path, &job)
+            .unwrap_err()
+            .code,
+        "APP_DATA_PROTECTED"
+    );
+    assert_eq!(
+        service
+            .repo
+            .scan(&scan.scan_id)
+            .unwrap()
+            .logical_total_bytes,
+        "3"
+    );
+}
+
+#[test]
+fn bounded_progress_coalesces_slow_consumer() {
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    let job = JobRuntime::new(
+        JobEvent::new("j", "s", "scan", 1),
+        Some(Arc::new(move |e| sink.lock().unwrap().push(e))),
+    );
+    for _ in 0..100 {
+        job.update(|e| e.status = "running".into());
+    }
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(job.snapshot().seq, 100);
+    job.acknowledge(1).unwrap();
+    assert_eq!(delivered.lock().unwrap().len(), 2);
+    assert_eq!(delivered.lock().unwrap()[1].seq, 100);
+    job.update(|e| e.status = "completed".into());
+    assert_eq!(delivered.lock().unwrap().len(), 3);
+    assert_eq!(job.acknowledge(999).unwrap_err().code, "INVALID_ACK");
+}
+
+#[cfg(windows)]
+#[test]
+fn sparse_and_compressed_allocation_is_platform_measured() {
+    let temp = tempfile::tempdir().unwrap();
+    let sparse = temp.path().join("sparse.bin");
+    let f = fs::File::create(&sparse).unwrap();
+    let set = std::process::Command::new("fsutil")
+        .args(["sparse", "setflag"])
+        .arg(&sparse)
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    f.set_len(64 * 1024 * 1024).unwrap();
+    drop(f);
+    let meta = platform::metadata(&sparse).unwrap();
+    assert_eq!(meta.logical, 64 * 1024 * 1024);
+    assert!(meta.allocated.unwrap() < meta.logical, "{meta:?}");
+    let compressed = temp.path().join("compressed.bin");
+    fs::write(&compressed, vec![0u8; 1024 * 1024]).unwrap();
+    let compression = std::process::Command::new("compact")
+        .args(["/c", "/i", "/q"])
+        .arg(&compressed)
+        .output()
+        .unwrap();
+    assert!(compression.status.success());
+    let meta = platform::metadata(&compressed).unwrap();
+    assert!(meta.allocated.unwrap() < meta.logical, "{meta:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_special_suffixes_fail_closed_for_sources_targets_and_members() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = platform::absolute(temp.path()).unwrap().join("source");
+    let dest = root.parent().unwrap().join("target");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(root.join("collision"), b"ordinary distinct file").unwrap();
+    fs::write(root.join("collision."), b"trailing dot distinct file").unwrap();
+    fs::write(root.join("collision "), b"trailing space distinct file").unwrap();
+    fs::write(root.join("nested/inside."), b"nested special file").unwrap();
+    fs::create_dir_all(root.join("parent.")).unwrap();
+    fs::write(root.join("parent./child"), b"special parent child").unwrap();
+    let special_target = root.parent().unwrap().join("target.");
+    fs::create_dir(&special_target).unwrap();
+    let service = Service::new(&temp.path().join("database")).unwrap();
+    let started = service.start_scan(root.clone(), None).unwrap();
+    let scan = wait_scan(&service, &started.scan_id);
+    for name in ["collision.", "collision ", "child", "nested"] {
+        let node = find(&service, &scan, name);
+        for kind in ["copy", "move", "trash"] {
+            let plan = file_ops::plan(
+                &service,
+                operation_request(&scan, &node, kind, Some(&dest), None, "skip"),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.items[0].error.as_ref().unwrap().code,
+                "UNSUPPORTED_SHELL_PATH",
+                "{plan:?}"
+            );
+        }
+        if name != "nested" {
+            let stored = service
+                .repo
+                .node(&scan.scan_id, &node.node_id, Some(scan.revision))
+                .unwrap();
+            for action in ["open", "reveal", "properties"] {
+                assert_eq!(
+                    file_ops::open_node(&stored.path, action).unwrap_err().code,
+                    "UNSUPPORTED_SHELL_PATH"
+                );
+            }
+            let plan = file_ops::plan(
+                &service,
+                operation_request(&scan, &node, "rename", None, Some("renamed"), "skip"),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.items[0].error.as_ref().unwrap().code,
+                "UNSUPPORTED_SHELL_PATH"
+            );
+        }
+    }
+    let ordinary = find(&service, &scan, "collision");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(
+            &scan,
+            &ordinary,
+            "copy",
+            Some(&special_target),
+            None,
+            "skip",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.items[0].error.as_ref().unwrap().code,
+        "UNSUPPORTED_SHELL_PATH"
+    );
+    assert_eq!(
+        fs::read(root.join("collision")).unwrap(),
+        b"ordinary distinct file"
+    );
+    assert_eq!(
+        fs::read(root.join("collision.")).unwrap(),
+        b"trailing dot distinct file"
+    );
+    assert_eq!(
+        fs::read(root.join("collision ")).unwrap(),
+        b"trailing space distinct file"
+    );
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&special_target).unwrap().count(), 0);
+}
+
+#[test]
+fn keyset_pages_have_no_gaps_or_duplicates_and_locate_target_for_every_sort() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("synthetic");
+    fs::create_dir(&root).unwrap();
+    let service = Service::new(&temp.path().join("db")).unwrap();
+    service.repo.insert_scan("pages", &root, true).unwrap();
+    let mut c = service.repo.connect().unwrap();
+    let tx = c.transaction().unwrap();
+    let mut meta = platform::metadata(&root).unwrap();
+    insert_node(&tx, "pages", 1, None, &root, 0, &meta, None).unwrap();
+    meta.kind = "file".into();
+    meta.recurse = false;
+    meta.logical = 123;
+    for id in 2..242 {
+        insert_node(
+            &tx,
+            "pages",
+            id,
+            Some(1),
+            &root.join(format!("sample-{id:04}")),
+            1,
+            &meta,
+            None,
+        )
+        .unwrap();
+    }
+    tx.execute("UPDATE nodes SET name=CASE WHEN id%3=0 THEN 'same' WHEN id%3=1 THEN 'SAME' ELSE name END WHERE scan_id='pages' AND id<>1", []).unwrap();
+    tx.commit().unwrap();
+    let scan = service.repo.finish("pages", "completed").unwrap();
+    for (sort, ordering) in [
+        ("size_desc", "sort_size,name COLLATE NOCASE,id"),
+        ("size_asc", "logical_total,name COLLATE NOCASE,id"),
+        ("name_asc", "name COLLATE NOCASE,id"),
+        ("name_desc", "name COLLATE NOCASE DESC,id DESC"),
+        (
+            "modified_desc",
+            "COALESCE(modified,'') DESC,name COLLATE NOCASE,id",
+        ),
+    ] {
+        let mut query = PageRequest {
+            scan_id: scan.scan_id.clone(),
+            revision: scan.revision,
+            parent_id: Some("1".into()),
+            sort: Some(sort.into()),
+            cursor: None,
+            page_size: Some(17),
+            filter: None,
+        };
+        let mut ids = Vec::new();
+        loop {
+            let page = service.repo.page(&query, false).unwrap();
+            assert_eq!(page.total_count, "240");
+            ids.extend(
+                page.nodes
+                    .into_iter()
+                    .map(|n| parse_id(&n.node_id).unwrap()),
+            );
+            query.cursor = page.next_cursor;
+            if query.cursor.is_none() {
+                break;
+            }
+        }
+        let expected = c
+            .prepare(&format!(
+                "SELECT id FROM nodes WHERE scan_id='pages' AND parent_id=1 ORDER BY {ordering}"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, expected, "sort {sort}");
+        if sort != "modified_desc" {
+            let page = service
+                .repo
+                .node_page("pages", &expected[219].to_string(), scan.revision, sort, 17)
+                .unwrap();
+            assert!(
+                page.nodes
+                    .iter()
+                    .any(|n| n.node_id == expected[219].to_string()),
+                "locate {sort}"
+            );
+        }
+    }
+}
+
+#[test]
+fn history_staleness_persists_without_rewriting_rows_and_root_refresh_clears_it() {
+    let (temp, service, scan) = fixture();
+    let loaded = service.repo.load_history(&scan.scan_id).unwrap();
+    assert!(loaded.stale);
+    assert_eq!(
+        service.repo.load_history(&scan.scan_id).unwrap().revision,
+        loaded.revision
+    );
+    assert_eq!(
+        service
+            .repo
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND stale=1",
+                [&scan.scan_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let root = service
+        .repo
+        .node(&scan.scan_id, "1", Some(loaded.revision))
+        .unwrap();
+    assert!(root.node.stale);
+    let target = temp.path().join("history.json");
+    export::write_report(
+        &service,
+        &request(&loaded, "json"),
+        &target,
+        &JobRuntime::new(
+            JobEvent::new("history", &scan.scan_id, "export", loaded.revision),
+            None,
+        ),
+    )
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+    assert_eq!(report["metadata"]["stale"], true, "{report}");
+    let refresh = service
+        .refresh(scan.scan_id.clone(), "1".into(), None)
+        .unwrap();
+    let completed = wait_job(&service, &refresh.scan_id);
+    assert_eq!(completed.status, "completed", "{completed:?}");
+    let refreshed = service.repo.scan(&scan.scan_id).unwrap();
+    assert!(!refreshed.stale);
+    assert!(
+        !service
+            .repo
+            .node(&scan.scan_id, "1", Some(refreshed.revision))
+            .unwrap()
+            .node
+            .stale
+    );
+}
+
+#[test]
+fn compact_scan_ids_are_transactional_unique_never_reused_and_legacy_compatible() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Arc::new(Repository::new(&temp.path().join("db")).unwrap());
+    repo.insert_scan("legacy-uuid-4e03-9af4", temp.path(), false)
+        .unwrap();
+    repo.insert_scan("s1", temp.path(), false).unwrap();
+    let threads = (0..32)
+        .map(|_| {
+            let repo = repo.clone();
+            std::thread::spawn(move || repo.new_scan_id().unwrap())
+        })
+        .collect::<Vec<_>>();
+    let ids = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 32);
+    assert!(!ids.contains("s1"));
+    let next = repo.new_scan_id().unwrap();
+    repo.insert_scan(&next, temp.path(), false).unwrap();
+    repo.connect()
+        .unwrap()
+        .execute("DELETE FROM scans WHERE id=?1", [&next])
+        .unwrap();
+    drop(repo);
+    let reopened = Repository::new(&temp.path().join("db")).unwrap();
+    let later = reopened.new_scan_id().unwrap();
+    assert_ne!(later, next);
+    assert!(!ids.contains(&later));
+    assert_eq!(
+        reopened.scan("legacy-uuid-4e03-9af4").unwrap().scan_id,
+        "legacy-uuid-4e03-9af4"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn explicit_junction_root_is_rejected_before_canonicalization() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("real");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("untouched"), b"sentinel").unwrap();
+    let link = temp.path().join("jump");
+    assert!(std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&root)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let service = Service::new(&temp.path().join("db")).unwrap();
+    assert_eq!(
+        service.register_source(link.clone()).unwrap_err().code,
+        "UNSAFE_SCAN_ROOT"
+    );
+    assert_eq!(
+        service
+            .resolve_source(None, Some(link.to_str().unwrap()))
+            .unwrap_err()
+            .code,
+        "UNSAFE_SCAN_ROOT"
+    );
+    assert_eq!(fs::read(root.join("untouched")).unwrap(), b"sentinel");
+}
+
+#[cfg(windows)]
+#[test]
+fn export_parent_replacement_preserves_both_targets() {
+    let (temp, service, scan) = fixture();
+    let parent = temp.path().join("reports");
+    let moved = temp.path().join("moved-reports");
+    fs::create_dir(&parent).unwrap();
+    let target = parent.join("report.json");
+    fs::write(&target, b"ORIGINAL").unwrap();
+    let callback_parent = parent.clone();
+    let callback_moved = moved.clone();
+    let job = JobRuntime::new(
+        JobEvent::new("race", &scan.scan_id, "export", scan.revision),
+        Some(Arc::new(move |event| {
+            if event.phase == "核验输出目录" {
+                fs::rename(&callback_parent, &callback_moved).unwrap();
+                fs::create_dir(&callback_parent).unwrap();
+                fs::write(callback_parent.join("report.json"), b"REPLACEMENT").unwrap();
+            }
+        })),
+    );
+    job.bounded_progress.store(false, Ordering::Release);
+    assert_eq!(
+        export::write_report(&service, &request(&scan, "json"), &target, &job)
+            .unwrap_err()
+            .code,
+        "SOURCE_CHANGED"
+    );
+    assert_eq!(fs::read(target).unwrap(), b"REPLACEMENT");
+    assert_eq!(fs::read(moved.join("report.json")).unwrap(), b"ORIGINAL");
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn export_cleanup_follows_own_open_temp_when_temp_is_moved() {
+    let (temp, service, scan) = fixture();
+    let parent = temp.path().join("reports");
+    let moved = temp.path().join("moved-temp");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&moved).unwrap();
+    let target = parent.join("report.json");
+    fs::write(&target, b"ORIGINAL").unwrap();
+    let callback_parent = parent.clone();
+    let callback_moved = moved.clone();
+    let job = JobRuntime::new(
+        JobEvent::new("temp-race", &scan.scan_id, "export", scan.revision),
+        Some(Arc::new(move |event| {
+            if event.phase == "流式写入报告" {
+                let own_temp = fs::read_dir(&callback_parent)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .find(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
+                    .unwrap();
+                fs::rename(own_temp.path(), callback_moved.join(own_temp.file_name())).unwrap();
+            }
+        })),
+    );
+    job.bounded_progress.store(false, Ordering::Release);
+    assert!(export::write_report(&service, &request(&scan, "json"), &target, &job).is_err());
+    assert_eq!(fs::read(target).unwrap(), b"ORIGINAL");
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn root_copy_is_real_and_returns_top_level_directory() {
+    let (temp, service, scan) = fixture();
+    let root = service
+        .repo
+        .node(&scan.scan_id, "1", Some(scan.revision))
+        .unwrap()
+        .node;
+    let target = temp.path().join("destination");
+    fs::create_dir(&target).unwrap();
+    for kind in ["move", "rename", "trash"] {
+        let plan = file_ops::plan(
+            &service,
+            operation_request(&scan, &root, kind, Some(&target), Some("renamed"), "skip"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.items[0].error.as_ref().unwrap().code,
+            "SCAN_ROOT_PROTECTED"
+        );
+    }
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &root, "copy", Some(&target), None, "skip"),
+    )
+    .unwrap();
+    assert!(plan.items[0].error.is_none(), "{plan:?}");
+    let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+    let done = wait_job(&service, &job.job_id);
+    let result = &done.results.as_ref().unwrap()[0];
+    assert_eq!(result.status, "success", "{done:?}");
+    assert_eq!(
+        result.destination.as_deref(),
+        Some(platform::display(&target.join("source")).as_str())
+    );
+    assert_eq!(
+        fs::read(target.join("source/中文🧭/nested/a.bin")).unwrap(),
+        vec![2u8; 31]
+    );
+}

@@ -1,0 +1,49 @@
+[package]
+name = "spacefold"
+version = "0.1.0"
+description = "Spacefold local disk space analyzer"
+edition = "2021"
+default-run = "spacefold"
+license = "MIT"
+
+[lib]
+name = "spacefold_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:arboard"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+arboard = { version = "3.6", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "=0.40.2", features = ["bundled", "backup", "hooks"] }
+crossbeam-channel = "0.5"
+csv = "1.4"
+rust_xlsxwriter = { version = "0.99.1", features = ["constant_memory"] }
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+zip = "4"
+
+[[bin]]
+name = "spacefold"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "spacefold-probe"
+path = "src/bin/spacefold-probe.rs"

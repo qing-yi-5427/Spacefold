@@ -1,0 +1,12 @@
+import { ratio } from './data';
+import type { ChartNode, Node } from './contracts';
+export interface Weighted {nodeId:string;logicalTotalBytes:string}
+export interface Rect<T> {node:T;x:number;y:number;w:number;h:number}
+/** The deterministic weighted binary split from the final design reference. */
+export function rectangles<T extends Weighted>(items:T[],x:number,y:number,w:number,h:number):Rect<T>[] {
+  const positive=items.filter(item=>BigInt(item.logicalTotalBytes)>0n);if(!positive.length)return [];if(positive.length===1)return [{node:positive[0],x,y,w,h}];const total=positive.reduce((s,n)=>s+BigInt(n.logicalTotalBytes),0n);let sum=0n,k=1,best=total;for(let i=0;i<positive.length-1;i++){sum+=BigInt(positive[i].logicalTotalBytes);const delta=total-2n*sum;const distance=delta<0n?-delta:delta;if(distance<best){best=distance;k=i+1;}}const a=positive.slice(0,k),b=positive.slice(k);const f=ratio(a.reduce((s,n)=>s+BigInt(n.logicalTotalBytes),0n),total);return w>=h?[...rectangles(a,x,y,w*f,h),...rectangles(b,x+w*f,y,w*(1-f),h)]:[...rectangles(a,x,y,w,h*f),...rectangles(b,x,y+h*f,w,h*(1-f))];
+}
+export function polar(cx:number,cy:number,radius:number,angle:number){return [cx+Math.cos(angle)*radius,cy+Math.sin(angle)*radius];}
+export function arcPath(cx:number,cy:number,inner:number,outer:number,start:number,end:number){const finish=Math.min(end,start+Math.PI*2-.0001);const a=polar(cx,cy,outer,start),b=polar(cx,cy,outer,finish),c=polar(cx,cy,inner,finish),d=polar(cx,cy,inner,start);const big=finish-start>Math.PI?1:0;return `M${a.join(',')} A${outer},${outer} 0 ${big},1 ${b.join(',')} L${c.join(',')} A${inner},${inner} 0 ${big},0 ${d.join(',')} Z`;}
+/** Combine visually tiny or budget-truncated entries into a non-operable conserved weight. */
+export function graphNodes(chart:ChartNode,threshold=.003):Node[]{const visible:Node[]=[];let otherBytes=BigInt(chart.otherBytes),otherCount=BigInt(chart.otherCount);for(const child of chart.children){const amount=BigInt(child.node.logicalTotalBytes);if(amount>0n&&ratio(amount,chart.node.logicalTotalBytes)<threshold){otherBytes+=amount;otherCount++;}else visible.push(child.node);}if(otherCount>0n)visible.push({...chart.node,nodeId:'aggregate-'+chart.node.nodeId,parentId:chart.node.nodeId,name:'其他 '+otherCount+' 项',logicalBytes:'0',logicalTotalBytes:otherBytes.toString(),childrenCount:otherCount.toString(),kind:'other',depth:chart.node.depth+1});return visible;}

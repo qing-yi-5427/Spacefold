@@ -1,0 +1,71 @@
+html,body,#root{margin:0;width:100%;min-width:0;min-height:100%;color-scheme:light dark}
+body{background:light-dark(#f5f5f8,#1d1c22)}
+#spacefold-mac{box-sizing:border-box}
+button{cursor:pointer}button:disabled{cursor:default}
+.sf-crumb-fragment{display:contents}
+#spacefold-mac .sf-crumb-fragment>svg{width:11px;height:11px;opacity:.55;flex:none}
+#spacefold-mac.sf-native{height:100dvh;display:flex;flex-direction:column;box-sizing:border-box}
+#spacefold-mac.sf-native .sf-body,#spacefold-mac.sf-native .sf-content,#spacefold-mac.sf-native .sf-view{display:flex;flex-direction:column;flex:1;min-height:0}
+#spacefold-mac.sf-native .sf-view>section,#spacefold-mac.sf-native #disk-workbench,#spacefold-mac.sf-native #disk-map,#spacefold-mac.sf-native #disk-lens,#spacefold-mac.sf-native .dl-shell{display:flex;flex-direction:column;flex:1;min-height:0;height:100%;overflow:hidden}
+#spacefold-mac.sf-native .wb-content,#spacefold-mac.sf-native .dm-content,#spacefold-mac.sf-native .dl-workspace{flex:1;min-height:0;overflow:hidden}
+#spacefold-mac.sf-native .wb-body,#spacefold-mac.sf-native .wb-main,#spacefold-mac.sf-native .wb-directory,#spacefold-mac.sf-native .dm-canvas-wrap{min-height:0}
+#spacefold-mac.sf-native .wb-directory{display:flex;flex-direction:column}
+#spacefold-mac.sf-native .wb-table-zone{overflow:auto;flex:1;min-height:0}
+#spacefold-mac .wb-table thead{position:sticky;top:0;z-index:3;background:var(--wb-background)}
+#spacefold-mac.sf-native .wb-inspector,#spacefold-mac.sf-native .dm-inspector,#spacefold-mac.sf-native .dl-directory-column{overflow:auto;min-height:0;overscroll-behavior:contain}
+#spacefold-mac.sf-native .dm-map{min-height:0!important}
+#spacefold-mac.sf-native #disk-map .dm-content,#spacefold-mac.sf-native #disk-lens .dl-workspace{min-height:0}
+#spacefold-mac.sf-native #disk-map .dm-map{height:0;flex:1}
+#spacefold-mac.sf-native .sf-start{min-height:0;flex:1}
+#spacefold-mac.sf-native .dl-chart-stage{max-height:calc(100dvh - 172px)}
+#spacefold-mac .sf-spacer,#spacefold-mac .sf-spacer:hover{background:transparent!important}
+#spacefold-mac .sf-spacer td{border-radius:0!important}
+#spacefold-mac .sf-page-row button,#spacefold-mac .sf-status-link{border:0;background:transparent;color:var(--sf-accent);font-size:12px;padding:2px 5px}
+#spacefold-mac .sf-status-link{margin-left:8px}
+#spacefold-mac .sf-start{min-height:608px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:28px;gap:7px;color:var(--sf-muted)}
+#spacefold-mac .sf-start>svg{width:32px;height:32px;color:var(--sf-accent)}
+#spacefold-mac .sf-start .wb-button{min-height:33px;border:1px solid var(--sf-line);border-radius:7px;background:var(--sf-accent-soft);color:var(--sf-accent);display:flex;align-items:center;gap:7px;padding:7px 12px}
+#spacefold-mac .sf-empty-directory{display:flex;align-items:center;justify-content:center;min-height:180px;height:100%;color:var(--sf-muted);font-size:13px}
+#spacefold-mac .sf-error-notice{position:absolute;bottom:14px;left:14px;right:14px;z-index:100;display:flex;align-items:center;gap:9px;justify-content:space-between;padding:10px 12px;border:1px solid color-mix(in srgb,var(--sf-danger) 25%,var(--sf-panel));background:var(--sf-panel);color:var(--sf-danger);border-radius:8px;box-shadow:0 4px 20px #00000012;font-size:12px;overflow-wrap:anywhere}
+#spacefold-mac .sf-error-notice button{border:0;background:transparent;color:inherit;padding:4px;display:grid;place-items:center}
+#spacefold-mac .sf-input-action{display:flex;gap:5px;min-width:0}
+#spacefold-mac .sf-input-action input{min-width:0;flex:1}
+#spacefold-mac .sf-plan,#spacefold-mac .sf-results{list-style:none;padding:0;margin:10px 0;display:flex;flex-direction:column;gap:7px}
+#spacefold-mac .sf-plan li,#spacefold-mac .sf-results li{padding:8px 10px;background:var(--sf-soft);border:1px solid var(--sf-line);border-radius:6px;display:flex;flex-direction:column;gap:4px;overflow-wrap:anywhere;font-size:12px}
+#spacefold-mac .sf-plan small,#spacefold-mac .sf-results small{color:var(--sf-muted);font-size:11px}
+#spacefold-mac .sf-results p{margin:3px 0;color:var(--sf-danger)}
+#spacefold-mac .sf-result-success>span{color:var(--da-success)}
+#spacefold-mac .sf-other{padding:10px 6px;font-size:12px;color:var(--sf-muted)}
+#spacefold-mac .sf-other button{display:block;border:0;background:transparent;color:var(--sf-accent);padding:5px 0}
+#spacefold-mac .sf-search-form{display:flex;gap:7px;padding:12px 0;flex-wrap:wrap}
+#spacefold-mac .sf-search-form input,#spacefold-mac .sf-search-form select{min-width:0;height:33px;padding:6px 8px;border:1px solid var(--sf-line);background:var(--sf-panel);color:var(--sf-ink);border-radius:6px;font:inherit}
+#spacefold-mac .sf-search-form input:first-child{flex:1 1 180px}
+#spacefold-mac .sf-search-form input:last-child{width:130px}
+#spacefold-mac .sf-search-results{overflow:auto;min-height:0}
+#spacefold-mac .sf-search-hit{padding:5px 0;border-bottom:1px solid var(--sf-line)}
+#spacefold-mac .sf-search-hit.selected{background:var(--sf-accent-soft);border-radius:6px}
+#spacefold-mac .sf-search-select{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:transparent;color:inherit;padding:6px}
+#spacefold-mac .sf-search-select>span:first-of-type{flex:1;min-width:0}
+#spacefold-mac .sf-search-select strong{font-size:13px;font-weight:500}
+#spacefold-mac .sf-search-select small{display:block;color:var(--sf-muted);overflow-wrap:anywhere;font-size:11px;margin-top:3px}
+#spacefold-mac .sf-search-caption{flex:1;color:var(--sf-muted);font-size:12px}
+#spacefold-mac .sf-recent{display:flex;flex-direction:column;align-items:flex-start;overflow-wrap:anywhere}
+#spacefold-mac .sf-recent span{font-size:12px;max-width:100%;white-space:normal}
+#spacefold-mac .sf-recent small{color:var(--sf-muted);font-size:11px}
+#spacefold-mac .sf-popover{max-height:calc(100% - 90px);overflow:auto}
+@container spacefold (max-width:639.98px){#spacefold-mac.sf-native .wb-inspector,#spacefold-mac.sf-native .dm-inspector,#spacefold-mac.sf-native .dl-directory-column{top:var(--sf-pathbar-height,44px);height:calc(100% - var(--sf-pathbar-height,44px))}#spacefold-mac.sf-native .dl-radial-column{padding-inline:14px}#spacefold-mac.sf-native .dl-chart-stage{max-height:calc(100dvh - 205px)}}
+@media(prefers-reduced-motion:reduce){#spacefold-mac *,#spacefold-mac *::before,#spacefold-mac *::after{transition:none!important;animation:none!important}}
+@media(forced-colors:active){#spacefold-mac .wb-share-track,#spacefold-mac .wb-selection-track,#spacefold-mac .sf-switch{border:1px solid CanvasText}#spacefold-mac .wb-selected{outline:1px solid Highlight}#spacefold-mac .dm-tile[aria-pressed="true"]{outline:2px solid Highlight}#spacefold-mac .sf-muted{color:CanvasText}}
+#spacefold-mac .sf-window-controls{display:flex;align-items:center;gap:1px;flex:none;margin-left:1px;border-left:1px solid var(--sf-line);padding-left:6px}
+#spacefold-mac .sf-window-button{display:grid;place-items:center;width:25px;min-height:31px;padding:5px;border:0;border-radius:5px;background:transparent;color:var(--sf-muted)}
+#spacefold-mac .sf-window-button svg{width:13px;height:13px;stroke-width:1.5}
+#spacefold-mac .sf-window-button:hover{background:var(--sf-soft);color:var(--sf-ink)}
+#spacefold-mac .sf-window-close:hover{background:var(--sf-danger);color:white}
+#spacefold-mac.sf-custom-chrome .sf-source-copy{overflow:hidden}
+#spacefold-mac.sf-custom-chrome .sf-source{max-width:200px}
+#spacefold-mac.sf-custom-chrome .sf-source-name,#spacefold-mac.sf-custom-chrome .sf-source-meta{overflow:hidden;text-overflow:ellipsis}
+@container spacefold (min-width:720px) and (max-width:960px){#spacefold-mac.sf-custom-chrome .sf-topbar{gap:5px;padding-inline:10px}#spacefold-mac.sf-custom-chrome .sf-brand-name{display:none}#spacefold-mac.sf-custom-chrome .sf-source{min-width:105px;max-width:140px;gap:5px;padding-inline:3px}#spacefold-mac.sf-custom-chrome .sf-tab{padding-inline:7px;gap:4px}#spacefold-mac.sf-custom-chrome .sf-header-actions{gap:1px}#spacefold-mac.sf-custom-chrome .sf-tool{min-width:28px;padding-inline:5px}#spacefold-mac.sf-custom-chrome .sf-export{padding-inline:7px;margin-left:1px}}
+@container spacefold (max-width:719.98px){#spacefold-mac.sf-custom-chrome .sf-topbar{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:7px 5px;padding-inline:8px}#spacefold-mac.sf-custom-chrome .sf-switch{grid-row:2;grid-column:1/-1;margin:0}#spacefold-mac.sf-custom-chrome .sf-tab{flex:1}#spacefold-mac.sf-custom-chrome .sf-source{min-width:0;max-width:100%;width:100%;padding-inline:2px;gap:4px}#spacefold-mac.sf-custom-chrome .sf-header-actions{gap:0;margin:0}#spacefold-mac.sf-custom-chrome .sf-window-controls{padding-left:3px;margin-left:0}#spacefold-mac.sf-custom-chrome .sf-window-button{width:23px}}
+@container spacefold (max-width:420px){#spacefold-mac.sf-custom-chrome .sf-source>svg:last-child{display:none}#spacefold-mac.sf-custom-chrome .sf-export{padding-inline:5px}#spacefold-mac.sf-custom-chrome .sf-tool{min-width:27px;padding-inline:5px}}
+#spacefold-mac.sf-native .wb-pathbar,#spacefold-mac.sf-native .dm-pathbar,#spacefold-mac.sf-native .dl-pathbar{max-height:min(160px,25dvh);overflow-y:auto;overscroll-behavior:contain}
+#spacefold-mac.sf-native .sf-inspector-scrim{top:var(--sf-pathbar-height,44px)}

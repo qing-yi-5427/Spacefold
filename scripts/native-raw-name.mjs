@@ -1,0 +1,22 @@
+import {chromium} from '@playwright/test';
+import {mkdirSync,writeFileSync,readFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+const out=path.resolve('artifacts/raw-windows-name'),dest=path.join(out,`copied-${randomUUID()}`);mkdirSync(dest,{recursive:true});
+const python=path.join(process.env.USERPROFILE,'.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe');
+execFileSync(python,['-c',`import os; p=os.path.abspath('artifacts/raw-windows-name')+'\\\\raw-\\ud800-tail.txt';open(p,'wb').write(b'raw windows name fixture')`]);
+const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
+const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
+async function wait(id,type){for(let i=0;i<2000;i++){const state=await invoke(type==='scan'?'get_scan':'get_job',type==='scan'?{scanId:id}:{jobId:id});if(!['running','queued','cancelling','refreshing'].includes(state.status))return state;await page.waitForTimeout(10);}throw Error('timeout');}
+let scan=await invoke('start_scan',{request:{path:out}});scan=await wait(scan.scanId,'scan');
+const children=await invoke('get_children',{request:{scanId:scan.scanId,parentId:'1',revision:scan.revision,pageSize:200}}),node=children.nodes.find(n=>n.name.includes('\ufffd'));
+assert(node.name.includes('\ufffd'));
+const request={scanId:scan.scanId,revision:scan.revision,scope:'selected',scopeId:'1',selectedIds:[node.nodeId],recursive:false,fields:['name','path','logical_bytes'],format:'json',targetPath:path.join(out,'raw-report.json')};
+const job=await invoke('start_export',{request}),result=await wait(job.jobId,'job');assert.equal(result.status,'completed');
+const report=JSON.parse(readFileSync(request.targetPath,'utf8')),row=report.rows[0];assert.equal(row.displayPathReplaced,true);assert.equal(row.pathEncoding,'utf16le');assert(row.pathData.includes('00d8'));
+const plan=await invoke('plan_operation',{request:{scanId:scan.scanId,nodeIds:[node.nodeId],expectedRevision:scan.revision,kind:'copy',destinationPath:dest,conflictPolicy:'skip'}});assert.equal(plan.items[0].error,null);
+const op=await invoke('execute_operation',{planId:plan.planId}),operation=await wait(op.jobId,'job');assert.equal(operation.results[0].status,'success');
+const copied=JSON.parse(execFileSync(python,['-c',`import os,json,sys;root=sys.argv[1];names=os.listdir(root);name=next(n for n in names if '\\ud800' in n);print(json.dumps({'rawUtf16Preserved':True,'nameUtf16le':name.encode('utf-16le','surrogatepass').hex(),'contentMatches':open(os.path.join(root,name),'rb').read()==b'raw windows name fixture'}))`,dest],{encoding:'utf8'}));assert(copied.contentMatches);
+const evidence={scan,node,row,copied,operation};writeFileSync(path.join(out,'results.json'),JSON.stringify(evidence,null,2));console.log(JSON.stringify({passed:true,copied},null,2));await browser.close();

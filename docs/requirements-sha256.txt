@@ -1,0 +1,2 @@
+1dc51902dd03cfaa4e7fc72d08d01c70a4a4028e738e95ac8ecb9a8e7e94b5d9  spacefold-features-tech.md
+e7a563f80dd5572bbcfb45167469ce2835633088062a18671b39580c31680148  spacefold-ui-spec.md
