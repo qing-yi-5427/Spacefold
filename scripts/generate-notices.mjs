@@ -38,7 +38,7 @@ function licenseFiles(dir) {
 for (const pkg of metadata.packages.filter(pkg => pkg.source).sort((a,b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`))) {
   const dir = path.dirname(pkg.manifest_path);
   const label = `Rust: ${pkg.name} ${pkg.version}`;
-  rows.push(`| Rust | ${pkg.name} | ${pkg.version} | ${pkg.license || 'see license file'} |`);
+  rows.push(`| Rust | [${pkg.name}](https://crates.io/crates/${pkg.name}/${pkg.version}) | ${pkg.version} | ${pkg.license || 'see license file'} |`);
   const files = licenseFiles(dir);
   for (const file of files) addNotice(label, fs.readFileSync(file, 'utf8'), `crate ${pkg.name} ${pkg.version}: ${path.relative(dir, file).replaceAll('\\', '/')}`);
   if (!files.length) {
@@ -59,7 +59,7 @@ for (const pkg of metadata.packages.filter(pkg => pkg.source).sort((a,b) => `${a
 }
 for (const [key, pkg] of Object.entries(lock.packages).filter(([key]) => key).sort(([a],[b]) => a.localeCompare(b))) {
   const name = key.split('node_modules/').at(-1);
-  rows.push(`| npm | ${name} | ${pkg.version} | ${pkg.license || 'see package'} |`);
+  rows.push(`| npm | [${name}](https://www.npmjs.com/package/${name}/v/${pkg.version}) | ${pkg.version} | ${pkg.license || 'see package'} |`);
   if (!fs.existsSync(key)) continue; // optional packages for other platforms are not distributed
   const files = licenseFiles(key);
   if (!files.length && !pkg.dev) throw new Error(`Missing production npm license: ${name}`);
