@@ -9,13 +9,17 @@ await page.waitForFunction(()=>window.__TAURI_INTERNALS__);
 const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 async function until(id,condition){for(let i=0;i<2000;i++){const scan=await invoke('get_scan',{scanId:id});if(condition(scan))return scan;await page.waitForTimeout(5);}throw Error('scan timeout');}
 if(phase==='prepare'){
+  const nativePid=Number(process.env.QA_NATIVE_PID);assert(Number.isSafeInteger(nativePid)&&nativePid>0,'Owned QA process ID required');
+  const expectedExecutable=path.resolve(process.env.QA_EXPECTED_EXE||'dist-release/Spacefold.exe').replaceAll("'","''");
+  execFileSync('powershell.exe',['-NoProfile','-Command',`$taskP=Get-Process -Id ${nativePid}; if($taskP.Path -ne '${expectedExecutable}'){throw 'Unexpected process'}`]);
   const original=await invoke('read_settings'),settings={...original,accent:'teal',theme:'dark',sizeUnit:'binary',defaultView:'lens',lastExportFormat:'xlsx'};await invoke('update_settings',{settings});
   let completed=await invoke('start_scan',{request:{path:path.resolve('artifacts/native-ui-source')}});completed=await until(completed.scanId,s=>s.status==='completed');
   let cancelled=await invoke('start_scan',{request:{path:path.resolve('artifacts/benchmark-source')}});await invoke('cancel_scan',{scanId:cancelled.scanId});cancelled=await until(cancelled.scanId,s=>s.status==='cancelled');
   let interrupted=await invoke('start_scan',{request:{path:path.resolve('artifacts/benchmark-source')}});interrupted=await until(interrupted.scanId,s=>s.status==='running'&&BigInt(s.discoveredCount)>2000n);
   writeFileSync(path.join(out,'expected.json'),JSON.stringify({original,settings,completed,cancelled,interrupted},null,2));
-  await browser.close();
-  execFileSync('powershell.exe',['-NoProfile','-Command',`$taskP=Get-Process -Id ${Number(process.env.QA_NATIVE_PID)}; if($taskP.Path -ne '${path.resolve(process.env.QA_EXPECTED_EXE||'dist-release/Spacefold.exe').replaceAll("'","''")}'){throw 'Unexpected process'}; Stop-Process -Id $taskP.Id`]);
+  // The connected, validated QA app is still running. Kill immediately while
+  // the scan is active; launching PowerShell here can outlast a fast scan.
+  process.kill(nativePid);await browser.close();
   console.log('Prepared actual app process interruption and persisted settings');
 }else{
   const expected=JSON.parse(readFileSync(path.join(out,'expected.json'),'utf8')),settings=await invoke('read_settings');

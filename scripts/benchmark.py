@@ -1,5 +1,5 @@
 """Rotated same-machine benchmarks. All reports and DBs stay outside the sources."""
-import argparse,ctypes,hashlib,json,os,re,statistics,subprocess,sys,threading,time,sqlite3
+import argparse,ctypes,hashlib,json,os,re,shutil,statistics,subprocess,sys,threading,time,sqlite3
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'artifacts/python-qa'))
 import psutil
@@ -10,8 +10,8 @@ WDS=ROOT/'artifacts/bench-tools/windirstat/x64/WinDirStat.exe'
 SF=Path(os.environ.get('BENCHMARK_PROBE',ROOT/'src-tauri/target/release/spacefold-probe.exe')).resolve()
 class Counters(ctypes.Structure):
     _fields_=[('cb',ctypes.c_ulong),('faults',ctypes.c_ulong)]+[(name,ctypes.c_size_t) for name in ('peakWorkingSet','workingSet','peakPaged','paged','peakNonPaged','nonPaged','pagefile','peakPagefile','private')]
-def run(name,command,report=None):
-    start=time.perf_counter();first=None;first_report=None;output=bytearray();samples=[];peak=0
+def run(name,command,report=None,database=None):
+    start=time.perf_counter();first=None;first_report=None;output=bytearray();samples=[];peak=0;wal_peak=0;wal_observed=False
     startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
     process=subprocess.Popen([str(v) for v in command],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,startupinfo=startup)
     def read():
@@ -23,6 +23,11 @@ def run(name,command,report=None):
             output.extend(data)
     reader=threading.Thread(target=read);reader.start();monitored=psutil.Process(process.pid)
     while process.poll() is None:
+        if database is not None:
+            wal=Path(str(database)+'-wal')
+            try:
+                wal_peak=max(wal_peak,wal.stat().st_size);wal_observed=True
+            except FileNotFoundError:pass
         if report is not None and first_report is None and report.exists() and report.stat().st_size>0:first_report=time.perf_counter()-start
         try:
             rss=sum(p.memory_info().rss for p in [monitored]+monitored.children(recursive=True) if p.is_running());peak=max(peak,rss)
@@ -34,6 +39,7 @@ def run(name,command,report=None):
     ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.c_void_p(int(process._handle)),ctypes.byref(counter),ctypes.sizeof(counter))
     text=output.decode('utf-8',errors='replace');(OUT/f'{name}.log').write_text(text,encoding='utf-8')
     result={'name':name,'command':[str(v) for v in command],'exitCode':process.returncode,'elapsedSeconds':round(elapsed,4),'firstOutputSeconds':None if first is None else round(first,4),'firstNonemptyReportSeconds':None if first_report is None else round(first_report,4),'peakParentWorkingSetBytes':counter.peakWorkingSet,'peakSampledProcessTreeWorkingSetBytes':peak,'sampleIntervalMs':10,'samples':samples}
+    if database is not None:result.update({'peakSampledWalBytes':wal_peak if wal_observed else None,'walSampledPeakIsLowerBound':True,'walBytesAfterExit':Path(str(database)+'-wal').stat().st_size if Path(str(database)+'-wal').exists() else 0})
     (OUT/f'{name}.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     assert process.returncode==0,(name,text[:1000])
     return result,text
@@ -92,17 +98,49 @@ def verify_spacefold(data,scan,exp,manifest):
         assert nodes[1]['total']==int(exp['logicalBytes']) and nodes[1]['fc']==exp['files'] and nodes[1]['dc']==exp['directories']
         plan=db.execute('EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id=? AND parent_id=1 ORDER BY sort_size,name COLLATE NOCASE,id LIMIT 200',(scan['scanId'],)).fetchall()
         assert any('nodes_parent_size_v3' in row[3] for row in plan),plan
-        return {'independentDatabaseRead':True,'fullPathAndRawBytesVerified':True,'allDirectoryAggregatesVerified':True,'completeNodes':len(rows),'indexes':sorted(required),'sizePageQueryPlan':plan,'journalMode':'wal','databaseBytes':database.stat().st_size}
+        return {'independentDatabaseRead':True,'fullPathAndRawBytesVerified':True,'allDirectoryAggregatesVerified':True,'completeNodes':len(rows),'indexes':sorted(required),'sizePageQueryPlan':plan,'journalMode':'wal','pageSize':db.execute('PRAGMA page_size').fetchone()[0],'databaseBytes':database.stat().st_size}
+def history_snapshot(database):
+    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+        scans=db.execute('SELECT id,source,status,discovered,error_count,finished,revision FROM scans ORDER BY id').fetchall()
+        digest=hashlib.sha256();count=0
+        for row in db.execute('SELECT scan_id,id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,error_code FROM nodes ORDER BY scan_id,id'):
+            values=[value.hex() if isinstance(value,bytes) else value for value in row]
+            digest.update(json.dumps(values,separators=(',',':')).encode('utf-8'));count+=1
+        return {'scanRecords':scans,'historyNodeCount':count,'historyNodeDigest':digest.hexdigest(),'pageSize':db.execute('PRAGMA page_size').fetchone()[0]}
+def verify_history(database,seed):
+    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+        digest=hashlib.sha256();count=0
+        for scan in seed['scanRecords']:
+            actual=db.execute('SELECT id,source,status,discovered,error_count,finished,revision FROM scans WHERE id=?',(scan[0],)).fetchone()
+            assert actual==scan,'Historical scan metadata changed'
+            for row in db.execute('SELECT scan_id,id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,error_code FROM nodes WHERE scan_id=? ORDER BY id',(scan[0],)):
+                values=[value.hex() if isinstance(value,bytes) else value for value in row]
+                digest.update(json.dumps(values,separators=(',',':')).encode('utf-8'));count+=1
+        assert count==seed['historyNodeCount'] and digest.hexdigest()==seed['historyNodeDigest'],'Historical tree changed'
+        assert db.execute('PRAGMA page_size').fetchone()[0]==seed['pageSize']
+        return {'historicalTreeUnchanged':True,**seed}
 def count_gdu(item):
     if isinstance(item,dict):return int('name' in item)+sum(count_gdu(value) for value in item.values())
     if isinstance(item,list):return sum(count_gdu(value) for value in item)
     return 0
-parser=argparse.ArgumentParser();parser.add_argument('--rounds',type=int,default=5);parser.add_argument('--sources',type=Path);parser.add_argument('--tools',default='gdu-summary,spacefold-kernel,dua,gdu-full-tree,windirstat-full-tree,spacefold-sqlite,gdu-sqlite');parser.add_argument('--early-gate-ratio',type=float,default=1.05);args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--rounds',type=int,default=5);parser.add_argument('--sources',type=Path);parser.add_argument('--tools',default='gdu-summary,spacefold-kernel,dua,gdu-full-tree,windirstat-full-tree,spacefold-sqlite,gdu-sqlite');parser.add_argument('--early-gate-ratio',type=float,default=1.05);parser.add_argument('--seed-database',type=Path);args=parser.parse_args()
 assert args.rounds>=5,'Formal comparisons require at least five rounds'
 assert not os.environ.get('SPACEFOLD_PROFILE'),'Formal benchmark must use the normal unprofiled release path'
 sources={'small100k':ROOT/'artifacts/benchmark-source','real-msvc-headers':Path('C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/include')}
 if args.sources:sources={key:Path(value).resolve() for key,value in json.loads(args.sources.read_text(encoding='utf-8-sig')).items()}
 tools=args.tools.split(',')
+seed=None
+seed_destinations=set()
+if args.seed_database:
+    args.seed_database=args.seed_database.resolve();seed=history_snapshot(args.seed_database)
+    assert seed['pageSize']==4096 and seed['historyNodeCount']>0,'Legacy seed must contain real 4KiB history'
+    assert not Path(str(args.seed_database)+'-wal').exists() or Path(str(args.seed_database)+'-wal').stat().st_size==0,'Seed must already be checkpointed'
+    (OUT/'legacy-seed.json').write_text(json.dumps({'path':str(args.seed_database),'sha256':hashlib.sha256(args.seed_database.read_bytes()).hexdigest(),**seed},indent=2),encoding='utf-8')
+    for dataset in sources:
+        for round_index in range(args.rounds):
+            destination=OUT/f'{dataset}-round{round_index+1}-spacefold-sqlite-db'
+            assert not destination.exists(),'Never reuse a seeded benchmark destination'
+            destination.mkdir();shutil.copyfile(args.seed_database,destination/'spacefold.sqlite3');seed_destinations.add(destination)
 assert not ctypes.windll.shell32.IsUserAnAdmin(),'Formal benchmark must run without elevation'
 assert not any(p.info['name'].lower() in ('cargo.exe','rustc.exe','cl.exe','link.exe') for p in psutil.process_iter(['name']) if p.info['name']),'Concurrent compiler detected'
 fingerprints={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in (SF,GDU,DUA,WDS)}
@@ -115,7 +153,7 @@ for dataset,source in sources.items():
         if round_index%2:order.reverse()
         for tool in order:
             name=f'{dataset}-round{round_index+1}-{tool}';report=OUT/f'{name}-report.json';data=OUT/f'{name}-db'
-            assert not report.exists() and not data.exists() and not (OUT/(name+'.sqlite')).exists(),'Never reuse a benchmark destination'
+            assert not report.exists() and (not data.exists() or data in seed_destinations) and not (OUT/(name+'.sqlite')).exists(),'Never reuse a benchmark destination'
             assert not any(p.info['name'].lower() in ('cargo.exe','rustc.exe','cl.exe','link.exe') for p in psutil.process_iter(['name']) if p.info['name']),'Concurrent compiler detected'
             if tool=='gdu-summary':command=[GDU,'-a','-n','-p','--no-prefix','--no-delete','--no-view-file','-s',source]
             elif tool=='gdu-full-tree':command=[GDU,'-a','-p','--no-delete','--no-view-file','-o',report,source]
@@ -124,7 +162,7 @@ for dataset,source in sources.items():
             elif tool=='gdu-sqlite':command=[GDU,'-a','-n','-p','--no-prefix','--no-delete','--no-view-file','-s',f'--db={OUT/(name+".sqlite")}',source]
             elif tool=='spacefold-kernel':command=[SF,'kernel',source]
             else:command=[SF,'scan',data,source]
-            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
+            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None,data/'spacefold.sqlite3' if tool=='spacefold-sqlite' else None);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
             if tool=='gdu-summary':assert int(re.search(r'^\s*(\d+)',text).group(1))==int(exp['logicalBytes'])
             elif tool=='gdu-full-tree':
                 doc=json.loads(report.read_text(encoding='utf-8'));assert doc[3][0]['asize']==int(exp['logicalBytes']);assert count_gdu(doc)==exp['entriesExcludingRoot']+1
@@ -142,6 +180,7 @@ for dataset,source in sources.items():
             else:
                 doc=json.loads(text.strip().splitlines()[-1]);scan=doc.get('scan',doc);assert scan['logicalTotalBytes']==exp['logicalBytes'];assert str(scan.get('discoveredCount',scan.get('count')))==str(exp['entriesExcludingRoot']+(tool=='spacefold-sqlite'))
                 if tool=='spacefold-sqlite':result['persistenceVerification']=verify_spacefold(data,scan,exp,manifest)
+                if tool=='spacefold-sqlite' and seed is not None:result['historyVerification']=verify_history(data/'spacefold.sqlite3',seed)
                 if 'firstResultElapsedMs' in doc:result['firstResultElapsedMs']=doc['firstResultElapsedMs']
                 if 'elapsedMs' in doc:result['internalElapsedMs']=doc['elapsedMs']
             result['correctnessVerified']=True;result.pop('samples',None);all_results.append(result)
