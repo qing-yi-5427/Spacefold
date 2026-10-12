@@ -10,6 +10,14 @@ use std::{
 };
 
 pub type ProgressCallback = Arc<dyn Fn(JobEvent) + Send + Sync>;
+#[cfg(test)]
+type CancelTestHook = (
+    String,
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
+#[cfg(test)]
+static CANCEL_TEST_HOOK: Mutex<Option<CancelTestHook>> = Mutex::new(None);
 pub struct JobRuntime {
     pub cancel: Arc<AtomicBool>,
     pub event: Mutex<JobEvent>,
@@ -251,8 +259,29 @@ impl Service {
         if job.terminal() {
             return Ok(());
         }
-        job.cancel.store(true, Ordering::Release);
+        #[cfg(test)]
+        {
+            let hook = CANCEL_TEST_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|h| h.0 == id)
+                .cloned();
+            if let Some((_, entered, release)) = hook {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
         job.update(|e| {
+            // Completion can race with the unlocked fast check above. Make the
+            // cancellation decision under the same mutex as terminal updates.
+            if matches!(
+                e.status.as_str(),
+                "completed" | "completed_with_errors" | "cancelled" | "failed" | "interrupted"
+            ) {
+                return;
+            }
+            job.cancel.store(true, Ordering::Release);
             e.status = "cancelling".into();
             e.phase = "正在结束当前读取，保留已完成部分".into()
         });
@@ -424,5 +453,60 @@ impl Service {
         let mut returned = original;
         returned.status = "running".into();
         Ok(returned)
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn late_cancel_cannot_overwrite_a_concurrently_committed_terminal_event() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = Service::new(fixture.path()).unwrap();
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                *CANCEL_TEST_HOOK.lock().unwrap() = None;
+            }
+        }
+        let _clear = ClearHook;
+        for terminal in [
+            "completed",
+            "completed_with_errors",
+            "cancelled",
+            "failed",
+            "interrupted",
+        ] {
+            let id = format!("terminal-{terminal}");
+            let job = service
+                .add_job(&id, JobEvent::new(&id, "scan", "scan", 1), None)
+                .unwrap();
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            *CANCEL_TEST_HOOK.lock().unwrap() = Some((id.clone(), entered_tx, release_rx));
+            let cloned = service.clone();
+            let cancel_id = id.clone();
+            let cancelling = std::thread::spawn(move || cloned.cancel_job(&cancel_id));
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            job.update(|e| {
+                e.status = terminal.into();
+                e.revision = 7;
+                e.discovered_count = "2048".into();
+                e.phase = "final event".into();
+            });
+            release_tx.send(()).unwrap();
+            cancelling.join().unwrap().unwrap();
+            let event = job.snapshot();
+            assert!(job.terminal());
+            assert_eq!(event.status, terminal);
+            assert_eq!(event.phase, "final event");
+            assert_eq!(event.revision, 7);
+            assert_eq!(event.discovered_count, "2048");
+            assert!(
+                !job.cancel.load(Ordering::Acquire),
+                "late cancellation cannot request work after a terminal event"
+            );
+        }
     }
 }
