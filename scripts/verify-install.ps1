@@ -1,10 +1,11 @@
-param([string]$InstallDirectory = 'artifacts/install-test/Spacefold')
+param([string]$InstallDirectory = 'artifacts/install-test/Spacefold',[string]$EvidenceDirectory = 'artifacts/install-test')
 $ErrorActionPreference = 'Stop'
 $taskRoot = [System.IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 Set-Location -LiteralPath $taskRoot
 $taskInstall = [System.IO.Path]::GetFullPath((Join-Path $taskRoot $InstallDirectory))
 if (-not $taskInstall.StartsWith($taskRoot + [System.IO.Path]::DirectorySeparatorChar,[System.StringComparison]::OrdinalIgnoreCase)) { throw 'Test installation must stay inside this workspace' }
-$taskEvidence = Join-Path $taskRoot 'artifacts/install-test'
+$taskEvidence = [System.IO.Path]::GetFullPath((Join-Path $taskRoot $EvidenceDirectory))
+if (-not $taskEvidence.StartsWith($taskRoot + [System.IO.Path]::DirectorySeparatorChar,[System.StringComparison]::OrdinalIgnoreCase)) { throw 'Test evidence must stay inside this workspace' }
 New-Item -ItemType Directory -Force $taskEvidence | Out-Null
 $taskMarker = Join-Path $taskEvidence 'qa-owned.json'
 $taskUninstallRoots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
@@ -14,8 +15,10 @@ foreach ($taskRegistryRoot in $taskUninstallRoots) {
   }
 }
 if ((Test-Path -LiteralPath $taskInstall) -and @(Get-ChildItem -LiteralPath $taskInstall -Force).Count) {
-  if (-not (Test-Path -LiteralPath $taskMarker)) { throw 'Refusing to overwrite an installation without a QA ownership marker' }
-  if ((Get-Content -LiteralPath $taskMarker -Raw -Encoding utf8 | ConvertFrom-Json).installDirectory -ne $taskInstall) { throw 'QA ownership path mismatch' }
+  $taskExistingMarker = $taskMarker
+  if (-not (Test-Path -LiteralPath $taskExistingMarker)) { $taskExistingMarker = Join-Path (Split-Path $taskInstall -Parent) 'qa-owned.json' }
+  if (-not (Test-Path -LiteralPath $taskExistingMarker)) { throw 'Refusing to overwrite an installation without a QA ownership marker' }
+  if ((Get-Content -LiteralPath $taskExistingMarker -Raw -Encoding utf8 | ConvertFrom-Json).installDirectory -ne $taskInstall) { throw 'QA ownership path mismatch' }
 }
 [ordered]@{installDirectory=$taskInstall;createdBy='Spacefold isolated installer QA'} | ConvertTo-Json | Set-Content -LiteralPath $taskMarker -Encoding utf8
 $taskVersion = (Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw -Encoding utf8 | ConvertFrom-Json).version

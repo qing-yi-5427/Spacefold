@@ -3,7 +3,7 @@ import {mkdirSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
-const out=path.resolve('artifacts/cancellation');mkdirSync(out,{recursive:true});
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/cancellation');mkdirSync(out,{recursive:true});
 const fixture=path.join(out,randomUUID());mkdirSync(fixture);
 for(let i=0;i<12000;i++)writeFileSync(path.join(fixture,`entry-${String(i).padStart(6,'0')}.txt`),'123');
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9223}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));

@@ -4,7 +4,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {execFileSync,spawnSync} from 'node:child_process';
-const out=path.resolve('artifacts/backend');mkdirSync(out,{recursive:true});
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/backend');mkdirSync(out,{recursive:true});
 const fixture=path.join(out,`fixture-${randomUUID()}`),source=path.join(fixture,'source'),destination=path.join(fixture,'destination');
 mkdirSync(source,{recursive:true});mkdirSync(destination);
 for(const dirname of ['Data','Database','空目录'])mkdirSync(path.join(source,dirname));

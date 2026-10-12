@@ -2,7 +2,7 @@ import {chromium,expect} from '@playwright/test';
 import {execFileSync} from 'node:child_process';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
-const pid=process.env.QA_NATIVE_PID||'51068',port=process.env.QA_CDP_PORT||'9223',out='artifacts/native-real-ui';mkdirSync(out,{recursive:true});
+const pid=process.env.QA_NATIVE_PID||'51068',port=process.env.QA_CDP_PORT||'9223',out=process.env.QA_OUTPUT_DIRECTORY||'artifacts/native-real-ui';mkdirSync(out,{recursive:true});
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${port}`),context=browser.contexts()[0],page=context.pages().find(p=>!p.url().startsWith('devtools:'));
 await (await context.newCDPSession(page)).send('Emulation.clearDeviceMetricsOverride');execFileSync('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/resize-native.ps1','-ProcessId',pid,'-Width','1026','-Height','800']);
 await page.reload();await page.waitForFunction(()=>window.spacefoldPreview?.getScan()?.status==='completed'&&document.querySelectorAll('[data-wb-row]').length>10,null,{timeout:60000});

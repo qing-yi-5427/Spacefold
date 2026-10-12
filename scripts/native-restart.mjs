@@ -3,7 +3,7 @@ import {mkdirSync,writeFileSync,readFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-const out=path.resolve('artifacts/native-restart');mkdirSync(out,{recursive:true});const phase=process.argv[2]||'prepare';
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/native-restart');mkdirSync(out,{recursive:true});const phase=process.argv[2]||'prepare';
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
 await page.waitForFunction(()=>window.__TAURI_INTERNALS__);
 const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});

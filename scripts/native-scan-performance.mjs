@@ -2,7 +2,7 @@ import {chromium,expect} from '@playwright/test';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-const out=path.resolve('artifacts/native-scan-performance');mkdirSync(out,{recursive:true});
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/native-scan-performance');mkdirSync(out,{recursive:true});
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
 await page.reload();
 await page.waitForFunction(()=>window.spacefoldPreview?.getScan());
