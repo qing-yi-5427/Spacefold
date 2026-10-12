@@ -133,6 +133,8 @@ static READER_TEST_HOOK: std::sync::Mutex<Option<ReaderTestHook>> = std::sync::M
 #[cfg(test)]
 static METADATA_PANIC_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+static READER_PANIC_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
 type DispatchHook = (
     PathBuf,
     crossbeam_channel::Sender<()>,
@@ -171,21 +173,34 @@ enum DirectoryMessage {
         error: AppError,
     },
     Done(ReaderTimings),
+    Fatal(AppError),
 }
 
-/// One reader overlaps enumeration/encoding with the sole SQLite writer. Only
+/// Two readers overlap enumeration/encoding with the sole SQLite writer. Only
 /// already-persisted directory IDs are requested. Bounded chunks provide
 /// backpressure, and no iterator/file handle crosses its owning thread.
 fn read_directories(
     requests: crossbeam_channel::Receiver<(i64, PathBuf, u32)>,
     output: crossbeam_channel::Sender<DirectoryMessage>,
     cancel: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
     profile: bool,
     budget: std::sync::Arc<ReaderBudget>,
 ) {
     while let Ok((parent, path, depth)) = requests.recv() {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             break;
+        }
+        #[cfg(test)]
+        {
+            let panic_here = READER_PANIC_PATH
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| p == &path);
+            if panic_here {
+                panic!("injected directory reader failure");
+            }
         }
         #[cfg(test)]
         {
@@ -260,7 +275,7 @@ fn read_directories(
         let mut bytes = entries.capacity()
             * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
         loop {
-            if cancel.load(Ordering::Acquire) {
+            if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                 return;
             }
             let started = profile.then(Instant::now);
@@ -439,22 +454,46 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
         let (directory_tx, directory_rx) = crossbeam_channel::bounded(READER_QUEUE_CHUNKS);
         let enabled = profile.enabled;
         let budget = std::sync::Arc::new(ReaderBudget::default());
-        let reader_budget = budget.clone();
-        let reader = scope.spawn(move || {
-            read_directories(
-                request_rx,
-                directory_tx,
-                &job.cancel,
-                enabled,
-                reader_budget,
-            )
-        });
+        let reader_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let requests = request_rx.clone();
+            let output = directory_tx.clone();
+            let reader_budget = budget.clone();
+            let stop = reader_stop.clone();
+            readers.push(scope.spawn(move || -> Result<()> {
+                let fault_output = output.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    read_directories(
+                        requests,
+                        output,
+                        &job.cancel,
+                        &stop,
+                        enabled,
+                        reader_budget.clone(),
+                    )
+                }));
+                if outcome.is_err() {
+                    stop.store(true, Ordering::Release);
+                    reader_budget.stop();
+                    let error = AppError::new("WORKER_FAILED", "枚举线程异常退出");
+                    let _ = fault_output.send(DirectoryMessage::Fatal(error.clone()));
+                    return Err(error);
+                }
+                Ok(())
+            }));
+        }
+        drop(request_rx);
+        drop(directory_tx);
         let result = (|| -> Result<()> {
             let mut in_flight = 0usize;
             let mut refill = true;
             'directories: loop {
                 if job.cancel.load(Ordering::Acquire) {
                     break;
+                }
+                if reader_stop.load(Ordering::Acquire) {
+                    return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                 }
                 if consumed >= 256
                     || consumed > 0 && batch_started.elapsed() >= Duration::from_millis(100)
@@ -506,6 +545,9 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         }
                         if job.cancel.load(Ordering::Acquire) {
                             break 'directories;
+                        }
+                        if reader_stop.load(Ordering::Acquire) {
+                            return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                         }
                         let path = platform::decode_path(path);
                         c.execute("INSERT INTO consumed_dirs(id) VALUES(?1)", [parent])?;
@@ -566,12 +608,21 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         hook.waiting.send(()).unwrap();
                     }
                 }
-                let message = match directory_rx.recv() {
+                let received = directory_rx.recv_timeout(Duration::from_millis(50));
+                profile.reader_wait_ms += milliseconds(wait_started);
+                let message = match received {
                     Ok(message) => message,
                     Err(_) if job.cancel.load(Ordering::Acquire) => break,
-                    Err(_) => return Err(AppError::new("WORKER_FAILED", "枚举线程中断")),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                        if reader_stop.load(Ordering::Acquire) =>
+                    {
+                        return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"))
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(AppError::new("WORKER_FAILED", "枚举线程中断"))
+                    }
                 };
-                profile.reader_wait_ms += milliseconds(wait_started);
                 match message {
                     DirectoryMessage::Entries {
                         parent,
@@ -642,6 +693,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         profile.encode_ms += timings.encode_ms;
                         refill = true;
                     }
+                    DirectoryMessage::Fatal(error) => return Err(error),
                 }
                 if last_emit.elapsed() >= Duration::from_millis(100) {
                     emit_scan(service, scan_id, job, "running", "读取目录与元数据")?;
@@ -654,9 +706,18 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
         // cancellation and on errors. Join it before flushing/finalizing state.
         drop(request_tx);
         drop(directory_rx);
+        reader_stop.store(true, Ordering::Release);
         budget.stop();
-        if reader.join().is_err() {
-            return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
+        let mut reader_error = None;
+        for reader in readers {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => reader_error = Some(error),
+                Err(_) => reader_error = Some(AppError::new("WORKER_FAILED", "枚举线程异常退出")),
+            }
+        }
+        if let Some(error) = reader_error {
+            return Err(error);
         }
         result
     });
@@ -1206,5 +1267,37 @@ mod tests {
         let committed = service.repo.scan(&scan.scan_id).unwrap();
         assert_eq!(committed.status, "failed");
         assert_eq!(committed.discovered_count, "1");
+    }
+
+    #[test]
+    fn reader_panic_with_idle_peer_fails_and_joins_both_readers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("unread.txt"), b"abc").unwrap();
+        let root = platform::absolute(&source).unwrap();
+        *READER_PANIC_PATH.lock().unwrap() = Some(root.clone());
+        struct ClearPanic;
+        impl Drop for ClearPanic {
+            fn drop(&mut self) {
+                *READER_PANIC_PATH.lock().unwrap() = None;
+            }
+        }
+        let _hook = ClearPanic;
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let started = Instant::now();
+        let scan = service.start_scan(root, None).unwrap();
+        let event = terminal(&service, &scan.scan_id);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle peer must not retain output channel forever"
+        );
+        assert_eq!(event.status, "failed");
+        assert_eq!(event.error.unwrap().code, "WORKER_FAILED");
+        let committed = service.repo.scan(&scan.scan_id).unwrap();
+        assert_eq!(committed.status, "failed");
+        assert_eq!(committed.discovered_count, "1");
+        assert_eq!(event.revision, committed.revision);
+        assert_eq!(event.discovered_count, committed.discovered_count);
     }
 }
