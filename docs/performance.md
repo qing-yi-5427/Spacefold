@@ -72,13 +72,19 @@ Spacefold 完整 SQLite 流程中位数 0.1016 秒，低于本组 WinDirStat 的
 
 完整 SQLite 内部耗时 792 / 786 / 792 ms，首批已提交可查询节点为 127 / 123 / 119 ms。默认流程保留完整节点、目录聚合与查询索引，扫描中即可分页浏览。终端 `firstOutputSeconds` 是 probe 最终摘要第一次写 stdout 的时间，不是 UI 首批结果时间；WinDirStat 的非空报告文件也不等同于完整报告写完。
 
-此前有效 [36 次结果](../artifacts/benchmarks-release-final/results.json)及其[构建环境](../artifacts/benchmarks-release-final/environment.json)保留作历史。旧轮 Spacefold 小文件中位数为 1.1317 秒，本轮为 0.8314 秒，降低约 26.5%；后者才是最终构建成绩，历史工具结果不混入本轮对照。
+此前有效 [36 次结果](../artifacts/benchmarks-release-final/results.json)及其[构建环境](../artifacts/benchmarks-release-final/environment.json)保留作历史。旧轮 Spacefold 小文件中位数为 1.1317 秒，本轮为 0.8314 秒，降低约 26.5%；后者为本页锁定 probe 的成绩，历史工具结果不混入本轮对照。
 
 ## 测量边界与应用体验
 
 工作集采样周期为 10 ms；原始日志同时保留父进程峰值和采样进程树峰值，后者是采样下界。短进程可能来不及取得进程树样本，采样值 0 表示**未捕获**，不能解释为零内存。上表使用系统记录的父进程峰值，避免把漏采解释为内存优势。
 
 Rust probe 的内存不含 Tauri/WebView2。完整桌面应用另测 exe 与 WebView2 进程树的峰值和交互反馈；不能把核心内存列为整个 GUI 的占用。空间图、透镜和虚拟树的查询/渲染数据也单独记录，不用百万条合成数据库速度替代真实磁盘扫描速度。
+
+桌面专项实测使用独立 portable、生产 URL `http://tauri.localhost/`，开发服务器已停止，构建 SHA-256 为 `56ceacf4e235fac883b91539d567dec2dbe9f380cf45da08e4d259167e570c6d`（PID 29300，WebView2 CDP 观测开启）。在同一 100,000 文件夹具的一次 UI 扫描中，[观测日志](../artifacts/native-scan-performance/results.json)记录首批已提交目录可见 **63.96 ms**、完成状态可见 **797.93 ms**、挂载 34 行、最大帧间隔 12.5 ms，50 ms 以上 Long Task 为 0。首批目录此时可以仍为已知 0 字节，和 probe 的首批数据时间是不同观测点；这次常驻 GUI 测试也不包含进程启动，不混入上面的三轮外部墙钟。
+
+[桌面进程树内存日志](../artifacts/native-scan-performance/process-memory.json)以 10 ms 周期采样 8 秒，包含 Tauri 和 WebView2，工作集合计峰值为 **648,122,368 字节（618.10 MiB）**。这是采样峰值下界；各进程工作集会重复包含共享页面，也不是独占物理内存。该数字保留完整 GUI 成本，不能用 Rust 核心的约 27.64 MiB 替代。
+
+随后三个安全边界修复的最终交付 portable SHA-256 为 `15b5e141f98fa9803bcdedf63cd160dc07b8fa1e8f5aed497b6720bb2ab9c85d`，前端资产 SHA-256 仍为 `12fb935fe0cb1d46aa6a72ce6f2b77823ee923b73935e429b4b84702beb586d9`。[最终功能复证](../artifacts/final/frontend-acceptance.json)及[真实正常窗口状态](../artifacts/final/portable-real-main.json)对应这个新文件；上述桌面性能与 RAM 数字保留其原构建归属。
 
 实际 Tauri/WebView2 窗口对 500 文件扫描进行了 600 / 800 / 1000 CSS px 高度测试，树表完整可见行 11 / 16 / 22，实际挂载 21 / 26 / 32 行，状态栏贴底、详情独立滚动；搜索可直接定位第 420 个文件。证据为 `artifacts/native-height/metrics.json`、`artifacts/native-real-ui/results.json` 和对应原生截图。这证明已接通窗口自适应与按页查询，并不是百万文件真实磁盘扫描性能证明。
 

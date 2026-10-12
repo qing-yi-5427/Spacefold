@@ -7,7 +7,8 @@ const out=path.resolve('artifacts/export-temp-identity',randomUUID());mkdirSync(
 const target=path.join(out,'report.csv');writeFileSync(target,'original report sentinel');
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
 const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
-const scan=(await invoke('get_recent_scans')).find(s=>s.status==='completed'&&s.source.endsWith('benchmark-source'));assert(scan);
+let scan=(await invoke('get_recent_scans')).find(s=>s.status==='completed'&&s.source.endsWith('benchmark-source'));
+if(!scan){scan=await invoke('start_scan',{request:{path:path.resolve('artifacts/benchmark-source')}});for(let i=0;i<2000;i++){scan=await invoke('get_scan',{scanId:scan.scanId});if(scan.status==='completed')break;await page.waitForTimeout(5);}assert.equal(scan.status,'completed');}
 const job=await invoke('start_export',{request:{scanId:scan.scanId,revision:scan.revision,scope:'all',scopeId:'1',selectedIds:[],recursive:true,fields:['name','path','logical_bytes'],format:'csv',targetPath:target}});
 let temp,finalEvent;for(let i=0;i<2000;i++){temp=readdirSync(out).find(name=>name.startsWith('.tmp'));if(temp)break;finalEvent=await invoke('get_job',{jobId:job.jobId});assert(!['completed','failed','cancelled'].includes(finalEvent.status),'export finished before owned temporary replacement');await page.waitForTimeout(1);}assert(temp);
 const originalTempPath=path.join(out,temp),moved=path.join(out,'moved-own-output.tmp');renameSync(originalTempPath,moved);writeFileSync(originalTempPath,'unrelated replacement sentinel');

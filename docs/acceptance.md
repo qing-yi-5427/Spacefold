@@ -11,8 +11,8 @@
 | F05 | 展开、同级排序、多选/范围、键盘、右侧动作 | 通过 | native-ui/results.json：方向键/Space/Shift/往返；native-real-ui有界分页 |
 | F06 | 搜索名称/路径、类型/最小大小、定位和退出恢复 | 通过 | native-real-ui/results.json：sample-0420远页定位、退出恢复；backend名称/路径/类型/阈值 |
 | F07 | 关联打开、资源管理器定位、剪贴板、属性 | 通过 | native-shell/results.json实际Explorer选中、属性窗、Notepads关联；backend剪贴板回读 |
-| F08 | copy/move/rename/trash、冲突、竞争、部分结果与刷新 | 最终两项安全复证中 | 成品真实跨卷/UNC/尾点保护通过；ACL修复后局部刷新和活动AppData祖先保护待新包回归 |
-| F09 | 四格式独立解析、三范围、递归、字段与精度 | 最终临时文件身份复证中 | 成品四格式27行；百万最终CSV/JSON精确1048576行与XLSX拆表通过；临时输出同名替换实测曾造成错误提交，待修复回归 |
+| F08 | copy/move/rename/trash、冲突、竞争、部分结果与刷新 | 通过（已建立本机条件） | 最终native-risks 7/7：跨卷、UNC拒回收站、ACL修复局部刷新/类型/祖先计数、AppData祖先copy拒绝；core真实回收站和四动作自保护；尾点与取消实证 |
+| F09 | 四格式独立解析、三范围、递归、字段与精度 | 通过 | 最终成品四格式27行独立解析；百万CSV/JSON精确1048576行与XLSX拆表；临时文件被移走并同名替换时EXPORT_TEMP_CHANGED、双sentinel保留、只清自身对象 |
 | F10 | 完成/取消/中断记录恢复及过期提示 | 通过 | native-restart/results.json：生产成品真实进程重启恢复3状态；get_scan和历史JSON导出metadata.stale一致 |
 | F11 | 五色、系统主题、GB/GiB、默认视图与重启 | 通过 | native-restart真实teal/dark/binary/lens/xlsx重启；native-real-ui系统主题/单位；native-ui五色 |
 | U01 | 1024浅色紫色默认树14行、右220 | 通过（用户修改已记） | reference与native fixture对照、native-ui/results.json；真正桌面全高+自绘控件按新增要求 |
@@ -30,7 +30,7 @@
 | U13 | 真键盘、菜单/弹层焦点、Escape/Tab | 通过 | native-ui13/13：Escape/Tab、3抽屉关闭后恢复opener；曾发现inert焦点缺陷已修 |
 | U14 | 长路径、空选、叶文件、根动作 | 通过 | 成品native-boundary-ui 3/3根copy计划/空选/rename恢复；backend真实长路径、零/空目录、异常UTF16复制 |
 | U15 | reduced motion/连续切换无锁 | 通过 | native-ui reduced-motion/快速切换无锁 |
-| M5 | 百万元数据、真实盘扫描、Windows程序及安装包 | 最终发布包验证中 | 百万wide/deep首末页2–4ms与三writers重读已过；最终42轮公平对照、停Vite内嵌成品UI通过；三安全修复后的新包及本机安装待验 |
+| M5 | 百万元数据、真实盘扫描、Windows程序及安装包 | 功能/规模/交付通过；性能差距已明示 | 百万wide/deep首末页2–4ms与三writers重读；42轮公平对照；停Vite内嵌portable和隔离NSIS安装版均实际运行，安装版UI扫描501条/128000字节；完整小文件速度仍慢于竞品 |
 
 ## 独立风险检查
 
@@ -45,3 +45,15 @@
 真实Unicode、超过260字符路径、硬链接、稀疏/压缩、junction循环、ACL拒绝后修复、UNC localhost管理共享与跨G→C卷目录复制/移动已验证。异常UTF16名称的JSON原始编码及Shell复制已验证。回收站测试只处理本轮新建夹具，不清空回收站。百万库为合成元数据，记录构建与查询耗时，不冒充百万真实文件扫描。真实小文件性能夹具另有十万文件与逐工具计数/逻辑字节一致证明。
 
 实际云占位、断开网络/卷、HDD、备用数据流、用户配额受限账户和缺失WebView2新系统未建立实机条件，未标为验证通过；程序提供明确覆盖说明与错误/未知状态。
+
+## 最终成品与复证归属
+
+生产业务源码提交 `d052183`，后端冻结快照SHA-256 `051900e5de27ea8bbb56795ef9c7f82c316182e23194352a3f01aaf140cf2ef5`。前端27项测试、后端23项核心回归与3项单元测试、启用custom-protocol的严格Clippy和格式检查通过。CI配置已本地解析，远程CI未运行。
+
+`dist-release/Spacefold.exe` SHA-256 `15b5e141f98fa9803bcdedf63cd160dc07b8fa1e8f5aed497b6720bb2ab9c85d`；安装包SHA-256 `9606ddab03b936b43c14ec65b0a6a5ff2723bf908bd6e19322752f210b66414a`。最终原生UI7/7、边界3/3、窗口控制7/7、600/800/1000高度测试均归属该portable，汇总为`artifacts/final/frontend-acceptance.json`，正常截图为`artifacts/final/portable-real-window.png`。
+
+隔离安装路径为`artifacts/install-test/Spacefold`，安装器exit0。安装后的exe SHA-256为`b1c6f3c9ff07ef133288fe8341eb3b4bdc27d41b870a219d2c07ddd8b0df48bb`，与portable严格仅Tauri安装类型标记`UNK`→`NSS`三字节不同，其他内容一致。安装版在无1420开发服务器条件下从`http://tauri.localhost/`加载嵌入界面、经真实UI完成500文件扫描并正常关闭，证据`artifacts/install-test/installation.json`、`runtime.json`、`installed-webview.png`。release清单含Common Controls 6、longPathAware与asInvoker。
+
+原型13项和21张响应式对照采用较早生产exe`56ceacf4…`，其前端资产与最终程序完全相同：`index-DUGABKED.js` SHA-256 `12fb935fe0cb1d46aa6a72ce6f2b77823ee923b73935e429b4b84702beb586d9`。保留真实构建归属，不把旧exe图混称新图。性能基准与GUI工作集也独立标明所测构建，详见`performance.md`。
+
+完整大文件、日志、截图及竞品下载在本机`artifacts/`保留并由Git忽略；源码包含重现脚本和本文摘要，克隆源码不会自动带入本机证据。版本化交付、真实哈希与构建/验收提交分别保存在`dist-release/BUILDINFO.json`和`SHA256SUMS.txt`。
