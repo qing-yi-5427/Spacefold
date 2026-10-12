@@ -16,3 +16,9 @@ coverage/
 dist-release/
 reference/index.html
 *.tsbuildinfo
+src-tauri/gen/
+.vs/
+*.pfx
+*.p12
+*.pem
+*.key

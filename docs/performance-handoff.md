@@ -41,7 +41,7 @@
 以下为后续 agent 的命令模板，本轮未再执行。先确认文件所有权；保留冻结成品与 raw，普通权限从项目根执行，测试输出只用新建临时夹具，源目录只读。独立正式组必须没有同时编译或其他 agent 的重负载，不关闭用户进程、不清缓存、不关闭安全软件。脚本依赖本地 `artifacts/python-qa/psutil` 和已锁定的三个官方工具。
 
 ```powershell
-Set-Location -LiteralPath 'G:\AI\coding\20-spacefold'
+Set-Location -LiteralPath '<你的 Spacefold 项目目录>'
 Get-FileHash -LiteralPath 'src-tauri/target/release/spacefold-probe.exe' -Algorithm SHA256
 & .\src-tauri\target\release\spacefold-probe.exe version
 
