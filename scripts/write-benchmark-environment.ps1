@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'artifacts/benchmarks-final-42')
+param([string]$OutputDirectory = 'artifacts/benchmarks-final-42',[string]$ProbePath = 'src-tauri/target/release/spacefold-probe.exe',[string]$ProbeSourceCommit = '')
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $taskRoot
@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $taskOs = Get-CimInstance Win32_OperatingSystem
 $taskCpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 $taskComputer = Get-CimInstance Win32_ComputerSystem
-$taskProbe = Get-Item 'src-tauri/target/release/spacefold-probe.exe'
+$taskProbe = Get-Item -LiteralPath $ProbePath
 $taskCommit = cmd /c 'git rev-parse --verify HEAD 2>NUL'
 if ($LASTEXITCODE -ne 0) { $taskCommit = 'uncommitted source snapshot' }
 $taskIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -20,6 +20,7 @@ $taskToolPaths = @('artifacts/bench-tools/gdu/gdu_windows_amd64.exe','artifacts/
   probeSha256 = (Get-FileHash $taskProbe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
   probeLastWrite = $taskProbe.LastWriteTime.ToString('o')
   probeVersion = (& $taskProbe.FullName version | ConvertFrom-Json)
+  probePath = $taskProbe.FullName
   os = $taskOs.Caption
   osVersion = $taskOs.Version
   architecture = $taskOs.OSArchitecture
@@ -28,7 +29,8 @@ $taskToolPaths = @('artifacts/bench-tools/gdu/gdu_windows_amd64.exe','artifacts/
   totalPhysicalMemoryBytes = $taskComputer.TotalPhysicalMemory
   disks = @(Get-CimInstance Win32_DiskDrive | Select-Object Model,MediaType,Size)
   drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID,FileSystem,Size)
-  sourceCommit = $taskCommit
+  sourceCommit = $(if ($ProbeSourceCommit) { $ProbeSourceCommit } else { $taskCommit })
+  harnessCommit = $taskCommit
   sourceStatus = @(git status --short)
   isElevated = $taskPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
   profileEnvironmentEnabled = [bool]$env:SPACEFOLD_PROFILE

@@ -10,6 +10,8 @@ WDS=ROOT/'artifacts/bench-tools/windirstat/x64/WinDirStat.exe'
 SF=Path(os.environ.get('BENCHMARK_PROBE',ROOT/'src-tauri/target/release/spacefold-probe.exe')).resolve()
 class Counters(ctypes.Structure):
     _fields_=[('cb',ctypes.c_ulong),('faults',ctypes.c_ulong)]+[(name,ctypes.c_size_t) for name in ('peakWorkingSet','workingSet','peakPaged','paged','peakNonPaged','nonPaged','pagefile','peakPagefile','private')]
+class IoCounters(ctypes.Structure):
+    _fields_=[(name,ctypes.c_ulonglong) for name in ('readOperations','writeOperations','otherOperations','readBytes','writeBytes','otherBytes')]
 def run(name,command,report=None,database=None):
     start=time.perf_counter();first=None;first_report=None;output=bytearray();samples=[];peak=0;wal_peak=0;wal_observed=False
     startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
@@ -39,6 +41,13 @@ def run(name,command,report=None,database=None):
     ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.c_void_p(int(process._handle)),ctypes.byref(counter),ctypes.sizeof(counter))
     text=output.decode('utf-8',errors='replace');(OUT/f'{name}.log').write_text(text,encoding='utf-8')
     result={'name':name,'command':[str(v) for v in command],'exitCode':process.returncode,'elapsedSeconds':round(elapsed,4),'firstOutputSeconds':None if first is None else round(first,4),'firstNonemptyReportSeconds':None if first_report is None else round(first_report,4),'peakParentWorkingSetBytes':counter.peakWorkingSet,'peakSampledProcessTreeWorkingSetBytes':peak,'sampleIntervalMs':10,'samples':samples}
+    handle=ctypes.c_void_p(int(process._handle));created=ctypes.c_ulonglong();exited=ctypes.c_ulonglong();kernel=ctypes.c_ulonglong();user=ctypes.c_ulonglong()
+    if ctypes.windll.kernel32.GetProcessTimes(handle,ctypes.byref(created),ctypes.byref(exited),ctypes.byref(kernel),ctypes.byref(user)):
+        result.update({'parentKernelCpuSeconds':kernel.value/10000000,'parentUserCpuSeconds':user.value/10000000,'parentTotalCpuSeconds':(kernel.value+user.value)/10000000})
+    io=IoCounters()
+    if ctypes.windll.kernel32.GetProcessIoCounters(handle,ctypes.byref(io)):
+        result['parentOsReportedIo']={field:getattr(io,field) for field,_ in IoCounters._fields_}
+        result['ioBoundary']='OS parent-process counters, not physical device bytes; all children remain in sampled process-tree memory.'
     if database is not None:result.update({'peakSampledWalBytes':wal_peak if wal_observed else None,'walSampledPeakIsLowerBound':True,'walBytesAfterExit':Path(str(database)+'-wal').stat().st_size if Path(str(database)+'-wal').exists() else 0})
     (OUT/f'{name}.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     assert process.returncode==0,(name,text[:1000])
@@ -179,6 +188,7 @@ for dataset,source in sources.items():
                     assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
             else:
                 doc=json.loads(text.strip().splitlines()[-1]);scan=doc.get('scan',doc);assert scan['logicalTotalBytes']==exp['logicalBytes'];assert str(scan.get('discoveredCount',scan.get('count')))==str(exp['entriesExcludingRoot']+(tool=='spacefold-sqlite'))
+                result['probeSummary']=doc
                 if tool=='spacefold-sqlite':result['persistenceVerification']=verify_spacefold(data,scan,exp,manifest)
                 if tool=='spacefold-sqlite' and seed is not None:result['historyVerification']=verify_history(data/'spacefold.sqlite3',seed)
                 if 'firstResultElapsedMs' in doc:result['firstResultElapsedMs']=doc['firstResultElapsedMs']
