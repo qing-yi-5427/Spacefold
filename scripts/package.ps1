@@ -25,7 +25,11 @@ $taskInstaller = "Spacefold_${taskVersion}_x64-setup.exe"
 Copy-Item -LiteralPath (Join-Path 'src-tauri/target/release/bundle/nsis' $taskInstaller) -Destination (Join-Path $OutputDirectory $taskInstaller)
 $taskCommit = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { $taskCommit = 'uncommitted source snapshot' }
-[ordered]@{version=$taskVersion;sourceCommit=$taskCommit;builtAt=(Get-Date).ToString('o');rust=(cargo --version);node=(node --version);npm=(npm --version);frontendLockSha256=(Get-FileHash package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant();rustLockSha256=(Get-FileHash src-tauri/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'BUILDINFO.json') -Encoding utf8
+$taskProbe = Join-Path $taskRoot 'src-tauri/target/release/spacefold-probe.exe'
+$taskSqlite = & $taskProbe version | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $taskSqlite.sqliteCompileOptions.threadsafe1 -or -not $taskSqlite.sqliteCompileOptions.enableApiArmor -or $taskSqlite.sqliteThreadsafe -ne 1) { throw 'Packaged probe SQLite threading/API checks were not verified' }
+$taskAssets = @(Get-ChildItem -LiteralPath 'dist/assets' -File | ForEach-Object { [ordered]@{name=$_.Name;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()} })
+[ordered]@{version=$taskVersion;sourceCommit=$taskCommit;builtAt=(Get-Date).ToString('o');rust=(cargo --version);rustc=(rustc --version);node=(node --version);npm=(npm --version);frontendLockSha256=(Get-FileHash package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant();rustLockSha256=(Get-FileHash src-tauri/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant();productionFeatures=@('desktop','custom-protocol');probeSha256=(Get-FileHash -LiteralPath $taskProbe -Algorithm SHA256).Hash.ToLowerInvariant();sqlite=$taskSqlite;frontendAssets=$taskAssets} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'BUILDINFO.json') -Encoding utf8
 $taskChecksumLines = @(Get-ChildItem -LiteralPath $OutputDirectory -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path $_.Path -Leaf)" })
 [System.IO.File]::WriteAllLines([System.IO.Path]::GetFullPath((Join-Path $OutputDirectory 'SHA256SUMS.txt')), $taskChecksumLines, (New-Object System.Text.UTF8Encoding($false)))
 @'

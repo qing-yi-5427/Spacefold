@@ -64,7 +64,7 @@ def expected(source):
             length=file.stat().st_size;files+=1;size+=length
             manifest[os.path.normcase(os.path.abspath(file))]=('file',length)
     return {'files':files,'directories':dirs,'entriesExcludingRoot':files+dirs,'logicalBytes':str(size)},manifest
-def verify_spacefold(data,scan,exp,manifest):
+def verify_spacefold(data,scan,exp,manifest,index_layout='legacy'):
     """Independent read after process exit, outside timing. All original nodes retained."""
     database=data/'spacefold.sqlite3'
     with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
@@ -76,7 +76,9 @@ def verify_spacefold(data,scan,exp,manifest):
         assert scan['status']=='completed' and scan['errorCount']=='0' and not scan['incomplete']
         assert db.execute('SELECT COUNT(*) FROM pending_dirs').fetchone()[0]==0
         indexes={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        required={'nodes_parent_size_asc_v2','nodes_parent_name_v2','nodes_parent_size_v3','nodes_incomplete','nodes_special_kind_v2'}
+        required={'nodes_parent_name_v2','nodes_parent_size_v3','nodes_incomplete','nodes_special_kind_v2'}
+        if index_layout=='legacy':required.add('nodes_parent_size_asc_v2')
+        else:assert 'nodes_parent_size_asc_v2' not in indexes,'Duplicate size index was not migrated away'
         assert required<=indexes,(required-indexes)
         rows=db.execute('SELECT id,parent_id,path,kind,payload,logical_total,file_count,dir_count,children_count,incomplete,error_code FROM nodes WHERE scan_id=?',(scan['scanId'],)).fetchall()
         assert len(rows)==exp['entriesExcludingRoot']+1
@@ -107,22 +109,30 @@ def verify_spacefold(data,scan,exp,manifest):
         assert nodes[1]['total']==int(exp['logicalBytes']) and nodes[1]['fc']==exp['files'] and nodes[1]['dc']==exp['directories']
         plan=db.execute('EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id=? AND parent_id=1 ORDER BY sort_size,name COLLATE NOCASE,id LIMIT 200',(scan['scanId'],)).fetchall()
         assert any('nodes_parent_size_v3' in row[3] for row in plan),plan
-        return {'independentDatabaseRead':True,'fullPathAndRawBytesVerified':True,'allDirectoryAggregatesVerified':True,'completeNodes':len(rows),'indexes':sorted(required),'sizePageQueryPlan':plan,'journalMode':'wal','pageSize':db.execute('PRAGMA page_size').fetchone()[0],'databaseBytes':database.stat().st_size}
+        assert not any('TEMP B-TREE' in row[3] for row in plan),plan
+        reverse_plan=[]
+        if index_layout!='legacy':
+            reverse_plan=db.execute('EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id=? AND parent_id=1 ORDER BY sort_size DESC,name COLLATE NOCASE DESC,id DESC LIMIT 200',(scan['scanId'],)).fetchall()
+            assert any('nodes_parent_size_v3' in row[3] for row in reverse_plan),reverse_plan
+            assert not any('TEMP B-TREE' in row[3] for row in reverse_plan),reverse_plan
+        return {'independentDatabaseRead':True,'fullPathAndRawBytesVerified':True,'allDirectoryAggregatesVerified':True,'completeNodes':len(rows),'indexes':sorted(required),'indexLayout':index_layout,'sizePageQueryPlan':plan,'sizeAscReverseQueryPlan':reverse_plan,'journalMode':'wal','pageSize':db.execute('PRAGMA page_size').fetchone()[0],'databaseBytes':database.stat().st_size}
 def history_snapshot(database):
     with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
-        scans=db.execute('SELECT id,source,status,discovered,error_count,finished,revision FROM scans ORDER BY id').fetchall()
+        scan_columns=[row[1] for row in db.execute("PRAGMA table_info('scans')")]; node_columns=[column[0] for column in db.execute('SELECT * FROM nodes LIMIT 0').description]
+        scans=[[{'blobHex':v.hex()} if isinstance(v,bytes) else v for v in row] for row in db.execute('SELECT '+','.join(scan_columns)+' FROM scans ORDER BY id')]
         digest=hashlib.sha256();count=0
-        for row in db.execute('SELECT scan_id,id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,error_code FROM nodes ORDER BY scan_id,id'):
+        for row in db.execute('SELECT * FROM nodes ORDER BY scan_id,id'):
             values=[value.hex() if isinstance(value,bytes) else value for value in row]
             digest.update(json.dumps(values,separators=(',',':')).encode('utf-8'));count+=1
-        return {'scanRecords':scans,'historyNodeCount':count,'historyNodeDigest':digest.hexdigest(),'pageSize':db.execute('PRAGMA page_size').fetchone()[0]}
+        return {'scanRecords':scans,'scanColumns':scan_columns,'nodeColumns':node_columns,'allStoredColumnsVerified':True,'historyNodeCount':count,'historyNodeDigest':digest.hexdigest(),'pageSize':db.execute('PRAGMA page_size').fetchone()[0]}
 def verify_history(database,seed):
     with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
         digest=hashlib.sha256();count=0
         for scan in seed['scanRecords']:
-            actual=db.execute('SELECT id,source,status,discovered,error_count,finished,revision FROM scans WHERE id=?',(scan[0],)).fetchone()
+            actual=db.execute('SELECT '+','.join(seed['scanColumns'])+' FROM scans WHERE id=?',(scan[0],)).fetchone()
+            actual=[{'blobHex':v.hex()} if isinstance(v,bytes) else v for v in actual]
             assert actual==scan,'Historical scan metadata changed'
-            for row in db.execute('SELECT scan_id,id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,error_code FROM nodes WHERE scan_id=? ORDER BY id',(scan[0],)):
+            for row in db.execute('SELECT * FROM nodes WHERE scan_id=? ORDER BY id',(scan[0],)):
                 values=[value.hex() if isinstance(value,bytes) else value for value in row]
                 digest.update(json.dumps(values,separators=(',',':')).encode('utf-8'));count+=1
         assert count==seed['historyNodeCount'] and digest.hexdigest()==seed['historyNodeDigest'],'Historical tree changed'
@@ -132,12 +142,17 @@ def count_gdu(item):
     if isinstance(item,dict):return int('name' in item)+sum(count_gdu(value) for value in item.values())
     if isinstance(item,list):return sum(count_gdu(value) for value in item)
     return 0
-parser=argparse.ArgumentParser();parser.add_argument('--rounds',type=int,default=5);parser.add_argument('--sources',type=Path);parser.add_argument('--tools',default='gdu-summary,spacefold-kernel,dua,gdu-full-tree,windirstat-full-tree,spacefold-sqlite,gdu-sqlite');parser.add_argument('--early-gate-ratio',type=float,default=1.05);parser.add_argument('--seed-database',type=Path);args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--rounds',type=int,default=5);parser.add_argument('--sources',type=Path);parser.add_argument('--tools',default='gdu-summary,spacefold-kernel,dua,gdu-full-tree,windirstat-full-tree,spacefold-sqlite,gdu-sqlite');parser.add_argument('--early-gate-ratio',type=float,default=1.05);parser.add_argument('--seed-database',type=Path);parser.add_argument('--index-layout',choices=('current','legacy'),default='current');parser.add_argument('--comparison-probe',type=Path);args=parser.parse_args()
 assert args.rounds>=5,'Formal comparisons require at least five rounds'
 assert not os.environ.get('SPACEFOLD_PROFILE'),'Formal benchmark must use the normal unprofiled release path'
 sources={'small100k':ROOT/'artifacts/benchmark-source','real-msvc-headers':Path('C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/include')}
 if args.sources:sources={key:Path(value).resolve() for key,value in json.loads(args.sources.read_text(encoding='utf-8-sig')).items()}
 tools=args.tools.split(',')
+allowed_tools={'gdu-summary','spacefold-kernel','dua','gdu-full-tree','windirstat-full-tree','spacefold-sqlite','gdu-sqlite','spacefold-old-sqlite'}
+assert set(tools)<=allowed_tools, 'Unknown benchmark tool'
+if args.comparison_probe:args.comparison_probe=args.comparison_probe.resolve()
+assert ('spacefold-old-sqlite' not in tools or (args.comparison_probe and not args.seed_database)), 'Old comparison needs an explicit immutable probe and fresh databases'
+executables=(SF,GDU,DUA,WDS)+((args.comparison_probe,) if args.comparison_probe else ())
 seed=None
 seed_destinations=set()
 if args.seed_database:
@@ -152,7 +167,7 @@ if args.seed_database:
             destination.mkdir();shutil.copyfile(args.seed_database,destination/'spacefold.sqlite3');seed_destinations.add(destination)
 assert not ctypes.windll.shell32.IsUserAnAdmin(),'Formal benchmark must run without elevation'
 assert not any(p.info['name'].lower() in ('cargo.exe','rustc.exe','cl.exe','link.exe') for p in psutil.process_iter(['name']) if p.info['name']),'Concurrent compiler detected'
-fingerprints={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in (SF,GDU,DUA,WDS)}
+fingerprints={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in executables}
 (OUT/'tool-fingerprints.json').write_text(json.dumps(fingerprints,indent=2),encoding='utf-8')
 all_results=[]
 for dataset,source in sources.items():
@@ -170,8 +185,9 @@ for dataset,source in sources.items():
             elif tool=='windirstat-full-tree':command=[WDS,'/SaveTo',report,source]
             elif tool=='gdu-sqlite':command=[GDU,'-a','-n','-p','--no-prefix','--no-delete','--no-view-file','-s',f'--db={OUT/(name+".sqlite")}',source]
             elif tool=='spacefold-kernel':command=[SF,'kernel',source]
+            elif tool=='spacefold-old-sqlite':command=[args.comparison_probe,'scan',data,source]
             else:command=[SF,'scan',data,source]
-            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None,data/'spacefold.sqlite3' if tool=='spacefold-sqlite' else None);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
+            result,text=run(name,command,report if tool in ('gdu-full-tree','windirstat-full-tree') else None,data/'spacefold.sqlite3' if tool in ('spacefold-sqlite','spacefold-old-sqlite') else None);result.update({'tool':tool,'dataset':dataset,'round':round_index+1,'expected':exp})
             if tool=='gdu-summary':assert int(re.search(r'^\s*(\d+)',text).group(1))==int(exp['logicalBytes'])
             elif tool=='gdu-full-tree':
                 doc=json.loads(report.read_text(encoding='utf-8'));assert doc[3][0]['asize']==int(exp['logicalBytes']);assert count_gdu(doc)==exp['entriesExcludingRoot']+1
@@ -187,9 +203,9 @@ for dataset,source in sources.items():
                     assert db.execute('SELECT COUNT(*) FROM items WHERE is_dir=0').fetchone()[0]==exp['files']
                     assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
             else:
-                doc=json.loads(text.strip().splitlines()[-1]);scan=doc.get('scan',doc);assert scan['logicalTotalBytes']==exp['logicalBytes'];assert str(scan.get('discoveredCount',scan.get('count')))==str(exp['entriesExcludingRoot']+(tool=='spacefold-sqlite'))
+                doc=json.loads(text.strip().splitlines()[-1]);scan=doc.get('scan',doc);assert scan['logicalTotalBytes']==exp['logicalBytes'];assert str(scan.get('discoveredCount',scan.get('count')))==str(exp['entriesExcludingRoot']+(tool in ('spacefold-sqlite','spacefold-old-sqlite')))
                 result['probeSummary']=doc
-                if tool=='spacefold-sqlite':result['persistenceVerification']=verify_spacefold(data,scan,exp,manifest)
+                if tool in ('spacefold-sqlite','spacefold-old-sqlite'):result['persistenceVerification']=verify_spacefold(data,scan,exp,manifest,'legacy' if tool=='spacefold-old-sqlite' else args.index_layout)
                 if tool=='spacefold-sqlite' and seed is not None:result['historyVerification']=verify_history(data/'spacefold.sqlite3',seed)
                 if 'firstResultElapsedMs' in doc:result['firstResultElapsedMs']=doc['firstResultElapsedMs']
                 if 'elapsedMs' in doc:result['internalElapsedMs']=doc['elapsedMs']
@@ -209,5 +225,5 @@ summary={}
 for dataset in sources:
     summary[dataset]={tool:{'medianSeconds':statistics.median(r['elapsedSeconds'] for r in all_results if r['dataset']==dataset and r['tool']==tool),'roundsSeconds':[r['elapsedSeconds'] for r in all_results if r['dataset']==dataset and r['tool']==tool]} for tool in tools}
 (OUT/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
-assert fingerprints=={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in (SF,GDU,DUA,WDS)},'Executable changed during benchmark'
+assert fingerprints=={str(exe):hashlib.sha256(exe.read_bytes()).hexdigest() for exe in executables},'Executable changed during benchmark'
 
