@@ -41,6 +41,7 @@ struct ScanProfile {
     aggregate_ms: f64,
     commit_ms: f64,
     finish_ms: f64,
+    close_ms: f64,
     batches: usize,
 }
 fn milliseconds(since: Instant) -> f64 {
@@ -65,8 +66,8 @@ const READER_CHUNK_BYTES: usize = 256 * 1024;
 const READER_QUEUE_CHUNKS: usize = 32;
 const READER_DATA_BYTES: usize = 8 * 1024 * 1024;
 
-/// Charges all queued and currently consumed reader chunks together. The one
-/// chunk still being constructed is separately limited by chunk entries/bytes.
+/// Charges all queued and currently consumed reader chunks together. Each of
+/// the two chunks being constructed is separately limited by entries/bytes.
 #[derive(Default)]
 struct ReaderBudget {
     state: std::sync::Mutex<(usize, bool)>,
@@ -787,6 +788,17 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
             }
         }
         profile.page_size = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    }
+    // Terminal means this scanner's SQLite resources have also been closed.
+    // Otherwise a caller exiting on the final event could kill the connection's
+    // natural last-close checkpoint while the complete data still lives in WAL.
+    let close_started = Instant::now();
+    if let Err((connection, error)) = c.close() {
+        drop(connection);
+        return Err(error.into());
+    }
+    profile.close_ms = milliseconds(close_started);
+    if profile.enabled {
         eprintln!(
             "{}",
             serde_json::json!({"scanProfile":profile,"totalMs":milliseconds(started)})

@@ -519,6 +519,80 @@ fn scan_cancellation_keeps_partial_and_terminal_waits() {
     assert!(cancel_started.elapsed() < Duration::from_secs(1));
 }
 
+#[test]
+fn completed_event_observes_closed_scanner_and_complete_main_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("source");
+    fs::create_dir(&root).unwrap();
+    for i in 0..512 {
+        fs::write(root.join(format!("f{i}")), b"content").unwrap();
+    }
+    let service = Service::new(&dir.path().join("db")).unwrap();
+    let c = service.repo.connect().unwrap();
+    let filename: String = c
+        .query_row("PRAGMA database_list", [], |r| r.get(2))
+        .unwrap();
+    drop(c);
+    let encoded = filename
+        .replace('\\', "/")
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"/:._-".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect::<String>();
+    let uri = format!("file:{encoded}?immutable=1");
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let scan = service
+        .start_scan(
+            platform::absolute(&root).unwrap(),
+            Some(Arc::new(move |event| {
+                if event.status != "completed" {
+                    return;
+                }
+                // immutable deliberately ignores WAL and cannot checkpoint it, so this
+                // callback catches a terminal event sent before scanner connection close.
+                let observed = (|| -> rusqlite::Result<(String, i64, i64, i64)> {
+                    let c = rusqlite::Connection::open_with_flags(
+                        &uri,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    )?;
+                    let (status, revision): (String, i64) = c.query_row(
+                        "SELECT status,revision FROM scans WHERE id=?1",
+                        [&event.scan_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    let count = c.query_row(
+                        "SELECT COUNT(*) FROM nodes WHERE scan_id=?1",
+                        [&event.scan_id],
+                        |r| r.get(0),
+                    )?;
+                    let logical = c.query_row(
+                        "SELECT logical_total FROM nodes WHERE scan_id=?1 AND id=1",
+                        [&event.scan_id],
+                        |r| r.get(0),
+                    )?;
+                    Ok((status, revision, count, logical))
+                })()
+                .map_err(|e| e.to_string());
+                done_tx.send((event.revision, observed)).unwrap();
+            })),
+        )
+        .unwrap();
+    let final_event = wait_job(&service, &scan.scan_id);
+    assert_eq!(final_event.status, "completed");
+    let (revision, observed) = done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (status, stored_revision, count, logical) = observed.unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(stored_revision, i64::from(revision));
+    assert_eq!(count, 513);
+    assert_eq!(logical, 3584);
+}
+
 #[cfg(windows)]
 #[test]
 fn real_recycle_returns_item_result_and_refreshes_scan() {

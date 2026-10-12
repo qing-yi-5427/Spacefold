@@ -19,6 +19,24 @@ fn main() {
         std::process::exit(1)
     }
 }
+fn finished_scan(service: &Service, scan_id: &str, event: &JobEvent) -> Result<Scan> {
+    if let Some(error) = &event.error {
+        return Err(error.clone());
+    }
+    if event.status == "failed" {
+        return Err(AppError::new("SCAN_FAILED", event.phase.clone()));
+    }
+    // Close failure can change an earlier completed row into failed. Never
+    // return a snapshot taken before the authoritative runtime termination.
+    let current = service.repo.scan(scan_id)?;
+    if current.status != event.status {
+        return Err(AppError::new(
+            "JOB_STATE_INCONSISTENT",
+            "扫描持久状态与最终事件不一致",
+        ));
+    }
+    Ok(current)
+}
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("version") {
@@ -85,8 +103,13 @@ fn run() -> Result<()> {
                 })),
             )?;
             loop {
-                let current = service.repo.scan(&scan.scan_id)?;
-                if !matches!(current.status.as_str(), "queued" | "running" | "cancelling") {
+                // Retain the same durable-state polling cadence, but wait for
+                // resource cleanup rather than only a committed terminal row.
+                let _committed = service.repo.scan(&scan.scan_id)?;
+                let runtime = service.job(&scan.scan_id)?;
+                if runtime.terminal() {
+                    let event = runtime.snapshot();
+                    let current = finished_scan(&service, &scan.scan_id, &event)?;
                     output(
                         serde_json::json!({"scan":current,"elapsedMs":elapsed.elapsed().as_millis(),"firstResultElapsedMs":*first.lock().unwrap()}),
                     );
@@ -283,6 +306,7 @@ fn last_cursor(service: &Service, scan: &Scan) -> Result<String> {
     )?;
     Ok(serde_json::json!({"key":key,"id":id,"name":name,"size":size,"modified":modified.unwrap_or_default()}).to_string())
 }
+
 fn kernel(root: &std::path::Path) -> Result<()> {
     let root = platform::absolute(root)?;
     let start = Instant::now();
@@ -467,4 +491,58 @@ fn synthetic(service: &Service, count: u64, mode: &str) -> Result<Scan> {
     c.execute("UPDATE nodes SET logical_total=?2,allocated_total=?2,file_count=?3,dir_count=?4,children_count=?5,incomplete=0 WHERE scan_id=?1 AND id=1",rusqlite::params![id,total,files,dirs,integer(if mode=="wide"{count}else{count.div_ceil(64)})?])?;
     c.execute("UPDATE scans SET discovered=?2,status='completed',revision=revision+1,finished=?3,notes_json=?4 WHERE id=?1",rusqlite::params![id,integer(count+1)?,now(),serde_json::to_string(&vec!["Synthetic metadata for scalability and exact-integer QA. No source files exist; file operations fail closed."])?])?;
     service.repo.scan(&id)
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    #[test]
+    fn runtime_failure_overrides_completed_database_and_final_status_is_reread() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"abc").unwrap();
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let scan = service
+            .start_scan(platform::absolute(&root).unwrap(), None)
+            .unwrap();
+        let start = Instant::now();
+        while !service.job(&scan.scan_id).unwrap().terminal() {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut event = service.job(&scan.scan_id).unwrap().snapshot();
+        assert_eq!(
+            finished_scan(&service, &scan.scan_id, &event)
+                .unwrap()
+                .status,
+            "completed"
+        );
+        // Model close failure after the completed transaction, including the
+        // case where the failure handler could not change that durable row.
+        event.status = "failed".into();
+        event.error = Some(AppError::new("DATABASE_ERROR", "injected close failure"));
+        let error = finished_scan(&service, &scan.scan_id, &event).unwrap_err();
+        assert_eq!(error.code, "DATABASE_ERROR");
+        assert_eq!(error.message, "injected close failure");
+        assert_eq!(
+            service.repo.scan(&scan.scan_id).unwrap().status,
+            "completed"
+        );
+        event.error = None;
+        assert_eq!(
+            finished_scan(&service, &scan.scan_id, &event)
+                .unwrap_err()
+                .code,
+            "SCAN_FAILED"
+        );
+        event.status = "completed".into();
+        service.repo.finish(&scan.scan_id, "failed").unwrap();
+        assert_eq!(
+            finished_scan(&service, &scan.scan_id, &event)
+                .unwrap_err()
+                .code,
+            "JOB_STATE_INCONSISTENT"
+        );
+    }
 }
