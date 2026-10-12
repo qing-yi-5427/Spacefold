@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--page-size', type=int, default=200)
     parser.add_argument('--full-traversal', action='store_true')
     parser.add_argument('--minimum-rows', type=int, default=2)
+    parser.add_argument('--mix-query-values', action='store_true',
+                        help='Modify only the isolated copy for synthetic Unicode/NOCASE/NULL/size query cases')
     args = parser.parse_args()
     source, output, probe = (args.source_database.resolve(), args.output.resolve(),
                              args.probe.resolve())
@@ -51,9 +53,31 @@ def main():
     database = data / 'spacefold.sqlite3'
     assert not Path(str(source) + '-wal').exists() or Path(str(source) + '-wal').stat().st_size == 0
     shutil.copy2(source, database)
+    if args.mix_query_values:
+        # A virtual query fixture may contain case-equal sibling names that a
+        # normal case-insensitive NTFS directory cannot contain simultaneously.
+        # Keep raw paths unchanged and never perform file operations on it.
+        names = ['same', 'SAME', 'ä', 'Ä', '中文', '😀', 'z', 'Z', 'a%_', 'é', 'É']
+        with closing(sqlite3.connect(database)) as db:
+            db.execute('PRAGMA synchronous=NORMAL')
+            for ordinal, (scan, ident, payload) in enumerate(db.execute(
+                    'SELECT scan_id,id,payload FROM nodes WHERE parent_id=1 ORDER BY id').fetchall()):
+                size = [0, 1, 127, 512, 4096][ordinal % 5]
+                modified = [None, '', '2026-10-12T12:00:00Z', '2026-10-13T00:00:00Z'][ordinal % 4]
+                payload = json.loads(payload)
+                if payload.get('v') == 3:
+                    payload['b'] = size
+                db.execute('UPDATE nodes SET name=?,logical_total=?,modified=?,payload=? WHERE scan_id=? AND id=?',
+                           (names[ordinal % len(names)], size, modified,
+                            json.dumps(payload, separators=(',', ':')), scan, ident))
+            db.execute('UPDATE nodes SET logical_total=(SELECT SUM(child.logical_total) FROM nodes AS child '
+                       'WHERE child.scan_id=nodes.scan_id AND child.parent_id=1) WHERE id=1')
+            db.commit()
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     before = digest_nodes(database)
     results = {'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(),
                'sourceDatabase': str(source), 'copyOnly': True, 'cases': [],
+               'syntheticMixedQueryValues': args.mix_query_values,
                'oracle': 'Python integers plus ASCII-only NOCASE; complete selected slices'}
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         scan_id, revision = db.execute('SELECT id,revision FROM scans ORDER BY id LIMIT 1').fetchone()
