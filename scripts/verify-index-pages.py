@@ -67,10 +67,17 @@ def main():
                 payload = json.loads(payload)
                 if payload.get('v') == 3:
                     payload['b'] = size
-                db.execute('UPDATE nodes SET name=?,logical_total=?,modified=?,payload=? WHERE scan_id=? AND id=?',
-                           (names[ordinal % len(names)], size, modified,
+                elif 'node' in payload:
+                    payload['node'].update(name=names[ordinal % len(names)],
+                        logicalBytes=str(size), logicalTotalBytes=str(size), modifiedAt=modified,
+                        allocatedBytes=str(size), allocatedKnownTotalBytes=str(size))
+                    payload['fingerprint'].update(logical=size, modified=modified)
+                db.execute('UPDATE nodes SET name=?,logical_total=?,allocated_total=?,modified=?,payload=? WHERE scan_id=? AND id=?',
+                           (names[ordinal % len(names)], size, size, modified,
                             json.dumps(payload, separators=(',', ':')), scan, ident))
             db.execute('UPDATE nodes SET logical_total=(SELECT SUM(child.logical_total) FROM nodes AS child '
+                       'WHERE child.scan_id=nodes.scan_id AND child.parent_id=1), '
+                       'allocated_total=(SELECT SUM(child.allocated_total) FROM nodes AS child '
                        'WHERE child.scan_id=nodes.scan_id AND child.parent_id=1) WHERE id=1')
             db.commit()
             db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
