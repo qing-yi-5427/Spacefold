@@ -621,6 +621,40 @@ mod win {
 #[cfg(windows)]
 pub use win::{disk_space, metadata, read_dir, wide, win_error};
 
+#[cfg(windows)]
+pub fn opened_file_identity(file: &std::fs::File) -> Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::*};
+    let handle = HANDLE(file.as_raw_handle());
+    let mut id = FILE_ID_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            &mut id as *mut _ as *mut _,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        return Ok(format!(
+            "{:016x}:{}",
+            id.VolumeSerialNumber,
+            id.FileId
+                .Identifier
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+    }
+    let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut legacy) }.map_err(win_error)?;
+    Ok(format!(
+        "{:08x}:{:08x}{:08x}",
+        legacy.dwVolumeSerialNumber, legacy.nFileIndexHigh, legacy.nFileIndexLow
+    ))
+}
+
 /// Fail closed when a parent has become a redirection since planning.
 pub fn parent_chain(path: &Path) -> Result<Vec<(PathBuf, Fingerprint)>> {
     let mut out = vec![];

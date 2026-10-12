@@ -20,7 +20,7 @@ npm run tauri build
 if ($LASTEXITCODE -ne 0) { throw 'Windows package failed' }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 Copy-Item -LiteralPath 'src-tauri/target/release/spacefold.exe' -Destination (Join-Path $OutputDirectory 'Spacefold.exe')
-$taskVersion = (Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+$taskVersion = (Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw -Encoding utf8 | ConvertFrom-Json).version
 $taskInstaller = "Spacefold_${taskVersion}_x64-setup.exe"
 Copy-Item -LiteralPath (Join-Path 'src-tauri/target/release/bundle/nsis' $taskInstaller) -Destination (Join-Path $OutputDirectory $taskInstaller)
 $taskCommit = git rev-parse HEAD

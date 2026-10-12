@@ -10,11 +10,12 @@ assert(!new URL(page.url()).searchParams.has('fixture'));
 await page.locator('[data-sf-view="tree"]').click();
 await page.evaluate(()=>{window.__qaFrames=[];window.__qaLongTasks=[];window.__qaRunning=true;let previous=performance.now();function frame(now){window.__qaFrames.push(now-previous);previous=now;if(window.__qaRunning)requestAnimationFrame(frame);}requestAnimationFrame(frame);try{new PerformanceObserver(list=>window.__qaLongTasks.push(...list.getEntries().map(e=>({startTime:e.startTime,duration:e.duration})))).observe({type:'longtask',buffered:false});}catch{}});
 await page.getByRole('button',{name:'选择扫描位置',exact:true}).click();await page.locator('[data-scan-path]').fill(path.resolve('artifacts/benchmark-source'));
+const previousScanId=await page.evaluate(()=>window.spacefoldPreview.getScan()?.scanId);
 const begin=performance.now();await page.getByRole('button',{name:'开始扫描',exact:true}).click();
 const observations=[];let firstVisibleMs=null,completed;
 for(let i=0;i<3000;i++){
   const snapshot=await page.evaluate(()=>{const scan=window.spacefoldPreview.getScan();return {scan,rows:document.querySelectorAll('[data-wb-row]').length,statusText:document.querySelector('[data-wb-status]')?.textContent};});
-  if(snapshot.scan?.source?.endsWith('benchmark-source')){
+  if(snapshot.scan?.source?.endsWith('benchmark-source')&&snapshot.scan.scanId!==previousScanId){
     observations.push({elapsedMs:performance.now()-begin,...snapshot});
     if(firstVisibleMs===null&&BigInt(snapshot.scan.discoveredCount)>1n&&snapshot.rows>1)firstVisibleMs=performance.now()-begin;
     if(snapshot.scan.status==='completed'){completed=snapshot;break;}

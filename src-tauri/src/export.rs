@@ -369,6 +369,8 @@ pub fn write_report(
     job.update(|e| e.phase = "核验输出目录".into());
     platform::verify_parents(&target_parents)?;
     let mut temp = report_tempfile(parent)?;
+    #[cfg(windows)]
+    temp.disable_cleanup(true); // Only the opened object may be cleaned, never an old path.
     let mut cleanup = ReportTempCleanup {
         file: temp.as_file().try_clone()?,
         committed: false,
@@ -417,10 +419,66 @@ pub fn write_report(
     temp.as_file().sync_all()?;
     cancelled(job)?;
     platform::verify_parents(&target_parents)?;
-    // NamedTempFile::persist uses an atomic replacement on the same volume. The prior file survives every earlier failure/cancellation.
+    #[cfg(windows)]
+    {
+        let opened = platform::opened_file_identity(temp.as_file())?;
+        let at_path = platform::metadata(temp.path())
+            .ok()
+            .and_then(|metadata| metadata.identity);
+        if at_path.as_deref() != Some(opened.as_str()) {
+            return Err(AppError::new(
+                "EXPORT_TEMP_CHANGED",
+                "临时报告路径被移动或替换，已取消提交并保留原报告",
+            ));
+        }
+        commit_report_handle(temp.as_file(), target)?;
+    }
+    #[cfg(not(windows))]
     temp.persist(target).map_err(|e| AppError::from(e.error))?;
     cleanup.committed = true;
     Ok(count)
+}
+#[cfg(windows)]
+fn commit_report_handle(file: &std::fs::File, target: &Path) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::*};
+    let name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let bytes = offset + name.len() * 2;
+    let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+    let handle = HANDLE(file.as_raw_handle());
+    unsafe {
+        let basic = FILE_BASIC_INFO {
+            FileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+            ..Default::default()
+        };
+        SetFileInformationByHandle(
+            handle,
+            FileBasicInfo,
+            &basic as *const _ as *const _,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+        .map_err(platform::win_error)?;
+        let header = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        header.write(FILE_RENAME_INFO {
+            Anonymous: FILE_RENAME_INFO_0 {
+                ReplaceIfExists: true,
+            },
+            RootDirectory: HANDLE::default(),
+            FileNameLength: (name.len() * 2) as u32,
+            FileName: [0],
+        });
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            storage.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+            name.len(),
+        );
+        // Same-volume rename commits the already-opened source object. A path
+        // replacement after the identity check cannot substitute another file.
+        SetFileInformationByHandle(handle, FileRenameInfo, header.cast(), bytes as u32)
+            .map_err(platform::win_error)?;
+    }
+    Ok(())
 }
 fn report_tempfile(parent: &Path) -> Result<tempfile::NamedTempFile> {
     #[cfg(windows)]

@@ -339,7 +339,16 @@ impl Service {
             .repo
             .node(&scan_id, &scope_id, Some(original.revision))?;
         if target.node.kind != "directory" {
-            return Err(AppError::new("NOT_DIRECTORY", "仅能刷新目录"));
+            if target.node.error_code.is_none() {
+                return Err(AppError::new("NOT_DIRECTORY", "仅能刷新目录"));
+            }
+            let current = platform::metadata(&target.path)?;
+            if current.kind != "directory" || !current.recurse || current.link_type.is_some() {
+                return Err(AppError::new(
+                    "NOT_DIRECTORY",
+                    "错误节点目前不是可安全枚举的实际目录",
+                ));
+            }
         }
         let job = self.add_job(
             &scan_id,

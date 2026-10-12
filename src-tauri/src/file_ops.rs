@@ -89,6 +89,42 @@ fn keep_both(path: &Path) -> Result<PathBuf> {
         "无法生成未使用的新名称",
     ))
 }
+fn protect_app_data(
+    path: &Path,
+    data_dir: &Path,
+    protected: &[(PathBuf, Fingerprint)],
+) -> Result<()> {
+    let normalized = if path.try_exists()? {
+        platform::absolute(path)?
+    } else {
+        path.to_owned()
+    };
+    let inside = normalized.starts_with(data_dir) || data_dir.starts_with(&normalized);
+    let identity = platform::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.identity);
+    let ancestor = identity.as_ref().is_some_and(|id| {
+        protected
+            .iter()
+            .any(|(_, fp)| fp.identity.as_ref() == Some(id))
+    });
+    let data_identity = protected.first().and_then(|(_, fp)| fp.identity.as_ref());
+    let child = if inside || ancestor {
+        false
+    } else {
+        platform::parent_chain(path)?
+            .iter()
+            .any(|(_, fp)| data_identity.is_some() && fp.identity.as_ref() == data_identity)
+    };
+    if inside || ancestor || child {
+        Err(AppError::new(
+            "APP_DATA_PROTECTED",
+            "不能操作活动索引/设置目录或其祖先；复制也不能生成活动数据库的不一致副本",
+        ))
+    } else {
+        Ok(())
+    }
+}
 pub fn plan(service: &Service, request: OperationRequest) -> Result<OperationPlan> {
     // Validate typed text before canonicalize can silently strip a Win32 suffix.
     let typed_destination_error = request
@@ -146,6 +182,8 @@ pub fn plan(service: &Service, request: OperationRequest) -> Result<OperationPla
     let mut items = vec![];
     let mut total = 0i64;
     let mut destinations = std::collections::HashSet::new();
+    let protected =
+        platform::parent_chain(&service.repo.data_dir.join("__spacefold_protection__"))?;
     for node in nodes {
         let mut source = PlannedSource {
             stored: node.clone(),
@@ -165,6 +203,7 @@ pub fn plan(service: &Service, request: OperationRequest) -> Result<OperationPla
                     "扫描根不能执行文件管理操作",
                 ));
             }
+            protect_app_data(&node.path, &service.repo.data_dir, &protected)?;
             let metadata = platform::metadata(&node.path)?;
             let current = metadata.fingerprint();
             if !fingerprint_matches(&node.fingerprint, &current) {
@@ -270,6 +309,7 @@ pub fn plan(service: &Service, request: OperationRequest) -> Result<OperationPla
                     ));
                 }
                 let final_dest = source.destination.as_ref().unwrap();
+                protect_app_data(final_dest, &service.repo.data_dir, &protected)?;
                 if !destinations.insert(platform::encode_path(final_dest)) {
                     return Err(AppError::new(
                         "DESTINATION_CONFLICT",
@@ -348,7 +388,12 @@ pub fn plan(service: &Service, request: OperationRequest) -> Result<OperationPla
     );
     Ok(dto)
 }
-fn validate_execution(source: &PlannedSource, kind: &str) -> Result<()> {
+fn validate_execution(source: &PlannedSource, kind: &str, data_dir: &Path) -> Result<()> {
+    let protected = platform::parent_chain(&data_dir.join("__spacefold_protection__"))?;
+    protect_app_data(&source.stored.path, data_dir, &protected)?;
+    if let Some(dest) = &source.destination {
+        protect_app_data(dest, data_dir, &protected)?;
+    }
     platform::validate_shell_path(&source.stored.path)?;
     if let Some(dest) = &source.destination {
         platform::validate_shell_path(dest)?;
@@ -519,7 +564,7 @@ pub fn execute_sync(
             result.status = "cancelled".into();
             result.error = Some(AppError::new("CANCELLED", "已取消尚未开始的项目"));
         } else {
-            match validate_execution(source, &plan.dto.kind) {
+            match validate_execution(source, &plan.dto.kind, &service.repo.data_dir) {
                 Err(e) => result.error = Some(e),
                 Ok(()) => {
                     if plan.policy == "skip" && source.destination_existing.is_some() {

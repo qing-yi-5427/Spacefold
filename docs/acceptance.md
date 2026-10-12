@@ -11,9 +11,9 @@
 | F05 | 展开、同级排序、多选/范围、键盘、右侧动作 | 通过 | native-ui/results.json：方向键/Space/Shift/往返；native-real-ui有界分页 |
 | F06 | 搜索名称/路径、类型/最小大小、定位和退出恢复 | 通过 | native-real-ui/results.json：sample-0420远页定位、退出恢复；backend名称/路径/类型/阈值 |
 | F07 | 关联打开、资源管理器定位、剪贴板、属性 | 通过 | native-shell/results.json实际Explorer选中、属性窗、Notepads关联；backend剪贴板回读 |
-| F08 | copy/move/rename/trash、冲突、竞争、部分结果与刷新 | 最终安全复证中 | native-risks 7/7、operation-cancellation 200项取消；尾点Shell别名修复待最终exe复证 |
-| F09 | 四格式独立解析、三范围、递归、字段与精度 | 通过 | backend/report-parse.json四格式27行；million-reports/large-report-parse.json各1048576；million.xlsx.verification.json拆表 |
-| F10 | 完成/取消/中断记录恢复及过期提示 | 最后一致性复证中 | native-restart/results.json真实进程重启恢复3状态；历史导出stale持久化修复待复证 |
+| F08 | copy/move/rename/trash、冲突、竞争、部分结果与刷新 | 最终两项安全复证中 | 成品真实跨卷/UNC/尾点保护通过；ACL修复后局部刷新和活动AppData祖先保护待新包回归 |
+| F09 | 四格式独立解析、三范围、递归、字段与精度 | 最终临时文件身份复证中 | 成品四格式27行；百万最终CSV/JSON精确1048576行与XLSX拆表通过；临时输出同名替换实测曾造成错误提交，待修复回归 |
+| F10 | 完成/取消/中断记录恢复及过期提示 | 通过 | native-restart/results.json：生产成品真实进程重启恢复3状态；get_scan和历史JSON导出metadata.stale一致 |
 | F11 | 五色、系统主题、GB/GiB、默认视图与重启 | 通过 | native-restart真实teal/dark/binary/lens/xlsx重启；native-real-ui系统主题/单位；native-ui五色 |
 | U01 | 1024浅色紫色默认树14行、右220 | 通过（用户修改已记） | reference与native fixture对照、native-ui/results.json；真正桌面全高+自绘控件按新增要求 |
 | U02 | 736右204，工具栏与文字无溢出 | 通过 | native响应式截图和metrics：736右204，无横滚 |
@@ -28,9 +28,9 @@
 | U11 | 深色/高对比、几何不变与可读性 | 通过（渲染层） | native深色截图与forced-colors模拟；未改变用户OS高对比设置 |
 | U12 | 四格式三范围，完整33/根直接6条 | 通过 | native-ui四格式三范围33/6/9/2；后端真实四格式和选取归一另证 |
 | U13 | 真键盘、菜单/弹层焦点、Escape/Tab | 通过 | native-ui13/13：Escape/Tab、3抽屉关闭后恢复opener；曾发现inert焦点缺陷已修 |
-| U14 | 长路径、空选、叶文件、根动作 | 最终边界复证中 | backend真实长路径、零/空目录、异常UTF16复制；待最终root/空选动作回归 |
+| U14 | 长路径、空选、叶文件、根动作 | 通过 | 成品native-boundary-ui 3/3根copy计划/空选/rename恢复；backend真实长路径、零/空目录、异常UTF16复制 |
 | U15 | reduced motion/连续切换无锁 | 通过 | native-ui reduced-motion/快速切换无锁 |
-| M5 | 百万元数据、真实盘扫描、Windows程序及安装包 | 发布包验证中 | 百万wide/deep页与三writers重读已过；benchmarks-release-final36次；最终exe/NSIS待本机安装 |
+| M5 | 百万元数据、真实盘扫描、Windows程序及安装包 | 最终发布包验证中 | 百万wide/deep首末页2–4ms与三writers重读已过；最终42轮公平对照、停Vite内嵌成品UI通过；三安全修复后的新包及本机安装待验 |
 
 ## 独立风险检查
 

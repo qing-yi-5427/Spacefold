@@ -577,15 +577,20 @@ fn junction_is_not_followed_and_changed_parent_rejects_operation() {
         "failed",
         "{event:?}"
     );
-    assert_eq!(
-        event.results.as_ref().unwrap()[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .code,
-        "SOURCE_CHANGED"
+    assert!(
+        matches!(
+            event.results.as_ref().unwrap()[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .code
+                .as_str(),
+            "SOURCE_CHANGED" | "UNSAFE_PARENT"
+        ),
+        "{event:?}"
     );
-    assert!(target.join("a.bin").exists());
+    assert_eq!(fs::read(target.join("a.bin")).unwrap(), vec![2; 31]);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
     let latest = service
         .start_scan(
             platform::absolute(&dir.path().join("source")).unwrap(),
@@ -1043,14 +1048,155 @@ fn export_cleanup_follows_own_open_temp_when_temp_is_moved() {
                     .find(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
                     .unwrap();
                 fs::rename(own_temp.path(), callback_moved.join(own_temp.file_name())).unwrap();
+                fs::write(own_temp.path(), b"UNRELATED REPLACEMENT").unwrap();
             }
         })),
     );
     job.bounded_progress.store(false, Ordering::Release);
-    assert!(export::write_report(&service, &request(&scan, "json"), &target, &job).is_err());
+    assert_eq!(
+        export::write_report(&service, &request(&scan, "json"), &target, &job)
+            .unwrap_err()
+            .code,
+        "EXPORT_TEMP_CHANGED"
+    );
     assert_eq!(fs::read(target).unwrap(), b"ORIGINAL");
-    assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 2);
+    let replacement = fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
+        .unwrap();
+    assert_eq!(
+        fs::read(replacement.path()).unwrap(),
+        b"UNRELATED REPLACEMENT"
+    );
     assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+}
+
+#[test]
+fn active_application_data_and_its_ancestors_are_protected_in_operation_plans() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    let holder = root.join("holder");
+    fs::create_dir_all(&holder).unwrap();
+    fs::write(holder.join("visible"), b"abc").unwrap();
+    let safe = root.join("safe/app-data");
+    fs::create_dir_all(&safe).unwrap();
+    fs::write(safe.join("safe-file"), b"safe").unwrap();
+    let service = Service::new(&holder.join("app-data")).unwrap();
+    let scan = service
+        .start_scan(platform::absolute(&root).unwrap(), None)
+        .unwrap();
+    let scan = wait_scan(&service, &scan.scan_id);
+    let folder = find(&service, &scan, "holder");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&destination).unwrap();
+    for kind in ["copy", "move", "rename", "trash"] {
+        let plan = file_ops::plan(
+            &service,
+            operation_request(
+                &scan,
+                &folder,
+                kind,
+                Some(&destination),
+                Some("renamed"),
+                "skip",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.items[0]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("APP_DATA_PROTECTED"),
+            "{plan:?}"
+        );
+    }
+    let safe_folder = find(&service, &scan, "app-data");
+    let plan = file_ops::plan(
+        &service,
+        operation_request(&scan, &safe_folder, "copy", Some(&holder), None, "replace"),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.items[0]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("APP_DATA_PROTECTED"),
+        "{plan:?}"
+    );
+    assert_eq!(fs::read(holder.join("visible")).unwrap(), b"abc");
+    assert!(service.repo.path.is_file());
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn repaired_acl_error_directory_can_refresh_and_updates_kind_and_ancestor_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    let denied = root.join("denied");
+    fs::create_dir_all(&denied).unwrap();
+    fs::write(denied.join("child"), b"abc").unwrap();
+    let principal = std::env::var("USERNAME").unwrap();
+    let grant = std::process::Command::new("icacls")
+        .arg(&denied)
+        .args(["/deny", &format!("{principal}:(OI)(CI)(R)")])
+        .output()
+        .unwrap();
+    assert!(grant.status.success(), "{grant:?}");
+    struct RestoreAcl {
+        path: std::path::PathBuf,
+        principal: String,
+    }
+    impl Drop for RestoreAcl {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls")
+                .arg(&self.path)
+                .args(["/remove:d", &self.principal])
+                .output();
+        }
+    }
+    let restore = RestoreAcl {
+        path: denied.clone(),
+        principal: principal.clone(),
+    };
+    let service = Service::new(&temp.path().join("db")).unwrap();
+    let started = service
+        .start_scan(platform::absolute(&root).unwrap(), None)
+        .unwrap();
+    let scan = wait_scan(&service, &started.scan_id);
+    let node = find(&service, &scan, "denied");
+    assert_eq!(node.kind, "other");
+    assert_eq!(node.error_code.as_deref(), Some("ACCESS_DENIED"));
+    drop(restore);
+    let refresh = service
+        .refresh(scan.scan_id.clone(), node.node_id.clone(), None)
+        .unwrap();
+    let event = wait_job(&service, &refresh.scan_id);
+    assert_eq!(event.status, "completed", "{event:?}");
+    let current = service.repo.scan(&scan.scan_id).unwrap();
+    assert_eq!(current.status, "completed");
+    assert_eq!(current.error_count, "0");
+    assert_eq!(current.logical_total_bytes, "3");
+    let folder = service
+        .repo
+        .node(&scan.scan_id, &node.node_id, Some(current.revision))
+        .unwrap()
+        .node;
+    assert_eq!(folder.kind, "directory");
+    assert!(!folder.incomplete);
+    assert_eq!(folder.children_count, "1");
+    let root = service
+        .repo
+        .node(&scan.scan_id, "1", Some(current.revision))
+        .unwrap()
+        .node;
+    assert_eq!(root.directory_count, "1");
+    assert_eq!(root.file_count, "1");
+    assert!(!root.incomplete);
 }
 
 #[cfg(windows)]
