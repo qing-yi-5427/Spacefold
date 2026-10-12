@@ -807,12 +807,15 @@ fn keyset_pages_have_no_gaps_or_duplicates_and_locate_target_for_every_sort() {
         )
         .unwrap();
     }
-    tx.execute("UPDATE nodes SET name=CASE WHEN id%3=0 THEN 'same' WHEN id%3=1 THEN 'SAME' ELSE name END WHERE scan_id='pages' AND id<>1", []).unwrap();
+    tx.execute("UPDATE nodes SET name=CASE id%6 WHEN 0 THEN 'same' WHEN 1 THEN 'SAME' WHEN 2 THEN 'Å.txt' WHEN 3 THEN 'å.txt' WHEN 4 THEN '中文🧭' ELSE name END,logical_total=id%7,modified=CASE WHEN id%2=0 THEN NULL ELSE '2026-10-12T01:02:03.456Z' END WHERE scan_id='pages' AND id<>1", []).unwrap();
     tx.commit().unwrap();
     let scan = service.repo.finish("pages", "completed").unwrap();
     for (sort, ordering) in [
         ("size_desc", "sort_size,name COLLATE NOCASE,id"),
-        ("size_asc", "logical_total,name COLLATE NOCASE,id"),
+        (
+            "size_asc",
+            "sort_size DESC,name COLLATE NOCASE DESC,id DESC",
+        ),
         ("name_asc", "name COLLATE NOCASE,id"),
         ("name_desc", "name COLLATE NOCASE DESC,id DESC"),
         (
@@ -854,6 +857,18 @@ fn keyset_pages_have_no_gaps_or_duplicates_and_locate_target_for_every_sort() {
             .unwrap();
         assert_eq!(ids, expected, "sort {sort}");
         if sort != "modified_desc" {
+            let plan = c.prepare(&format!("EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id='pages' AND parent_id=1 ORDER BY {ordering} LIMIT 17")).unwrap().query_map([],|row|row.get::<_,String>(3)).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap().join(";");
+            assert!(!plan.contains("TEMP B-TREE"), "indexed sort {sort}: {plan}");
+            assert!(
+                plan.contains(if sort.starts_with("size") {
+                    "nodes_parent_size_v3"
+                } else {
+                    "nodes_parent_name_v2"
+                }),
+                "indexed sort {sort}: {plan}"
+            );
+        }
+        if sort != "modified_desc" {
             let page = service
                 .repo
                 .node_page("pages", &expected[219].to_string(), scan.revision, sort, 17)
@@ -866,6 +881,87 @@ fn keyset_pages_have_no_gaps_or_duplicates_and_locate_target_for_every_sort() {
             );
         }
     }
+    let indexes = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='nodes_parent_size_asc_v2'",[],|r|r.get::<_,i64>(0)).unwrap();
+    assert_eq!(indexes, 0);
+    let mut old_query = PageRequest {
+        scan_id: "pages".into(),
+        revision: scan.revision,
+        parent_id: Some("1".into()),
+        sort: Some("size_asc".into()),
+        cursor: None,
+        page_size: Some(17),
+        filter: None,
+    };
+    let page = service.repo.page(&old_query, false).unwrap();
+    let mut old: serde_json::Value =
+        serde_json::from_str(page.next_cursor.as_ref().unwrap()).unwrap();
+    old["key"] = serde_json::to_value(
+        serde_json::to_string(&(
+            "pages",
+            scan.revision,
+            Some(1i64),
+            "size_asc",
+            &Filter::default(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    old_query.cursor = Some(old.to_string());
+    assert_eq!(
+        service.repo.page(&old_query, false).unwrap_err().code,
+        "INVALID_CURSOR"
+    );
+}
+
+#[test]
+fn duplicate_size_index_migration_preserves_old_history_and_page_size() {
+    let (_temp, service, scan) = fixture();
+    let c = service.repo.connect().unwrap();
+    c.execute_batch("CREATE INDEX nodes_parent_size_asc_v2 ON nodes(scan_id,parent_id,logical_total,name COLLATE NOCASE,id)").unwrap();
+    fn rows(c: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = c
+            .prepare(&format!(
+                "SELECT * FROM {table} ORDER BY {}",
+                if table == "nodes" { "scan_id,id" } else { "id" }
+            ))
+            .unwrap();
+        let count = statement.column_count();
+        statement
+            .query_map([], |r| {
+                (0..count)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect()
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+    let node_rows = rows(&c, "nodes");
+    let scan_rows = rows(&c, "scans");
+    let page_size = c
+        .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let reopened = Repository::new(&service.repo.data_dir).unwrap();
+    let after = reopened.connect().unwrap();
+    assert_eq!(rows(&after, "nodes"), node_rows);
+    assert_eq!(rows(&after, "scans"), scan_rows);
+    assert_eq!(
+        after
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        page_size
+    );
+    assert_eq!(after.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='nodes_parent_size_asc_v2'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(
+        reopened.scan(&scan.scan_id).unwrap().revision,
+        scan.revision
+    );
+    assert_eq!(
+        after
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
 }
 
 #[test]

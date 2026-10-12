@@ -228,6 +228,38 @@ fn run() -> Result<()> {
                 serde_json::json!({"pageElapsedMs":page_ms,"count":page.nodes.len(),"firstId":page.nodes.first().map(|n|n.node_id.clone()),"lastId":page.nodes.last().map(|n|n.node_id.clone()),"ancestorCount":ancestors.len(),"page":page}),
             );
         }
+        "page" => {
+            let request: PageRequest = serde_json::from_str(
+                args.get(2)
+                    .ok_or_else(|| AppError::new("USAGE", "page DATA_DIR REQUEST_JSON"))?,
+            )?;
+            let start = Instant::now();
+            let page = service.repo.page(&request, false)?;
+            output(
+                serde_json::json!({"pageElapsedMs":start.elapsed().as_secs_f64()*1000.0,"page":page}),
+            );
+        }
+        "node-page" => {
+            let scan_id = args.get(2).ok_or_else(|| {
+                AppError::new(
+                    "USAGE",
+                    "node-page DATA_DIR SCAN_ID NODE_ID SORT [PAGE_SIZE]",
+                )
+            })?;
+            let node_id = args
+                .get(3)
+                .ok_or_else(|| AppError::new("USAGE", "NODE_ID required"))?;
+            let sort = args.get(4).map(String::as_str).unwrap_or("size_desc");
+            let size = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(200);
+            let scan = service.repo.scan(scan_id)?;
+            let start = Instant::now();
+            let page = service
+                .repo
+                .node_page(scan_id, node_id, scan.revision, sort, size)?;
+            output(
+                serde_json::json!({"pageElapsedMs":start.elapsed().as_secs_f64()*1000.0,"page":page}),
+            );
+        }
         _ => return Err(AppError::new("USAGE", "未知 probe 命令")),
     }
     Ok(())
@@ -235,13 +267,13 @@ fn run() -> Result<()> {
 fn last_cursor(service: &Service, scan: &Scan) -> Result<String> {
     let c = service.repo.connect()?;
     let(id,name,size,modified):(i64,String,i64,Option<String>)=c.query_row("SELECT id,name,logical_total,modified FROM nodes WHERE scan_id=?1 AND parent_id=1 ORDER BY sort_size DESC,name COLLATE NOCASE DESC,id DESC LIMIT 1 OFFSET 200",[&scan.scan_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    let key = serde_json::to_string(&(
-        scan.scan_id.as_str(),
+    let key = spacefold_lib::repository::page_cursor_key(
+        &scan.scan_id,
         scan.revision,
-        Some(1i64),
+        Some(1),
         "size_desc",
         &Filter::default(),
-    ))?;
+    )?;
     Ok(serde_json::json!({"key":key,"id":id,"name":name,"size":size,"modified":modified.unwrap_or_default()}).to_string())
 }
 fn kernel(root: &std::path::Path) -> Result<()> {

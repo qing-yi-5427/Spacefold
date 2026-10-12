@@ -7,6 +7,18 @@ use std::{
 };
 
 pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
+/// Version sorting semantics independently of a persisted scan revision.
+pub fn page_cursor_key(
+    scan_id: &str,
+    revision: u32,
+    parent: Option<i64>,
+    sort: &str,
+    filter: &Filter,
+) -> Result<String> {
+    Ok(serde_json::to_string(&(
+        2u8, scan_id, revision, parent, sort, filter,
+    ))?)
+}
 pub struct Repository {
     pub path: PathBuf,
     pub data_dir: PathBuf,
@@ -40,7 +52,7 @@ impl Repository {
     CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS nodes_parent_size_asc_v2 ON nodes(scan_id,parent_id,logical_total ASC,name COLLATE NOCASE,id);CREATE INDEX IF NOT EXISTS nodes_parent_name_v2 ON nodes(scan_id,parent_id,name COLLATE NOCASE,id);
+    CREATE INDEX IF NOT EXISTS nodes_parent_name_v2 ON nodes(scan_id,parent_id,name COLLATE NOCASE,id);
     CREATE TABLE IF NOT EXISTS pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id));
     CREATE TABLE IF NOT EXISTS scan_errors(id INTEGER PRIMARY KEY AUTOINCREMENT,scan_id TEXT NOT NULL,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,scan_id TEXT NOT NULL,kind TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,payload TEXT NOT NULL);
@@ -62,7 +74,7 @@ impl Repository {
         if !has_sort_size {
             c.execute_batch("ALTER TABLE nodes ADD COLUMN sort_size INTEGER GENERATED ALWAYS AS (-logical_total) VIRTUAL;")?;
         }
-        c.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
+        c.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_parent_size_asc_v2; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
         let has_search_path: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('nodes') WHERE name='search_path')",
             [],
@@ -322,13 +334,13 @@ impl Repository {
         let sort = r.sort.as_deref().unwrap_or("size_desc");
         let ordering = match sort {
             "size_desc" => "sort_size ASC,name COLLATE NOCASE ASC,id ASC",
-            "size_asc" => "logical_total ASC,name COLLATE NOCASE ASC,id ASC",
+            "size_asc" => "sort_size DESC,name COLLATE NOCASE DESC,id DESC",
             "name_asc" => "name COLLATE NOCASE ASC,id ASC",
             "name_desc" => "name COLLATE NOCASE DESC,id DESC",
             "modified_desc" => "COALESCE(modified,'') DESC,name COLLATE NOCASE,id ASC",
             _ => return Err(AppError::new("INVALID_SORT", "排序方式无效")),
         };
-        let key = serde_json::to_string(&(r.scan_id.as_str(), r.revision, parent, sort, &f))?;
+        let key = page_cursor_key(&r.scan_id, r.revision, parent, sort, &f)?;
         let cursor = r
             .cursor
             .as_deref()
@@ -441,20 +453,12 @@ impl Repository {
             let tail=format!("(name COLLATE NOCASE>{name} COLLATE NOCASE OR (name COLLATE NOCASE={name} COLLATE NOCASE AND id>{id}))");
             match sort {
                 "size_desc" | "size_asc" => {
-                    let size = bind(Value::Integer(if sort == "size_desc" {
-                        -cursor.size
-                    } else {
-                        cursor.size
-                    }));
-                    let column = if sort == "size_desc" {
-                        "sort_size"
-                    } else {
-                        "logical_total"
-                    };
+                    let size = bind(Value::Integer(-cursor.size));
+                    let operator = if sort == "size_desc" { ">" } else { "<" };
                     ranges.extend([
-                        format!("{column}>{size}"),
-                        format!("{column}={size} AND name COLLATE NOCASE>{name} COLLATE NOCASE"),
-                        format!("{column}={size} AND name COLLATE NOCASE={name} COLLATE NOCASE AND id>{id}"),
+                        format!("sort_size{operator}{size}"),
+                        format!("sort_size={size} AND name COLLATE NOCASE{operator}{name} COLLATE NOCASE"),
+                        format!("sort_size={size} AND name COLLATE NOCASE={name} COLLATE NOCASE AND id{operator}{id}"),
                     ]);
                 }
                 "name_asc" | "name_desc" => {
@@ -559,10 +563,10 @@ impl Repository {
                 -parse_bytes(&target.node.logical_total_bytes)?,
             ),
             "size_asc" => (
-                "logical_total,name COLLATE NOCASE,id",
-                "<",
-                "logical_total DESC,name COLLATE NOCASE DESC,id DESC",
-                parse_bytes(&target.node.logical_total_bytes)?,
+                "sort_size,name COLLATE NOCASE,id",
+                ">",
+                "sort_size,name COLLATE NOCASE,id",
+                -parse_bytes(&target.node.logical_total_bytes)?,
             ),
             "name_asc" => (
                 "name COLLATE NOCASE,id",
@@ -595,7 +599,7 @@ impl Repository {
             )
             .optional()?
         };
-        let cursor=previous.map(|previous|{let key=serde_json::to_string(&(scan_id,revision,Some(parent_id),sort,&Filter::default()))?;Ok::<_,AppError>(serde_json::json!({"key":key,"id":parse_id(&previous.node.node_id)?,"name":previous.node.name,"size":parse_bytes(&previous.node.logical_total_bytes)?,"modified":previous.node.modified_at.unwrap_or_default()}).to_string())}).transpose()?;
+        let cursor=previous.map(|previous|{let key=page_cursor_key(scan_id,revision,Some(parent_id),sort,&Filter::default())?;Ok::<_,AppError>(serde_json::json!({"key":key,"id":parse_id(&previous.node.node_id)?,"name":previous.node.name,"size":parse_bytes(&previous.node.logical_total_bytes)?,"modified":previous.node.modified_at.unwrap_or_default()}).to_string())}).transpose()?;
         self.page(
             &PageRequest {
                 scan_id: scan_id.into(),
