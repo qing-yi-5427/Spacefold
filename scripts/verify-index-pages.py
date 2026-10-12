@@ -11,12 +11,13 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from contextlib import closing
 
 
 def digest_nodes(database):
     digest = hashlib.sha256()
     count = 0
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         for row in db.execute('SELECT * FROM nodes ORDER BY scan_id,id'):
             digest.update(json.dumps(
                 [value.hex() if isinstance(value, bytes) else value for value in row],
@@ -54,7 +55,7 @@ def main():
     results = {'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(),
                'sourceDatabase': str(source), 'copyOnly': True, 'cases': [],
                'oracle': 'Python integers plus ASCII-only NOCASE; complete selected slices'}
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         scan_id, revision = db.execute('SELECT id,revision FROM scans ORDER BY id LIMIT 1').fetchone()
         # Keep only the small oracle tuple in memory. The raw path is read separately
         # for each asserted API slice, independently of the display payload.
@@ -86,7 +87,7 @@ def main():
         assert int(page['totalCount']) == len(rows), page['totalCount']
         assert page['revision'] == revision
         assert [int(node['nodeId']) for node in page['nodes']] == [row[0] for row in expected]
-        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
             for node, row in zip(page['nodes'], expected):
                 assert node['name'] == row[1] and int(node['logicalTotalBytes']) == row[2]
                 raw = db.execute('SELECT path FROM nodes WHERE scan_id=? AND id=?',
@@ -160,7 +161,7 @@ def main():
                     placeholders, params = '?,?', (target[1], target[0])
                 # Match the production node_page predecessor SQL, separately
                 # from the Python oracle; report the actual tie-group plan.
-                with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+                with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
                     plan = db.execute(
                         'EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE scan_id=? AND parent_id=1 '
                         f'AND ({fields}){relation}({placeholders}) ORDER BY {ordering} LIMIT 1',
@@ -191,7 +192,7 @@ def main():
                                  'oldCursorRejected': True, 'invalidCursorRejected': True,
                                  'fullTraversal': args.full_traversal})
     assert digest_nodes(database) == before, 'Persisted historical records changed'
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
         assert not db.execute('PRAGMA foreign_key_check').fetchall()
         indexes = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='index'")]

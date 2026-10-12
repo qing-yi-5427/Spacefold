@@ -1,6 +1,7 @@
 """Rotated same-machine benchmarks. All reports and DBs stay outside the sources."""
 import argparse,ctypes,hashlib,json,os,re,shutil,statistics,subprocess,sys,threading,time,sqlite3
 from pathlib import Path
+from contextlib import closing
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'artifacts/python-qa'))
 import psutil
 ROOT=Path.cwd();OUT=ROOT/os.environ.get('BENCHMARK_OUTPUT','artifacts/benchmarks');OUT.mkdir(parents=True,exist_ok=True)
@@ -67,7 +68,7 @@ def expected(source):
 def verify_spacefold(data,scan,exp,manifest,index_layout='legacy'):
     """Independent read after process exit, outside timing. All original nodes retained."""
     database=data/'spacefold.sqlite3'
-    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as db:
         assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
         assert db.execute('PRAGMA foreign_key_check').fetchall()==[]
         assert db.execute('PRAGMA journal_mode').fetchone()[0]=='wal'
@@ -117,7 +118,7 @@ def verify_spacefold(data,scan,exp,manifest,index_layout='legacy'):
             assert not any('TEMP B-TREE' in row[3] for row in reverse_plan),reverse_plan
         return {'independentDatabaseRead':True,'fullPathAndRawBytesVerified':True,'allDirectoryAggregatesVerified':True,'completeNodes':len(rows),'indexes':sorted(required),'indexLayout':index_layout,'sizePageQueryPlan':plan,'sizeAscReverseQueryPlan':reverse_plan,'journalMode':'wal','pageSize':db.execute('PRAGMA page_size').fetchone()[0],'databaseBytes':database.stat().st_size}
 def history_snapshot(database):
-    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as db:
         scan_columns=[row[1] for row in db.execute("PRAGMA table_info('scans')")]; node_columns=[column[0] for column in db.execute('SELECT * FROM nodes LIMIT 0').description]
         scans=[[{'blobHex':v.hex()} if isinstance(v,bytes) else v for v in row] for row in db.execute('SELECT '+','.join(scan_columns)+' FROM scans ORDER BY id')]
         digest=hashlib.sha256();count=0
@@ -126,7 +127,7 @@ def history_snapshot(database):
             digest.update(json.dumps(values,separators=(',',':')).encode('utf-8'));count+=1
         return {'scanRecords':scans,'scanColumns':scan_columns,'nodeColumns':node_columns,'allStoredColumnsVerified':True,'historyNodeCount':count,'historyNodeDigest':digest.hexdigest(),'pageSize':db.execute('PRAGMA page_size').fetchone()[0]}
 def verify_history(database,seed):
-    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as db:
         digest=hashlib.sha256();count=0
         for scan in seed['scanRecords']:
             actual=db.execute('SELECT '+','.join(seed['scanColumns'])+' FROM scans WHERE id=?',(scan[0],)).fetchone()
@@ -197,7 +198,7 @@ for dataset,source in sources.items():
                 doc=json.loads(report.read_text(encoding='utf-8-sig'));assert len(doc)==exp['entriesExcludingRoot']+1;assert doc[0]['逻辑大小']==int(exp['logicalBytes']);assert doc[0]['文件数']==exp['files']
             elif tool=='gdu-sqlite':
                 assert int(re.search(r'^\s*(\d+)',text).group(1))==int(exp['logicalBytes'])
-                with sqlite3.connect(OUT/(name+'.sqlite')) as db:
+                with closing(sqlite3.connect(OUT/(name+'.sqlite'))) as db:
                     assert db.execute('SELECT COUNT(*) FROM items').fetchone()[0]==exp['entriesExcludingRoot']+1
                     assert db.execute('SELECT size FROM items WHERE parent_id IS NULL').fetchone()[0]==int(exp['logicalBytes'])
                     assert db.execute('SELECT COUNT(*) FROM items WHERE is_dir=0').fetchone()[0]==exp['files']
