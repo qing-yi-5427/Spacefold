@@ -32,6 +32,10 @@ struct ScanProfile {
     directory_queue_peak_cached_bytes: usize,
     consumed_limit: usize,
     directory_readers: usize,
+    output_slots: usize,
+    output_slot_storage_upper_bound_bytes: usize,
+    auxiliary_message_peak_bytes: usize,
+    auxiliary_message_budget_waits: usize,
     directory_api: platform::DirectoryApiProfile,
     reader_wait_ms: f64,
     directory_check_ms: f64,
@@ -96,6 +100,14 @@ fn reader_count_override(value: Option<&str>) -> usize {
         Some("2") => 2,
         Some("4") => 4,
         _ => DEFAULT_DIRECTORY_READERS,
+    }
+}
+fn output_slots_override(value: Option<&str>) -> usize {
+    match value {
+        Some("32") => 32,
+        Some("64") => 64,
+        Some("128") => 128,
+        _ => READER_QUEUE_CHUNKS,
     }
 }
 const DEFAULT_DIRECTORY_READERS: usize = 4;
@@ -215,6 +227,7 @@ const READER_CHUNK_ENTRIES: usize = 256;
 const READER_CHUNK_BYTES: usize = 256 * 1024;
 const READER_QUEUE_CHUNKS: usize = 32;
 const READER_DATA_BYTES: usize = 8 * 1024 * 1024;
+const AUXILIARY_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -367,11 +380,22 @@ impl Drop for ReaderWaitSpan {
 
 /// Charges all queued and currently consumed reader chunks together. Each of
 /// each active reader's constructing chunk is separately limited by entries/bytes.
-#[derive(Default)]
 struct ReaderBudget {
-    state: std::sync::Mutex<(usize, bool)>,
+    // Used bytes, stopped, high-water bytes, acquisition waits.
+    state: std::sync::Mutex<(usize, bool, usize, usize)>,
     changed: std::sync::Condvar,
     observation: Option<std::sync::Arc<ReaderWaitProbe>>,
+    limit: usize,
+}
+impl Default for ReaderBudget {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            changed: Default::default(),
+            observation: None,
+            limit: READER_DATA_BYTES,
+        }
+    }
 }
 struct ReaderPermit {
     budget: std::sync::Arc<ReaderBudget>,
@@ -384,12 +408,15 @@ impl ReaderBudget {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Option<ReaderPermit> {
         let mut state = self.state.lock().unwrap();
-        if bytes > READER_DATA_BYTES {
+        if bytes > self.limit {
             return None;
         }
         let mut waiting = None;
-        while state.0 + bytes > READER_DATA_BYTES && !state.1 && !cancel.load(Ordering::Acquire) {
-            if waiting.is_none() {
+        let mut waited = false;
+        while state.0 + bytes > self.limit && !state.1 && !cancel.load(Ordering::Acquire) {
+            if !waited {
+                waited = true;
+                state.3 += 1;
                 waiting = self
                     .observation
                     .as_ref()
@@ -406,6 +433,7 @@ impl ReaderBudget {
             return None;
         }
         state.0 += bytes;
+        state.2 = state.2.max(state.0);
         Some(ReaderPermit {
             budget: self.clone(),
             bytes,
@@ -485,12 +513,61 @@ enum DirectoryMessage {
     Done(ReaderTimings),
     Fatal(AppError),
 }
-struct ReaderOutput {
-    sender: crossbeam_channel::Sender<DirectoryMessage>,
-    observation: Option<std::sync::Arc<ReaderWaitProbe>>,
+impl DirectoryMessage {
+    fn auxiliary_bytes(&self) -> usize {
+        let error_bytes = |error: &AppError| {
+            error.code.capacity()
+                + error.message.capacity()
+                + error.node_id.as_ref().map_or(0, String::capacity)
+        };
+        match self {
+            Self::Metadata(update) => update.bytes(),
+            Self::Entries { path, .. } => path.capacity(),
+            Self::Error { path, error, .. } => path.capacity() + error_bytes(error),
+            Self::Fatal(error) => error_bytes(error),
+            Self::Done(_) => 0,
+        }
+    }
 }
-impl ReaderOutput {
+struct ReaderMessage {
+    message: DirectoryMessage,
+    auxiliary_permit: Option<ReaderPermit>,
+}
+struct ReaderOutput<'a> {
+    sender: crossbeam_channel::Sender<ReaderMessage>,
+    observation: Option<std::sync::Arc<ReaderWaitProbe>>,
+    auxiliary_budget: std::sync::Arc<ReaderBudget>,
+    cancel: &'a std::sync::atomic::AtomicBool,
+}
+impl ReaderOutput<'_> {
     fn send(&self, message: DirectoryMessage) -> std::result::Result<(), ()> {
+        let bytes = message.auxiliary_bytes();
+        if bytes > self.auxiliary_budget.limit {
+            drop(message);
+            let _ = self.send_message(ReaderMessage {
+                message: DirectoryMessage::Fatal(AppError::new(
+                    "READER_PAYLOAD_BUDGET",
+                    "目录消息超过内存预算，已保留此前提交的扫描结果",
+                )),
+                auxiliary_permit: None,
+            });
+            return Err(());
+        }
+        let auxiliary_permit = if bytes == 0 {
+            None
+        } else {
+            Some(
+                self.auxiliary_budget
+                    .acquire(bytes, self.cancel)
+                    .ok_or(())?,
+            )
+        };
+        self.send_message(ReaderMessage {
+            message,
+            auxiliary_permit,
+        })
+    }
+    fn send_message(&self, message: ReaderMessage) -> std::result::Result<(), ()> {
         let Some(probe) = &self.observation else {
             return self.sender.send(message).map_err(|_| ());
         };
@@ -498,7 +575,7 @@ impl ReaderOutput {
             Ok(()) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(()),
             Err(crossbeam_channel::TrySendError::Full(message)) => {
-                let kind = match &message {
+                let kind = match &message.message {
                     DirectoryMessage::Metadata(_) => 0,
                     DirectoryMessage::Entries { .. } => 1,
                     DirectoryMessage::Done(_) => 2,
@@ -530,17 +607,13 @@ static DEFERRED_DIRECTORY_HOOK: std::sync::Mutex<Option<DeferredDirectoryHook>> 
 /// backpressure, and no iterator/file handle crosses its owning thread.
 fn read_directories(
     requests: crossbeam_channel::Receiver<(i64, PathBuf, u32, Option<String>, bool)>,
-    output: crossbeam_channel::Sender<DirectoryMessage>,
+    output: ReaderOutput<'_>,
     cancel: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     profile: bool,
     budget: std::sync::Arc<ReaderBudget>,
     directory_reader: platform::ScanDirectoryReader,
 ) {
-    let output = ReaderOutput {
-        sender: output,
-        observation: budget.observation.clone(),
-    };
     while let Ok((parent, path, depth, expected_identity, deferred)) = requests.recv() {
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             break;
@@ -853,7 +926,21 @@ fn scan_sync_with_options(
     fast: bool,
     readers: usize,
 ) -> Result<Scan> {
+    let output_slots =
+        output_slots_override(std::env::var("SPACEFOLD_OUTPUT_SLOTS").ok().as_deref());
+    scan_sync_with_queue_capacity(service, scan_id, root, job, fast, readers, output_slots)
+}
+fn scan_sync_with_queue_capacity(
+    service: &Service,
+    scan_id: &str,
+    root: &Path,
+    job: &JobRuntime,
+    fast: bool,
+    readers: usize,
+    output_slots: usize,
+) -> Result<Scan> {
     assert!(matches!(readers, 2 | 4));
+    assert!(matches!(output_slots, 32 | 64 | 128));
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
@@ -863,6 +950,13 @@ fn scan_sync_with_options(
         reader_wait_probe: profile_enabled.then(|| std::sync::Arc::new(ReaderWaitProbe::default())),
         consumed_limit,
         directory_readers: readers,
+        output_slots,
+        // crossbeam's bounded slot holds one atomic stamp and the message,
+        // with at most one message alignment unit of padding per slot.
+        output_slot_storage_upper_bound_bytes: output_slots
+            * (std::mem::size_of::<ReaderMessage>()
+                + std::mem::size_of::<usize>()
+                + std::mem::align_of::<ReaderMessage>()),
         started: Some(started),
         ..Default::default()
     };
@@ -933,9 +1027,13 @@ fn scan_sync_with_options(
     let mut batch_path_bytes = 0usize;
     let mut consumed = 0usize;
     let mut batch_started = Instant::now();
+    let auxiliary_budget = std::sync::Arc::new(ReaderBudget {
+        limit: AUXILIARY_MESSAGE_BYTES,
+        ..Default::default()
+    });
     let pipeline_result = std::thread::scope(|scope| {
         let (request_tx, request_rx) = crossbeam_channel::bounded(DIRECTORY_PREFETCH);
-        let (directory_tx, directory_rx) = crossbeam_channel::bounded(READER_QUEUE_CHUNKS);
+        let (directory_tx, directory_rx) = crossbeam_channel::bounded(output_slots);
         let enabled = profile.enabled;
         let budget = std::sync::Arc::new(ReaderBudget {
             observation: profile.reader_wait_probe.clone(),
@@ -947,10 +1045,17 @@ fn scan_sync_with_options(
             let requests = request_rx.clone();
             let output = directory_tx.clone();
             let reader_budget = budget.clone();
+            let auxiliary_budget = auxiliary_budget.clone();
             let stop = reader_stop.clone();
             let directory_reader = directory_reader.clone();
             readers.push(scope.spawn(move || -> Result<()> {
                 let fault_output = output.clone();
+                let output = ReaderOutput {
+                    sender: output,
+                    observation: reader_budget.observation.clone(),
+                    auxiliary_budget: auxiliary_budget.clone(),
+                    cancel: &job.cancel,
+                };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
                         requests,
@@ -965,8 +1070,12 @@ fn scan_sync_with_options(
                 if outcome.is_err() {
                     stop.store(true, Ordering::Release);
                     reader_budget.stop();
+                    auxiliary_budget.stop();
                     let error = AppError::new("WORKER_FAILED", "枚举线程异常退出");
-                    let _ = fault_output.send(DirectoryMessage::Fatal(error.clone()));
+                    let _ = fault_output.send(ReaderMessage {
+                        message: DirectoryMessage::Fatal(error.clone()),
+                        auxiliary_permit: None,
+                    });
                     return Err(error);
                 }
                 Ok(())
@@ -1164,6 +1273,10 @@ fn scan_sync_with_options(
                         return Err(AppError::new("WORKER_FAILED", "枚举线程中断"))
                     }
                 };
+                let ReaderMessage {
+                    message,
+                    mut auxiliary_permit,
+                } = message;
                 match message {
                     DirectoryMessage::Metadata(update) => {
                         batch_path_bytes +=
@@ -1171,6 +1284,7 @@ fn scan_sync_with_options(
                         profile.peak_batch_path_bytes =
                             profile.peak_batch_path_bytes.max(batch_path_bytes);
                         directory_updates.push(update);
+                        drop(auxiliary_permit.take());
                         // Existing collection time and owned-byte limits also
                         // bound the independently completed directory metadata.
                         if batch_path_bytes >= BATCH_PATH_BYTES
@@ -1211,6 +1325,8 @@ fn scan_sync_with_options(
                         entries,
                         permit,
                     } => {
+                        drop(path);
+                        drop(auxiliary_permit.take());
                         for (entry, encoded) in entries {
                             if job.cancel.load(Ordering::Acquire) {
                                 break 'directories;
@@ -1273,7 +1389,6 @@ fn scan_sync_with_options(
                                 refill = true;
                             }
                         }
-                        let _ = path;
                         drop(permit);
                     }
                     DirectoryMessage::Error {
@@ -1291,6 +1406,10 @@ fn scan_sync_with_options(
                     }
                     DirectoryMessage::Fatal(error) => return Err(error),
                 }
+                // Metadata/entries now belong to the existing bounded writer
+                // batch, or the error has been saved. Transfer their ownership
+                // before returning this separate queue-only auxiliary charge.
+                drop(auxiliary_permit);
                 if last_emit.elapsed() >= Duration::from_millis(100) {
                     emit_scan(service, scan_id, job, "running", "读取目录与元数据")?;
                     last_emit = Instant::now();
@@ -1304,6 +1423,7 @@ fn scan_sync_with_options(
         drop(directory_rx);
         reader_stop.store(true, Ordering::Release);
         budget.stop();
+        auxiliary_budget.stop();
         #[cfg(test)]
         {
             let hook = DEFERRED_DIRECTORY_HOOK
@@ -1385,6 +1505,9 @@ fn scan_sync_with_options(
     profile.finish_ms = milliseconds(finish_started);
     if profile.enabled {
         // sqlite3_db_status only reads counters on this owned connection.
+        let auxiliary = auxiliary_budget.state.lock().unwrap();
+        profile.auxiliary_message_peak_bytes = auxiliary.2;
+        profile.auxiliary_message_budget_waits = auxiliary.3;
         if let Some(probe) = &profile.reader_wait_probe {
             profile.reader_backpressure = probe.snapshot();
         }
@@ -1915,11 +2038,13 @@ mod tests {
         fs::write(root.join("empty.bin"), b"").unwrap();
         let root = platform::absolute(&root).unwrap();
         let service = Service::new(&fixture.path().join("data")).unwrap();
-        let run = |fast, readers| {
+        let run = |fast, readers, slots| {
             let id = service.repo.new_scan_id().unwrap();
             service.repo.insert_scan(&id, &root, false).unwrap();
             let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
-            let scan = scan_sync_with_options(&service, &id, &root, &job, fast, readers).unwrap();
+            let scan =
+                scan_sync_with_queue_capacity(&service, &id, &root, &job, fast, readers, slots)
+                    .unwrap();
             assert!(job.terminal());
             assert_eq!(scan.status, "completed");
             let connection = service.repo.connect().unwrap();
@@ -1938,40 +2063,42 @@ mod tests {
                 .collect::<std::collections::BTreeMap<_, _>>();
             (scan, nodes)
         };
-        let (old, legacy) = run(false, 2);
-        let (new, bulk) = run(true, 2);
-        let (parallel_scan, parallel) = run(true, 4);
-        assert_eq!(new.discovered_count, parallel_scan.discovered_count);
-        assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
-        assert_eq!(new.error_count, parallel_scan.error_count);
-        assert!(bulk.keys().eq(parallel.keys()));
-        for (path, node) in &bulk {
-            let parent_path = |nodes: &std::collections::BTreeMap<Vec<u8>, StoredNode>,
-                               parent: &Option<String>| {
-                parent.as_ref().map(|id| {
-                    nodes
-                        .values()
-                        .find(|n| &n.node.node_id == id)
-                        .map(|n| platform::encode_path(&n.path))
-                        .unwrap()
-                })
-            };
-            assert_eq!(
-                parent_path(&bulk, &node.node.parent_id),
-                parent_path(&parallel, &parallel[path].node.parent_id)
-            );
-            let mut two = node.node.clone();
-            let mut four = parallel[path].node.clone();
-            // Discovery IDs and revisions are scheduling details. Every saved
-            // path, own metadata and aggregate remains identical.
-            two.node_id.clear();
-            four.node_id.clear();
-            two.parent_id = None;
-            four.parent_id = None;
-            assert_eq!(
-                serde_json::to_value(two).unwrap(),
-                serde_json::to_value(four).unwrap()
-            );
+        let (old, legacy) = run(false, 2, 32);
+        let (new, bulk) = run(true, 2, 32);
+        for slots in [32, 64, 128] {
+            let (parallel_scan, parallel) = run(true, 4, slots);
+            assert_eq!(new.discovered_count, parallel_scan.discovered_count);
+            assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
+            assert_eq!(new.error_count, parallel_scan.error_count);
+            assert!(bulk.keys().eq(parallel.keys()));
+            for (path, node) in &bulk {
+                let parent_path = |nodes: &std::collections::BTreeMap<Vec<u8>, StoredNode>,
+                                   parent: &Option<String>| {
+                    parent.as_ref().map(|id| {
+                        nodes
+                            .values()
+                            .find(|n| &n.node.node_id == id)
+                            .map(|n| platform::encode_path(&n.path))
+                            .unwrap()
+                    })
+                };
+                assert_eq!(
+                    parent_path(&bulk, &node.node.parent_id),
+                    parent_path(&parallel, &parallel[path].node.parent_id)
+                );
+                let mut two = node.node.clone();
+                let mut four = parallel[path].node.clone();
+                // Discovery IDs and revisions are scheduling details. Every saved
+                // path, own metadata and aggregate remains identical.
+                two.node_id.clear();
+                four.node_id.clear();
+                two.parent_id = None;
+                four.parent_id = None;
+                assert_eq!(
+                    serde_json::to_value(two).unwrap(),
+                    serde_json::to_value(four).unwrap()
+                );
+            }
         }
         assert_eq!(old.discovered_count, new.discovered_count);
         assert_eq!(old.logical_total_bytes, new.logical_total_bytes);
@@ -2285,18 +2412,28 @@ mod tests {
         let probe = Arc::new(ReaderWaitProbe::default());
         let (sender, receiver) = crossbeam_channel::bounded(1);
         sender
-            .send(DirectoryMessage::Done(ReaderTimings {
-                enumerate_ms: 0.0,
-                ..Default::default()
-            }))
+            .send(ReaderMessage {
+                message: DirectoryMessage::Done(ReaderTimings {
+                    enumerate_ms: 0.0,
+                    ..Default::default()
+                }),
+                auxiliary_permit: None,
+            })
             .unwrap();
         let filler = sender.clone();
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        let output = ReaderOutput {
-            sender,
-            observation: Some(probe.clone()),
-        };
+        let producer_probe = probe.clone();
         let producer = std::thread::spawn(move || {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let output = ReaderOutput {
+                sender,
+                observation: Some(producer_probe),
+                auxiliary_budget: Arc::new(ReaderBudget {
+                    limit: AUXILIARY_MESSAGE_BYTES,
+                    ..Default::default()
+                }),
+                cancel: &cancel,
+            };
             for value in [1.0, 2.0] {
                 if output
                     .send(DirectoryMessage::Done(ReaderTimings {
@@ -2319,18 +2456,23 @@ mod tests {
         }
         assert_eq!(probe.snapshot().active_waiters[1], 1);
         for expected in [0.0, 1.0] {
-            let DirectoryMessage::Done(timing) =
-                receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+            let DirectoryMessage::Done(timing) = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .message
             else {
                 panic!("unexpected message")
             };
             assert_eq!(timing.enumerate_ms, expected);
         }
         filler
-            .send(DirectoryMessage::Done(ReaderTimings {
-                enumerate_ms: 99.0,
-                ..Default::default()
-            }))
+            .send(ReaderMessage {
+                message: DirectoryMessage::Done(ReaderTimings {
+                    enumerate_ms: 99.0,
+                    ..Default::default()
+                }),
+                auxiliary_permit: None,
+            })
             .unwrap();
         release_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2343,6 +2485,117 @@ mod tests {
         assert_eq!(saved.active_waiters, [0, 0]);
         assert_eq!(saved.message_send_waits, 2);
         assert_eq!(saved.message_send_waits_by_kind, [0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn auxiliary_message_budget_charges_owned_capacity_and_releases_both_permits() {
+        for slots in [32, 64, 128] {
+            let (sender, receiver) = crossbeam_channel::bounded(slots);
+            let auxiliary = Arc::new(ReaderBudget {
+                limit: AUXILIARY_MESSAGE_BYTES,
+                ..Default::default()
+            });
+            let entries = Arc::new(ReaderBudget::default());
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let output = ReaderOutput {
+                sender,
+                observation: None,
+                auxiliary_budget: auxiliary.clone(),
+                cancel: &cancel,
+            };
+            let mut text = String::with_capacity(512);
+            text.push_str("saved error");
+            let mut path = PathBuf::with_capacity(256);
+            path.push("source");
+            let error = DirectoryMessage::Error {
+                parent: 1,
+                path,
+                stage: "enumerate",
+                error: AppError::new("IO_ERROR", text),
+            };
+            let expected_error = error.auxiliary_bytes();
+            output.send(error).unwrap();
+            let mut parent_path = PathBuf::with_capacity(128);
+            parent_path.push("parent");
+            let expected_parent = parent_path.capacity();
+            output
+                .send(DirectoryMessage::Entries {
+                    parent: 1,
+                    path: parent_path,
+                    depth: 0,
+                    entries: vec![],
+                    permit: entries.acquire(32, &cancel).unwrap(),
+                })
+                .unwrap();
+            let auxiliary_used = auxiliary.state.lock().unwrap().0;
+            let entries_used = entries.state.lock().unwrap().0;
+            assert_eq!(auxiliary_used, expected_error + expected_parent);
+            assert_eq!(entries_used, 32);
+            let received = receiver.recv().unwrap();
+            assert_eq!(received.message.auxiliary_bytes(), expected_error);
+            drop(received);
+            let auxiliary_used = auxiliary.state.lock().unwrap().0;
+            assert_eq!(auxiliary_used, expected_parent);
+            drop(receiver);
+            // A disconnected queue retains owned messages while a sender remains.
+            let auxiliary_used = auxiliary.state.lock().unwrap().0;
+            let entries_used = entries.state.lock().unwrap().0;
+            assert_eq!(auxiliary_used, expected_parent);
+            assert_eq!(entries_used, 32);
+            drop(output);
+            let auxiliary_used = auxiliary.state.lock().unwrap().0;
+            let entries_used = entries.state.lock().unwrap().0;
+            assert_eq!(auxiliary_used, 0);
+            assert_eq!(entries_used, 0);
+        }
+    }
+
+    #[test]
+    fn oversized_auxiliary_message_is_fatal_and_cancelled_budget_wait_does_not_enqueue() {
+        let (sender, receiver) = crossbeam_channel::bounded(32);
+        let auxiliary = Arc::new(ReaderBudget {
+            limit: 64,
+            ..Default::default()
+        });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output = ReaderOutput {
+            sender: sender.clone(),
+            observation: None,
+            auxiliary_budget: auxiliary.clone(),
+            cancel: &cancel,
+        };
+        let oversized = DirectoryMessage::Fatal(AppError::new("ERROR", String::with_capacity(128)));
+        assert!(output.send(oversized).is_err());
+        let DirectoryMessage::Fatal(error) = receiver.recv().unwrap().message else {
+            panic!("oversized message did not fail the job")
+        };
+        assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+        assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+        let permit = auxiliary.acquire(64, &cancel).unwrap();
+        let waiting_budget = auxiliary.clone();
+        let waiting_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let output = ReaderOutput {
+                sender,
+                observation: None,
+                auxiliary_budget: waiting_budget,
+                cancel: &waiting_cancel,
+            };
+            output
+                .send(DirectoryMessage::Fatal(AppError::new("E", "x")))
+                .is_err()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while auxiliary.state.lock().unwrap().3 == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(auxiliary.state.lock().unwrap().3, 1);
+        cancel.store(true, Ordering::Release);
+        auxiliary.stop();
+        assert!(worker.join().unwrap());
+        drop(permit);
+        assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
