@@ -2294,7 +2294,20 @@ pub fn aggregate_batch(
     dirs: i64,
     children: i64,
 ) -> Result<()> {
-    let sql="WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET logical_total=logical_total+?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5,file_count=file_count+?6,dir_count=dir_count+?7 WHERE scan_id=?1 AND id IN ancestors";
+    let sql = if logical == 0 {
+        // Omitting an unchanged indexed column must still reject the invalid
+        // logical values which the original UPDATE's CHECK constraint rejected.
+        let valid: bool = tx.query_row("WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE scan_id=?1 AND id IN ancestors AND (typeof(logical_total)<>'integer' OR logical_total<0))", params![scan_id,parent], |r|r.get(0))?;
+        if !valid {
+            return Err(AppError::new(
+                "SIZE_OUT_OF_RANGE",
+                "扫描总量超出精确整数支持范围",
+            ));
+        }
+        "WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5,file_count=file_count+?6,dir_count=dir_count+?7 WHERE scan_id=?1 AND id IN ancestors"
+    } else {
+        "WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET logical_total=logical_total+?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5,file_count=file_count+?6,dir_count=dir_count+?7 WHERE scan_id=?1 AND id IN ancestors"
+    };
     tx.execute(sql,params![scan_id,parent,logical,allocated,unknown,files,dirs]).map_err(|error|if matches!(error,rusqlite::Error::SqliteFailure(ref e,_) if e.extended_code==rusqlite::ffi::SQLITE_CONSTRAINT_CHECK){AppError::new("SIZE_OUT_OF_RANGE","扫描总量超出精确整数支持范围")}else{error.into()})?;
     tx.execute(
         "UPDATE nodes SET children_count=children_count+?3 WHERE scan_id=?1 AND id=?2",
@@ -2319,6 +2332,8 @@ struct AggregateRow {
     current: [i64; 6],
     delta: [i64; 6],
 }
+const AGGREGATE_VALUES_UPDATE: &str = "UPDATE nodes SET logical_total=?3,allocated_total=?4,allocated_unknown=?5,file_count=?6,dir_count=?7,children_count=?8 WHERE scan_id=?1 AND id=?2";
+const AGGREGATE_NON_LOGICAL_UPDATE: &str = "UPDATE nodes SET allocated_total=?3,allocated_unknown=?4,file_count=?5,dir_count=?6,children_count=?7 WHERE scan_id=?1 AND id=?2";
 /// Coalesce shared ancestors once per committed batch. The maps contain only
 /// fixed-size IDs/counters, no paths or metadata. At most 32,768 ancestor rows
 /// are retained; an unusually dispersed/deep batch uses the original bounded
@@ -2453,20 +2468,39 @@ fn aggregate_many_with_limit(
     }
     // All sums are checked before the first UPDATE. The caller's transaction
     // also contains nodes, direct child counts, queue consumption and revision.
-    let mut update = tx.prepare_cached("UPDATE nodes SET logical_total=?3,allocated_total=?4,allocated_unknown=?5,file_count=?6,dir_count=?7,children_count=?8 WHERE scan_id=?1 AND id=?2")?;
+    let mut update = tx.prepare_cached(AGGREGATE_VALUES_UPDATE)?;
+    let mut non_logical = tx.prepare_cached(AGGREGATE_NON_LOGICAL_UPDATE)?;
     for (id, row) in &rows {
-        update.execute(params![
-            scan_id,
-            id,
-            row.current[0],
-            row.current[1],
-            row.current[2],
-            row.current[3],
-            row.current[4],
-            row.current[5]
-        ])?;
+        if row.delta == [0; 6] {
+            continue;
+        }
+        if row.delta[0] == 0 {
+            // SQLite maintains both size indexes whenever logical_total occurs
+            // in SET, even when the new value is identical to the old one.
+            non_logical.execute(params![
+                scan_id,
+                id,
+                row.current[1],
+                row.current[2],
+                row.current[3],
+                row.current[4],
+                row.current[5]
+            ])?;
+        } else {
+            update.execute(params![
+                scan_id,
+                id,
+                row.current[0],
+                row.current[1],
+                row.current[2],
+                row.current[3],
+                row.current[4],
+                row.current[5]
+            ])?;
+        }
     }
     drop(update);
+    drop(non_logical);
     tx.execute(
         "UPDATE scans SET discovered=?2 WHERE id=?1",
         params![scan_id, discovered],
@@ -3292,5 +3326,304 @@ mod aggregate_many_tests {
         assert_eq!(values(&repo.connect().unwrap(), &folded), before);
         tx.rollback().unwrap();
         assert_eq!(values(&c, &folded), before);
+    }
+
+    #[test]
+    fn zero_logical_aggregate_avoids_size_indexes_without_losing_signed_counters_or_children() {
+        let (_fixture, repo, legacy, folded) = fixture();
+        apply(
+            &repo,
+            &legacy,
+            &folded,
+            &BTreeMap::from([(2, [10, 10, 0, 1, 1, 2]), (4, [10, 10, 0, 1, 1, 2])]),
+            32_768,
+        );
+        let mut c = repo.connect().unwrap();
+        let explain = |sql: &str| {
+            let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            stmt.query_map(
+                rusqlite::params_from_iter(std::iter::repeat_n(
+                    rusqlite::types::Value::Null,
+                    stmt.parameter_count(),
+                )),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let full = explain(AGGREGATE_VALUES_UPDATE);
+        let no_logical = explain(AGGREGATE_NON_LOGICAL_UPDATE);
+        for name in ["nodes_parent_size_v3", "nodes_special_kind_v2"] {
+            let root: i64 = c
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!no_logical
+                .iter()
+                .any(|(op, _, page)| op == "OpenWrite" && *page == root));
+            let cursor = full
+                .iter()
+                .find(|(op, _, page)| op == "OpenWrite" && *page == root)
+                .unwrap()
+                .1;
+            assert!(full
+                .iter()
+                .any(|(op, id, _)| op == "IdxDelete" && *id == cursor));
+            assert!(full
+                .iter()
+                .any(|(op, id, _)| op == "IdxInsert" && *id == cursor));
+        }
+        c.execute_batch("CREATE TEMP TABLE aggregate_writes(scan_id TEXT,id INTEGER,logical INTEGER); CREATE TEMP TRIGGER aggregate_any AFTER UPDATE ON main.nodes BEGIN INSERT INTO aggregate_writes VALUES(new.scan_id,new.id,0);END; CREATE TEMP TRIGGER aggregate_logical AFTER UPDATE OF logical_total ON main.nodes BEGIN INSERT INTO aggregate_writes VALUES(new.scan_id,new.id,1);END;").unwrap();
+        let changes = BTreeMap::from([
+            (2, [5, 2, 1, 1, 1, 3]),
+            (4, [-5, -2, 0, -1, 0, -1]),
+            (6, [0; 6]),
+        ]);
+        let tx = c.transaction().unwrap();
+        for (id, d) in &changes {
+            aggregate_batch(&tx, &legacy, *id, d[0], d[1], d[2], d[3], d[4], d[5]).unwrap();
+        }
+        aggregate_many(&tx, &folded, &changes).unwrap();
+        assert_eq!(values(&tx, &folded), values(&tx, &legacy));
+        let logical_writes = tx
+            .prepare("SELECT id FROM aggregate_writes WHERE scan_id=?1 AND logical=1 ORDER BY id")
+            .unwrap()
+            .query_map([&folded], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(logical_writes, vec![2, 4, 20, 30]); // Shared root's +5/-5 cancels exactly.
+        let skipped: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM aggregate_writes WHERE scan_id=?1 AND id=6",
+                [&folded],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(skipped, 0);
+        let root = Repository::node_conn(&tx, &folded, 1).unwrap().node;
+        assert_eq!(
+            (
+                root.logical_total_bytes.as_str(),
+                root.allocated_known_total_bytes.as_str(),
+                root.allocated_unknown_count.as_str(),
+                root.file_count.as_str(),
+                root.directory_count.as_str(),
+                root.children_count.as_str()
+            ),
+            ("20", "20", "1", "2", "9", "2")
+        );
+        assert_eq!(
+            Repository::node_conn(&tx, &folded, 2)
+                .unwrap()
+                .node
+                .children_count,
+            "6"
+        );
+        assert_eq!(
+            Repository::node_conn(&tx, &folded, 4)
+                .unwrap()
+                .node
+                .children_count,
+            "2"
+        );
+        let discovered: i64 = tx
+            .query_row("SELECT discovered FROM scans WHERE id=?1", [&folded], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(discovered, 13);
+        tx.commit().unwrap();
+        let before = values(&c, &folded);
+        c.execute("DELETE FROM aggregate_writes", []).unwrap();
+        let tx = c.transaction().unwrap();
+        aggregate_many(&tx, &folded, &BTreeMap::from([(6, [0; 6])])).unwrap();
+        assert_eq!(values(&tx, &folded), before);
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM aggregate_writes", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        tx.commit().unwrap();
+        // A child-only batch must still affect parent children and scan discovery,
+        // in both the coalesced and the bounded fallback representation.
+        apply(
+            &repo,
+            &legacy,
+            &folded,
+            &BTreeMap::from([(6, [0, 0, 0, 0, 0, 3])]),
+            0,
+        );
+        assert_eq!(
+            Repository::node_conn(&c, &folded, 6)
+                .unwrap()
+                .node
+                .children_count,
+            "3"
+        );
+        assert_eq!(
+            c.query_row("SELECT discovered FROM scans WHERE id=?1", [&folded], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            16
+        );
+        apply(
+            &repo,
+            &legacy,
+            &folded,
+            &BTreeMap::from([(6, [0, 0, 0, 0, 0, -1])]),
+            32_768,
+        );
+        assert_eq!(
+            Repository::node_conn(&c, &folded, 6)
+                .unwrap()
+                .node
+                .children_count,
+            "2"
+        );
+    }
+
+    #[test]
+    fn zero_aggregate_keeps_parent_graph_and_all_counter_prechecks_before_skipping_writes() {
+        let (_fixture, repo, _legacy, scan) = fixture();
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        assert_eq!(
+            aggregate_many(&tx, &scan, &BTreeMap::from([(999, [0; 6])]))
+                .unwrap_err()
+                .code,
+            "NODE_NOT_FOUND"
+        );
+        tx.execute(
+            "UPDATE nodes SET parent_id=6 WHERE scan_id=?1 AND id=20",
+            [&scan],
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate_many(&tx, &scan, &BTreeMap::from([(6, [0; 6])]))
+                .unwrap_err()
+                .code,
+            "CORRUPT_HIERARCHY"
+        );
+        tx.rollback().unwrap();
+        for (index, column) in [
+            (1, "allocated_total"),
+            (2, "allocated_unknown"),
+            (3, "file_count"),
+            (4, "dir_count"),
+            (5, "children_count"),
+        ] {
+            let tx = c.transaction().unwrap();
+            tx.execute(
+                &format!("UPDATE nodes SET {column}=?2 WHERE scan_id=?1 AND id=6"),
+                params![&scan, i64::MAX],
+            )
+            .unwrap();
+            let before = values(&tx, &scan);
+            let mut change = [0; 6];
+            change[index] = 1;
+            assert_eq!(
+                aggregate_many(&tx, &scan, &BTreeMap::from([(6, change)]))
+                    .unwrap_err()
+                    .code,
+                "SIZE_OUT_OF_RANGE"
+            );
+            assert_eq!(values(&tx, &scan), before);
+            tx.rollback().unwrap();
+        }
+        let tx = c.transaction().unwrap();
+        tx.execute(
+            "UPDATE nodes SET file_count=-1 WHERE scan_id=?1 AND id=6",
+            [&scan],
+        )
+        .unwrap();
+        let before = values(&tx, &scan);
+        assert_eq!(
+            aggregate_many(&tx, &scan, &BTreeMap::from([(6, [0; 6])]))
+                .unwrap_err()
+                .code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        assert_eq!(values(&tx, &scan), before);
+        tx.rollback().unwrap();
+        let tx = c.transaction().unwrap();
+        for id in 100..=4197i64 {
+            tx.execute("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,incomplete,search_path) SELECT scan_id,?2,?3,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,incomplete,search_path FROM nodes WHERE scan_id=?1 AND id=1",params![&scan,id,if id==100{1}else{id-1}]).unwrap();
+        }
+        assert_eq!(
+            aggregate_many(&tx, &scan, &BTreeMap::from([(4197, [0; 6])]))
+                .unwrap_err()
+                .code,
+            "DEPTH_LIMIT"
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn zero_logical_fallback_preserves_size_constraints_and_rolls_back_partial_other_counters() {
+        let (_fixture, repo, legacy, scan) = fixture();
+        apply(
+            &repo,
+            &legacy,
+            &scan,
+            &BTreeMap::from([(2, [0, 3, 2, 1, 2, 3]), (4, [0, 4, 1, 2, 1, 3])]),
+            0,
+        );
+        apply(
+            &repo,
+            &legacy,
+            &scan,
+            &BTreeMap::from([(2, [0, -1, -1, -1, -1, -1])]),
+            0,
+        );
+        let mut c = repo.connect().unwrap();
+        let before = values(&c, &scan);
+        let tx = c.transaction().unwrap();
+        assert_eq!(
+            aggregate_many_with_limit(
+                &tx,
+                &scan,
+                &BTreeMap::from([(2, [0, i64::MAX, 0, 0, 0, 0]), (4, [0, 1, 0, 0, 0, 0])]),
+                0
+            )
+            .unwrap_err()
+            .code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        tx.rollback().unwrap();
+        assert_eq!(values(&c, &scan), before);
+        for value in [
+            rusqlite::types::Value::Text("corrupt".into()),
+            rusqlite::types::Value::Integer(-1),
+        ] {
+            c.execute_batch("PRAGMA ignore_check_constraints=ON")
+                .unwrap();
+            let tx = c.transaction().unwrap();
+            tx.execute(
+                "UPDATE nodes SET logical_total=?2 WHERE scan_id=?1 AND id=6",
+                params![&scan, value],
+            )
+            .unwrap();
+            tx.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                .unwrap();
+            assert_eq!(
+                aggregate_batch(&tx, &scan, 6, 0, 0, 0, 0, 0, 0)
+                    .unwrap_err()
+                    .code,
+                "SIZE_OUT_OF_RANGE"
+            );
+            tx.rollback().unwrap();
+        }
     }
 }
