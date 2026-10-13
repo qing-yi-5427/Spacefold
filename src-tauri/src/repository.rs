@@ -7,6 +7,31 @@ use std::{
 };
 
 pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
+struct ViewBudget {
+    bytes: usize,
+    nodes: usize,
+}
+#[cfg(test)]
+type ViewReadHook = (
+    PathBuf,
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
+#[cfg(test)]
+static VIEW_READ_HOOK: std::sync::Mutex<Option<ViewReadHook>> = std::sync::Mutex::new(None);
+impl ViewBudget {
+    fn charge(&mut self, value: &impl serde::Serialize, nodes: usize) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(serde_json::to_vec(value)?.len());
+        self.nodes = self.nodes.saturating_add(nodes);
+        if self.bytes > 8 * 1024 * 1024 || self.nodes > 10_000 {
+            return Err(AppError::new(
+                "VIEW_PAYLOAD_BUDGET",
+                "视图超出记录或 8 MiB 返回预算，请减少展开目录或所选项",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Version sorting semantics independently of a persisted scan revision.
 pub fn page_cursor_key(
     scan_id: &str,
@@ -438,19 +463,25 @@ impl Repository {
         let c = self.connect()?;
         let tx = c.unchecked_transaction()?;
         Self::check_revision(&tx, scan_id, revision)?;
-        let (nodes, covered) = Self::normalize_conn(&tx, scan_id, ids)?;
+        Self::selection_conn(&tx, scan_id, ids)
+    }
+    fn selection_conn(c: &Connection, scan_id: &str, ids: &[String]) -> Result<SelectionSummary> {
+        let (nodes, covered) = Self::normalize_conn(c, scan_id, ids)?;
+        Self::selection_nodes(nodes.into_iter().map(|node| node.node).collect(), covered)
+    }
+    fn selection_nodes(nodes: Vec<Node>, covered: Vec<String>) -> Result<SelectionSummary> {
         let mut bytes = 0i64;
         let mut alloc = 0i64;
         let mut unknown = 0i64;
         for n in &nodes {
-            bytes = checked_add(bytes, parse_bytes(&n.node.logical_total_bytes)?)?;
-            alloc = checked_add(alloc, parse_bytes(&n.node.allocated_known_total_bytes)?)?;
-            unknown = checked_add(unknown, parse_bytes(&n.node.allocated_unknown_count)?)?
+            bytes = checked_add(bytes, parse_bytes(&n.logical_total_bytes)?)?;
+            alloc = checked_add(alloc, parse_bytes(&n.allocated_known_total_bytes)?)?;
+            unknown = checked_add(unknown, parse_bytes(&n.allocated_unknown_count)?)?
         }
-        let mutable = !nodes.is_empty() && nodes.iter().all(|n| n.node.parent_id.is_some());
+        let mutable = !nodes.is_empty() && nodes.iter().all(|n| n.parent_id.is_some());
         let single = nodes.len() == 1;
         Ok(SelectionSummary {
-            normalized_ids: nodes.iter().map(|n| n.node.node_id.clone()).collect(),
+            normalized_ids: nodes.iter().map(|n| n.node_id.clone()).collect(),
             covered_ids: covered,
             count: nodes.len().to_string(),
             logical_total_bytes: bytes.to_string(),
@@ -460,10 +491,36 @@ impl Repository {
             can_rename: single && mutable,
             can_move: mutable,
             can_trash: mutable,
-            nodes: nodes.into_iter().map(|n| n.node).collect(),
+            nodes,
         })
     }
+    fn visit_ancestors_conn(
+        c: &Connection,
+        scan_id: &str,
+        mut parent: Option<String>,
+        mut visit: impl FnMut(Node) -> Result<()>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        while let Some(id) = parent {
+            let id = parse_id(&id)?;
+            if !seen.insert(id) {
+                return Err(AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"));
+            }
+            if seen.len() > 4096 {
+                return Err(AppError::new("DEPTH_LIMIT", "目录深度超过支持上限"));
+            }
+            let node = Self::node_conn(c, scan_id, id)?.node;
+            parent = node.parent_id.clone();
+            visit(node)?;
+        }
+        Ok(())
+    }
     pub fn page(&self, r: &PageRequest, search: bool) -> Result<NodePage> {
+        let c = self.connect()?;
+        let tx = c.unchecked_transaction()?;
+        Self::page_conn(&tx, r, search)
+    }
+    fn page_conn(tx: &Connection, r: &PageRequest, search: bool) -> Result<NodePage> {
         use rusqlite::types::Value;
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Cursor {
@@ -473,9 +530,7 @@ impl Repository {
             size: i64,
             modified: String,
         }
-        let c = self.connect()?;
-        let tx = c.unchecked_transaction()?;
-        Self::check_revision(&tx, &r.scan_id, r.revision)?;
+        Self::check_revision(tx, &r.scan_id, r.revision)?;
         let limit = r.page_size.unwrap_or(200).clamp(1, 500);
         let parent = if search {
             None
@@ -715,8 +770,18 @@ impl Repository {
     ) -> Result<NodePage> {
         let c = self.connect()?;
         let tx = c.unchecked_transaction()?;
-        Self::check_revision(&tx, scan_id, revision)?;
-        let target = Self::node_conn(&tx, scan_id, parse_id(node_id)?)?;
+        Self::node_page_conn(&tx, scan_id, node_id, revision, sort, page_size)
+    }
+    fn node_page_conn(
+        tx: &Connection,
+        scan_id: &str,
+        node_id: &str,
+        revision: u32,
+        sort: &str,
+        page_size: u32,
+    ) -> Result<NodePage> {
+        Self::check_revision(tx, scan_id, revision)?;
+        let target = Self::node_conn(tx, scan_id, parse_id(node_id)?)?;
         let Some(parent) = target.node.parent_id.as_deref() else {
             return Ok(NodePage {
                 revision,
@@ -772,7 +837,8 @@ impl Repository {
             .optional()?
         };
         let cursor=previous.map(|previous|{let key=page_cursor_key(scan_id,revision,Some(parent_id),sort,&Filter::default())?;Ok::<_,AppError>(serde_json::json!({"key":key,"id":parse_id(&previous.node.node_id)?,"name":previous.node.name,"size":parse_bytes(&previous.node.logical_total_bytes)?,"modified":previous.node.modified_at.unwrap_or_default()}).to_string())}).transpose()?;
-        self.page(
+        Self::page_conn(
+            tx,
             &PageRequest {
                 scan_id: scan_id.into(),
                 parent_id: Some(parent.into()),
@@ -795,22 +861,287 @@ impl Repository {
     ) -> Result<ChartData> {
         let c = self.connect()?;
         let tx = c.unchecked_transaction()?;
-        Self::check_revision(&tx, scan_id, revision)?;
+        Self::chart_conn(&tx, scan_id, scope_id, revision, depth, budget)
+    }
+    fn chart_conn(
+        tx: &Connection,
+        scan_id: &str,
+        scope_id: &str,
+        revision: u32,
+        depth: u32,
+        budget: u32,
+    ) -> Result<ChartData> {
+        Self::check_revision(tx, scan_id, revision)?;
         let mut left = budget.clamp(2, 2000);
         let mut truncated = false;
         let root = chart_node(
-            &tx,
+            tx,
             scan_id,
             parse_id(scope_id)?,
             depth.clamp(1, 4),
             &mut left,
             &mut truncated,
+            None,
         )?;
         Ok(ChartData {
             revision,
             root,
             truncated,
         })
+    }
+    /// Build one committed UI view without holding the scanner's writer mutex.
+    /// Every helper below reads this transaction, never a second connection.
+    pub fn view_snapshot(&self, request: &ViewSnapshotRequest) -> Result<ViewSnapshot> {
+        const PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+        const NODE_LIMIT: usize = 10_000;
+        if request.expanded_ids.len() > 40 || request.page_anchors.len() > 40 {
+            return Err(AppError::new(
+                "VIEW_LIMIT",
+                "单次视图最多包含 40 个展开目录和分页锚点",
+            ));
+        }
+        if request.selected_ids.len() > 4096 {
+            return Err(AppError::new("SELECTION_LIMIT", "单次选择最多 4096 项"));
+        }
+        let sort = request.sort.as_deref().unwrap_or("size_desc");
+        if !matches!(sort, "size_desc" | "size_asc" | "name_asc" | "name_desc") {
+            return Err(AppError::new("INVALID_SORT", "视图排序方式无效"));
+        }
+        let c = self.connect()?;
+        let tx = c.unchecked_transaction()?;
+        // This first SELECT establishes the WAL read snapshot. Future writer
+        // commits cannot advance its revision or any rows read by this request.
+        let scan = Self::scan_conn(&tx, &request.scan_id)?;
+        #[cfg(test)]
+        {
+            let hook = VIEW_READ_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|hook| hook.0 == self.path)
+                .cloned();
+            if let Some((_, entered, release)) = hook {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
+        let revision = scan.revision;
+        let mut budget = ViewBudget {
+            bytes: 8192,
+            nodes: 0,
+        };
+        let mut nodes = std::collections::BTreeMap::<String, Node>::new();
+        let mut expanded = std::collections::BTreeSet::<String>::new();
+        let mut add_node = |node: Node, expand: bool| -> Result<()> {
+            if expand && node.kind == "directory" {
+                expanded.insert(node.node_id.clone());
+            }
+            if !nodes.contains_key(&node.node_id) {
+                budget.charge(&node, 1)?;
+                nodes.insert(node.node_id.clone(), node);
+            }
+            Ok(())
+        };
+        let root = Self::node_conn(&tx, &request.scan_id, parse_id(&scan.root_id)?)?.node;
+        add_node(root.clone(), false)?;
+        let scope = match Self::node_conn(&tx, &request.scan_id, parse_id(&request.scope_id)?) {
+            Ok(node) if node.node.kind == "directory" => node.node,
+            Ok(_) => root,
+            Err(error) if error.code == "NODE_NOT_FOUND" => root,
+            Err(error) => return Err(error),
+        };
+        let scope_id = scope.node_id.clone();
+        Self::visit_ancestors_conn(&tx, &request.scan_id, scope.parent_id.clone(), |node| {
+            add_node(node, false)
+        })?;
+        add_node(scope, false)?;
+        for id in &request.expanded_ids {
+            match Self::node_conn(&tx, &request.scan_id, parse_id(id)?) {
+                Ok(node) => add_node(node.node, true)?,
+                Err(error) if error.code == "NODE_NOT_FOUND" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut selected_ids = Vec::new();
+        let mut selected_set = HashSet::new();
+        for id in &request.selected_ids {
+            let parsed = parse_id(id)?;
+            if !selected_set.insert(parsed) {
+                continue;
+            }
+            match Self::node_conn(&tx, &request.scan_id, parsed) {
+                Ok(node) => {
+                    selected_ids.push(node.node.node_id.clone());
+                    Self::visit_ancestors_conn(
+                        &tx,
+                        &request.scan_id,
+                        node.node.parent_id.clone(),
+                        |ancestor| add_node(ancestor, false),
+                    )?;
+                    add_node(node.node, false)?;
+                }
+                Err(error) if error.code == "NODE_NOT_FOUND" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let primary_id = request
+            .primary_id
+            .as_ref()
+            .filter(|id| selected_ids.contains(id))
+            .cloned()
+            .or_else(|| selected_ids.first().cloned());
+        if scope_id != request.scope_id {
+            // Only a vanished/changed scope resets expansion. A normal refresh
+            // must not reopen a directory the user deliberately collapsed.
+            expanded.clear();
+            expanded.insert(scan.root_id.clone());
+        }
+        let alive = selected_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut ordered_selection = selected_ids
+            .iter()
+            .map(|id| Ok((parse_id(id)?, id)))
+            .collect::<Result<Vec<_>>>()?;
+        ordered_selection.sort_unstable_by_key(|entry| entry.0);
+        let mut normalized = Vec::new();
+        let mut covered = Vec::new();
+        for (_, id) in ordered_selection {
+            let node = nodes.get(id).unwrap();
+            let mut parent = node.parent_id.as_deref();
+            let mut is_covered = false;
+            while let Some(parent_id) = parent {
+                if alive.contains(parent_id) {
+                    is_covered = true;
+                    break;
+                }
+                parent = nodes
+                    .get(parent_id)
+                    .ok_or_else(|| AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"))?
+                    .parent_id
+                    .as_deref();
+            }
+            if is_covered {
+                covered.push(id.clone());
+            } else {
+                normalized.push(node.clone());
+            }
+        }
+        let summary = Self::selection_nodes(normalized, covered)?;
+        budget.charge(&summary, summary.nodes.len())?;
+        let mut chart_left = 400;
+        let mut chart_truncated = false;
+        let chart = ChartData {
+            revision,
+            root: chart_node(
+                &tx,
+                &request.scan_id,
+                parse_id(&scope_id)?,
+                2,
+                &mut chart_left,
+                &mut chart_truncated,
+                Some(&mut budget),
+            )?,
+            truncated: chart_truncated,
+        };
+        let mut pages = Vec::new();
+        let mut page_parents = expanded.clone();
+        page_parents.insert(scan.root_id.clone());
+        page_parents.insert(scope_id.clone());
+        for parent_id in &page_parents {
+            let anchor = if let Some(anchor) = request
+                .page_anchors
+                .iter()
+                .find(|anchor| &anchor.parent_id == parent_id)
+            {
+                match Self::node_conn(&tx, &request.scan_id, parse_id(&anchor.first_id)?) {
+                    Ok(node) if node.node.parent_id.as_ref() == Some(parent_id) => Some(node),
+                    Ok(_) => None,
+                    Err(error) if error.code == "NODE_NOT_FOUND" => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let page = if let Some(anchor) = anchor {
+                Self::node_page_conn(
+                    &tx,
+                    &request.scan_id,
+                    &anchor.node.node_id,
+                    revision,
+                    sort,
+                    200,
+                )?
+            } else {
+                Self::page_conn(
+                    &tx,
+                    &PageRequest {
+                        scan_id: request.scan_id.clone(),
+                        parent_id: Some(parent_id.clone()),
+                        revision,
+                        sort: Some(sort.into()),
+                        filter: None,
+                        cursor: None,
+                        page_size: Some(200),
+                    },
+                    false,
+                )?
+            };
+            budget.charge(&page, page.nodes.len())?;
+            pages.push(ViewPage {
+                parent_id: parent_id.clone(),
+                page,
+            });
+        }
+        let mut details = Vec::new();
+        if let Some(primary_id) = &primary_id {
+            if nodes
+                .get(primary_id)
+                .is_some_and(|node| node.kind == "directory")
+            {
+                let page = Self::page_conn(
+                    &tx,
+                    &PageRequest {
+                        scan_id: request.scan_id.clone(),
+                        parent_id: Some(primary_id.clone()),
+                        revision,
+                        sort: Some("size_desc".into()),
+                        filter: None,
+                        cursor: None,
+                        page_size: Some(5),
+                    },
+                    false,
+                )?;
+                budget.charge(&page.nodes, page.nodes.len())?;
+                details.push(ViewDetails {
+                    node_id: primary_id.clone(),
+                    nodes: page.nodes,
+                });
+            }
+        }
+        let snapshot = ViewSnapshot {
+            scan,
+            scope_id,
+            primary_id,
+            expanded_ids: expanded.into_iter().collect(),
+            selected_ids,
+            nodes: nodes.into_values().collect(),
+            pages,
+            chart,
+            summary,
+            details,
+        };
+        // Keep both output guards exact, including envelopes/string arrays. The
+        // incremental guard above also bounds construction before serialization.
+        if budget.nodes > NODE_LIMIT || serde_json::to_vec(&snapshot)?.len() > PAYLOAD_LIMIT {
+            return Err(AppError::new(
+                "VIEW_PAYLOAD_BUDGET",
+                "视图超出记录或 8 MiB 返回预算，请减少展开目录或所选项",
+            ));
+        }
+        tx.commit()?;
+        Ok(snapshot)
     }
     pub fn errors(&self, scan_id: &str, cursor: Option<&str>, page_size: u32) -> Result<ErrorPage> {
         let c = self.connect()?;
@@ -1290,6 +1621,7 @@ fn chart_node(
     depth: u32,
     left: &mut u32,
     truncated: &mut bool,
+    mut view_budget: Option<&mut ViewBudget>,
 ) -> Result<ChartNode> {
     let node = Repository::node_conn(c, scan_id, id)?.node;
     *left = left.saturating_sub(1);
@@ -1299,6 +1631,10 @@ fn chart_node(
         other_count: "0".into(),
         other_bytes: "0".into(),
     };
+    if let Some(budget) = &mut view_budget {
+        budget.bytes = budget.bytes.saturating_add(200); // Per-node chart envelopes/counters.
+        budget.charge(&out.node, 1)?;
+    }
     if depth == 0 || *left == 0 {
         out.other_count = out.node.children_count.clone();
         out.other_bytes = out.node.logical_total_bytes.clone();
@@ -1308,10 +1644,12 @@ fn chart_node(
         return Ok(out);
     }
     let limit = (*left).min(200);
-    let sql=format!("SELECT {NODE_COLUMNS} FROM nodes WHERE scan_id=?1 AND parent_id=?2 ORDER BY sort_size,name COLLATE NOCASE,id LIMIT ?3");
-    let mut stmt = c.prepare(&sql)?;
+    // Queue IDs, not a second full path/metadata copy for each child. Each
+    // recursive node is decoded once and budgeted before its descendants.
+    let sql="SELECT id FROM nodes WHERE scan_id=?1 AND parent_id=?2 ORDER BY sort_size,name COLLATE NOCASE,id LIMIT ?3";
+    let mut stmt = c.prepare(sql)?;
     let direct = stmt
-        .query_map(params![scan_id, id, limit], read_node)?
+        .query_map(params![scan_id, id, limit], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut known = 0i64;
     let mut count = 0u64;
@@ -1319,16 +1657,18 @@ fn chart_node(
         if *left == 0 {
             break;
         }
-        known = checked_add(known, parse_bytes(&child.node.logical_total_bytes)?)?;
-        count += 1;
-        out.children.push(chart_node(
+        let child = chart_node(
             c,
             scan_id,
-            parse_id(&child.node.node_id)?,
+            child,
             depth - 1,
             left,
             truncated,
-        )?);
+            view_budget.as_deref_mut(),
+        )?;
+        known = checked_add(known, parse_bytes(&child.node.logical_total_bytes)?)?;
+        count += 1;
+        out.children.push(child);
     }
     let total_count = out.node.children_count.parse::<u64>().unwrap_or(0);
     out.other_count = total_count.saturating_sub(count).to_string();
@@ -1339,4 +1679,260 @@ fn chart_node(
         *truncated = true;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod view_snapshot_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn fixture() -> (tempfile::TempDir, Arc<Repository>, String) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("folder/file.bin"), [7u8; 17]).unwrap();
+        let root = platform::absolute(&root).unwrap();
+        let repo = Arc::new(Repository::new(&fixture.path().join("db")).unwrap());
+        let scan_id = repo.new_scan_id().unwrap();
+        repo.insert_scan(&scan_id, &root, false).unwrap();
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        for (id, parent, path, depth) in [
+            (1, None, root.clone(), 0),
+            (2, Some(1), root.join("folder"), 1),
+            (3, Some(2), root.join("folder/file.bin"), 2),
+        ] {
+            insert_node(
+                &tx,
+                &scan_id,
+                id,
+                parent,
+                &path,
+                depth,
+                &platform::metadata(&path).unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        repo.finish(&scan_id, "completed").unwrap();
+        (fixture, repo, scan_id)
+    }
+
+    fn request(scan_id: &str) -> ViewSnapshotRequest {
+        ViewSnapshotRequest {
+            scan_id: scan_id.into(),
+            scope_id: "2".into(),
+            expanded_ids: vec!["1".into(), "2".into()],
+            selected_ids: vec!["2".into(), "3".into()],
+            primary_id: Some("2".into()),
+            sort: Some("name_asc".into()),
+            page_anchors: vec![],
+        }
+    }
+
+    fn assert_consistent(snapshot: &ViewSnapshot, expected: &str) {
+        assert_eq!(snapshot.scan.logical_total_bytes, expected);
+        assert!(snapshot
+            .nodes
+            .iter()
+            .all(|node| node.logical_total_bytes == expected));
+        for page in &snapshot.pages {
+            assert_eq!(page.page.revision, snapshot.scan.revision);
+            assert!(page
+                .page
+                .nodes
+                .iter()
+                .all(|node| node.logical_total_bytes == expected));
+        }
+        assert_eq!(snapshot.chart.revision, snapshot.scan.revision);
+        assert_eq!(snapshot.chart.root.node.logical_total_bytes, expected);
+        assert_eq!(
+            snapshot.chart.root.children[0].node.logical_total_bytes,
+            expected
+        );
+        assert_eq!(snapshot.summary.logical_total_bytes, expected);
+        assert_eq!(snapshot.summary.normalized_ids, ["2"]);
+        assert_eq!(snapshot.summary.covered_ids, ["3"]);
+        assert_eq!(snapshot.details[0].node_id, "2");
+        assert_eq!(snapshot.details[0].nodes[0].logical_bytes, expected);
+    }
+
+    #[test]
+    fn view_snapshot_stays_on_one_revision_while_writer_commits() {
+        let (_fixture, repo, scan_id) = fixture();
+        let prior_revision = repo.scan(&scan_id).unwrap().revision;
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        *VIEW_READ_HOOK.lock().unwrap() = Some((repo.path.clone(), entered_tx, release_rx));
+        struct ClearHook(crossbeam_channel::Sender<()>);
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                VIEW_READ_HOOK.lock().unwrap().take();
+                let _ = self.0.try_send(());
+            }
+        }
+        let clear = ClearHook(release_tx.clone());
+        let reader_repo = repo.clone();
+        let read_request = request(&scan_id);
+        let reader = std::thread::spawn(move || reader_repo.view_snapshot(&read_request));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut writer = repo.connect().unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "UPDATE nodes SET logical_total=117 WHERE scan_id=?1",
+            [&scan_id],
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE nodes SET payload=json_set(payload,'$.b',117) WHERE scan_id=?1 AND id=3",
+            [&scan_id],
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id=?1",
+            [&scan_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        release_tx.send(()).unwrap();
+        let snapshot = reader.join().unwrap().unwrap();
+        drop(clear);
+        assert_eq!(snapshot.scan.revision, prior_revision);
+        assert_consistent(&snapshot, "17");
+        let latest = repo.view_snapshot(&request(&scan_id)).unwrap();
+        assert_eq!(latest.scan.revision, prior_revision + 1);
+        assert_consistent(&latest, "117");
+    }
+
+    #[test]
+    fn view_snapshot_keeps_collapsed_directories_and_page_anchor_instead_of_revealing_selection() {
+        let (_fixture, repo, scan_id) = fixture();
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        let folder = repo.node(&scan_id, "2", None).unwrap().path;
+        let metadata = platform::metadata(&folder.join("file.bin")).unwrap();
+        for id in 4..=304 {
+            insert_node(
+                &tx,
+                &scan_id,
+                id,
+                Some(2),
+                &folder.join(format!("item-{id:04}.bin")),
+                2,
+                &metadata,
+                None,
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id=?1",
+            [&scan_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let mut r = request(&scan_id);
+        r.expanded_ids.clear();
+        r.selected_ids = vec!["3".into(), "999999".into()];
+        r.primary_id = Some("3".into());
+        r.page_anchors = vec![ViewPageAnchor {
+            parent_id: "2".into(),
+            first_id: "103".into(),
+        }];
+        let snapshot = repo.view_snapshot(&r).unwrap();
+        assert!(snapshot.expanded_ids.is_empty());
+        assert_eq!(snapshot.selected_ids, ["3"]);
+        let folder_page = &snapshot
+            .pages
+            .iter()
+            .find(|page| page.parent_id == "2")
+            .unwrap()
+            .page;
+        assert_eq!(folder_page.nodes[0].node_id, "103");
+        assert!(folder_page.page_cursor.is_some());
+        assert!(!folder_page.nodes.iter().any(|node| node.node_id == "3"));
+        r.page_anchors[0].first_id = "1".into(); // Existing node in a different parent.
+        assert_eq!(
+            repo.view_snapshot(&r)
+                .unwrap()
+                .pages
+                .iter()
+                .find(|page| page.parent_id == "2")
+                .unwrap()
+                .page
+                .nodes[0]
+                .node_id,
+            "3"
+        );
+        r.scope_id = "999999".into();
+        let tx = c.transaction().unwrap();
+        let root = repo.node(&scan_id, "1", None).unwrap().path;
+        for id in 1000..1040 {
+            let path = root.join(format!("expanded-{id}"));
+            std::fs::create_dir(&path).unwrap();
+            insert_node(
+                &tx,
+                &scan_id,
+                id,
+                Some(1),
+                &path,
+                1,
+                &platform::metadata(&path).unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        r.expanded_ids = (1000..1040).map(|id| id.to_string()).collect();
+        let fallback = repo.view_snapshot(&r).unwrap();
+        assert_eq!(fallback.scope_id, "1");
+        assert_eq!(fallback.expanded_ids, ["1"]);
+    }
+
+    #[test]
+    fn view_snapshot_input_and_incremental_output_budgets_fail_closed() {
+        let (_fixture, repo, scan_id) = fixture();
+        let mut r = request(&scan_id);
+        r.expanded_ids = vec!["1".into(); 41];
+        assert_eq!(repo.view_snapshot(&r).unwrap_err().code, "VIEW_LIMIT");
+        r.expanded_ids.clear();
+        r.selected_ids = vec!["1".into(); 4097];
+        assert_eq!(repo.view_snapshot(&r).unwrap_err().code, "SELECTION_LIMIT");
+        r.selected_ids.clear();
+        r.sort = Some("unknown".into());
+        assert_eq!(repo.view_snapshot(&r).unwrap_err().code, "INVALID_SORT");
+        let mut budget = ViewBudget { bytes: 0, nodes: 0 };
+        assert_eq!(
+            budget
+                .charge(&"x".repeat(8 * 1024 * 1024), 0)
+                .unwrap_err()
+                .code,
+            "VIEW_PAYLOAD_BUDGET"
+        );
+        let mut budget = ViewBudget { bytes: 0, nodes: 0 };
+        assert_eq!(
+            budget.charge(&"small", 10_001).unwrap_err().code,
+            "VIEW_PAYLOAD_BUDGET"
+        );
+        // A budget stop on the first ancestor must occur before decoding a
+        // later corrupt ancestor, rather than collecting the whole path first.
+        let c = repo.connect().unwrap();
+        c.execute(
+            "UPDATE nodes SET payload='unreadable' WHERE scan_id=?1 AND id=1",
+            [&scan_id],
+        )
+        .unwrap();
+        let mut budget = ViewBudget {
+            bytes: 8 * 1024 * 1024 - 1,
+            nodes: 0,
+        };
+        assert_eq!(
+            Repository::visit_ancestors_conn(&c, &scan_id, Some("2".into()), |node| budget
+                .charge(&node, 1))
+            .unwrap_err()
+            .code,
+            "VIEW_PAYLOAD_BUDGET"
+        );
+        assert!(Repository::node_conn(&c, &scan_id, 1).is_err());
+    }
 }

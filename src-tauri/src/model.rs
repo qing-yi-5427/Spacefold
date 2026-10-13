@@ -201,6 +201,52 @@ pub struct NodePage {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ViewPageAnchor {
+    pub parent_id: String,
+    pub first_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSnapshotRequest {
+    pub scan_id: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub expanded_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_ids: Vec<String>,
+    pub primary_id: Option<String>,
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub page_anchors: Vec<ViewPageAnchor>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewPage {
+    pub parent_id: String,
+    pub page: NodePage,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewDetails {
+    pub node_id: String,
+    pub nodes: Vec<Node>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSnapshot {
+    pub scan: Scan,
+    pub scope_id: String,
+    pub primary_id: Option<String>,
+    pub expanded_ids: Vec<String>,
+    pub selected_ids: Vec<String>,
+    pub nodes: Vec<Node>,
+    pub pages: Vec<ViewPage>,
+    pub chart: ChartData,
+    pub summary: SelectionSummary,
+    pub details: Vec<ViewDetails>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChartNode {
     pub node: Node,
     pub children: Vec<ChartNode>,
