@@ -3,12 +3,16 @@ use spacefold_lib::{
     model::*,
     platform,
     repository::{insert_node, Repository},
-    service::{JobRuntime, Service},
+    service::{JobRuntime, ProgressCallback, Service},
 };
 use std::{
     fs,
     path::PathBuf,
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
 };
 fn output(value: impl serde::Serialize) {
     println!("{}", serde_json::to_string(&value).unwrap());
@@ -36,6 +40,57 @@ fn finished_scan(service: &Service, scan_id: &str, event: &JobEvent) -> Result<S
         ));
     }
     Ok(current)
+}
+struct ScanTerminal {
+    event: JobEvent,
+    callback_elapsed_ms: f64,
+}
+struct ScanNotifications {
+    callback: ProgressCallback,
+    terminal: crossbeam_channel::Receiver<ScanTerminal>,
+    first_result_elapsed_ms: Arc<Mutex<Option<u128>>>,
+}
+impl ScanNotifications {
+    fn new(started: Instant) -> Self {
+        let (sender, terminal) = crossbeam_channel::bounded(1);
+        let first_result_elapsed_ms = Arc::new(Mutex::new(None));
+        let first = first_result_elapsed_ms.clone();
+        let sent = AtomicBool::new(false);
+        let callback = Arc::new(move |event: JobEvent| {
+            let is_terminal = matches!(
+                event.status.as_str(),
+                "completed" | "completed_with_errors" | "cancelled" | "failed" | "interrupted"
+            );
+            let callback_elapsed_ms = is_terminal.then(|| started.elapsed().as_secs_f64() * 1000.0);
+            if event.discovered_count.parse::<u64>().unwrap_or(0) > 1 {
+                if let Ok(mut first) = first.lock() {
+                    if first.is_none() {
+                        *first = Some(started.elapsed().as_millis());
+                    }
+                }
+            }
+            if let Some(callback_elapsed_ms) = callback_elapsed_ms {
+                if !sent.swap(true, Ordering::AcqRel) {
+                    // One owned terminal notification, even if it precedes
+                    // start_scan's return. Never block the scanner callback.
+                    let _ = sender.try_send(ScanTerminal {
+                        event,
+                        callback_elapsed_ms,
+                    });
+                }
+            }
+        });
+        Self {
+            callback,
+            terminal,
+            first_result_elapsed_ms,
+        }
+    }
+    fn wait(&self) -> Result<ScanTerminal> {
+        self.terminal
+            .recv()
+            .map_err(|_| AppError::new("SCAN_NOTIFICATION_CLOSED", "扫描终态通知通道已关闭"))
+    }
 }
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -85,38 +140,29 @@ fn run() -> Result<()> {
         }
         "scan" => {
             let elapsed = Instant::now();
-            let first = std::sync::Arc::new(std::sync::Mutex::new(None::<u128>));
-            let first_callback = first.clone();
+            let notifications = ScanNotifications::new(elapsed);
             let root = platform::absolute(&PathBuf::from(
                 args.get(2)
                     .ok_or_else(|| AppError::new("USAGE", "SOURCE required"))?,
             ))?;
-            let scan = service.start_scan(
-                root,
-                Some(std::sync::Arc::new(move |event| {
-                    if event.discovered_count.parse::<u64>().unwrap_or(0) > 1 {
-                        let mut first = first_callback.lock().unwrap();
-                        if first.is_none() {
-                            *first = Some(elapsed.elapsed().as_millis());
-                        }
-                    }
-                })),
-            )?;
-            loop {
-                // Retain the same durable-state polling cadence, but wait for
-                // resource cleanup rather than only a committed terminal row.
-                let _committed = service.repo.scan(&scan.scan_id)?;
-                let runtime = service.job(&scan.scan_id)?;
-                if runtime.terminal() {
-                    let event = runtime.snapshot();
-                    let current = finished_scan(&service, &scan.scan_id, &event)?;
-                    output(
-                        serde_json::json!({"scan":current,"elapsedMs":elapsed.elapsed().as_millis(),"firstResultElapsedMs":*first.lock().unwrap()}),
-                    );
-                    break;
+            let scan = service.start_scan(root, Some(notifications.callback.clone()))?;
+            let terminal = notifications.wait()?;
+            let current = finished_scan(&service, &scan.scan_id, &terminal.event)?;
+            output(serde_json::json!({
+                "scan":current,
+                // Existing command timing still includes authoritative final
+                // reread; the new callback field freezes before that reread.
+                "elapsedMs":elapsed.elapsed().as_millis(),
+                "firstResultElapsedMs":*notifications.first_result_elapsed_ms.lock().unwrap(),
+                "callbackElapsedMs":terminal.callback_elapsed_ms,
+                "nativeElapsedMs":terminal.event.elapsed_ms,
+                "timingOrigins":{
+                    "elapsedMs":"scan command after Service initialization through terminal notification and authoritative final reread; integer milliseconds",
+                    "firstResultElapsedMs":"first existing callback with discoveredCount greater than one, from the scan command origin; integer milliseconds",
+                    "callbackElapsedMs":"scan command origin to entry into the existing terminal callback, before final reread; monotonic fractional milliseconds",
+                    "nativeElapsedMs":"production JobRuntime origin to terminal event after scanner resource cleanup; integer milliseconds"
                 }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            }));
         }
         "export" => {
             if args.len() < 5 {
@@ -496,6 +542,118 @@ fn synthetic(service: &Service, count: u64, mode: &str) -> Result<Scan> {
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_notification_bypasses_progress_backpressure_and_is_once() {
+        for status in [
+            "completed",
+            "completed_with_errors",
+            "cancelled",
+            "failed",
+            "interrupted",
+        ] {
+            let notifications = ScanNotifications::new(Instant::now());
+            let job = JobRuntime::new(
+                JobEvent::new("job", "scan", "scan", 1),
+                Some(notifications.callback.clone()),
+            );
+            job.update(|event| {
+                event.status = "running".into();
+                event.discovered_count = "2".into();
+            });
+            let first = *notifications.first_result_elapsed_ms.lock().unwrap();
+            assert!(first.is_some());
+            // The first progress event is deliberately never acknowledged.
+            job.update(|event| event.discovered_count = "3".into());
+            assert!(notifications.terminal.try_recv().is_err());
+            job.update(|event| {
+                event.status = status.into();
+                if status == "failed" {
+                    event.error = Some(AppError::new("WORKER_FAILED", "injected fault"));
+                }
+            });
+            // Buffered before the waiter starts; this also covers a scan that
+            // terminates before start_scan returns to the probe.
+            let terminal = notifications
+                .terminal
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(terminal.event.status, status);
+            assert_eq!(terminal.event.seq, 3);
+            assert!(terminal.callback_elapsed_ms >= terminal.event.elapsed_ms as f64);
+            assert_eq!(
+                *notifications.first_result_elapsed_ms.lock().unwrap(),
+                first
+            );
+            if status == "failed" {
+                assert_eq!(terminal.event.error.unwrap().code, "WORKER_FAILED");
+            }
+            job.update(|event| event.phase = "duplicate terminal update".into());
+            assert!(notifications.terminal.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn terminal_callback_never_waits_for_a_full_or_disconnected_receiver() {
+        let notifications = ScanNotifications::new(Instant::now());
+        let callback = notifications.callback.clone();
+        let mut event = JobEvent::new("job", "scan", "scan", 1);
+        event.status = "cancelled".into();
+        callback(event.clone());
+        // A second callback must return while the one-slot channel is full.
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            callback(event);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        let notifications = ScanNotifications::new(Instant::now());
+        let callback = notifications.callback.clone();
+        drop(notifications);
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let mut event = JobEvent::new("job", "scan", "scan", 1);
+            event.status = "failed".into();
+            callback(event);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn database_scan_failure_notifies_without_waiting_forever() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"abc").unwrap();
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        {
+            let c = service.repo.connect().unwrap();
+            c.execute_batch("CREATE TRIGGER fail_child_insert BEFORE INSERT ON nodes WHEN NEW.id>1 BEGIN SELECT RAISE(ABORT,'injected scan insert failure'); END;").unwrap();
+        }
+        let notifications = ScanNotifications::new(Instant::now());
+        let scan = service
+            .start_scan(
+                platform::absolute(&root).unwrap(),
+                Some(notifications.callback.clone()),
+            )
+            .unwrap();
+        let terminal = notifications
+            .terminal
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(terminal.event.status, "failed");
+        assert_eq!(
+            finished_scan(&service, &scan.scan_id, &terminal.event)
+                .unwrap_err()
+                .code,
+            "DATABASE_ERROR"
+        );
+        assert_eq!(service.repo.scan(&scan.scan_id).unwrap().status, "failed");
+        assert!(notifications.terminal.try_recv().is_err());
+    }
+
     #[test]
     fn runtime_failure_overrides_completed_database_and_final_status_is_reread() {
         let fixture = tempfile::tempdir().unwrap();
@@ -503,15 +661,19 @@ mod terminal_tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("file"), b"abc").unwrap();
         let service = Service::new(&fixture.path().join("data")).unwrap();
+        let notifications = ScanNotifications::new(Instant::now());
         let scan = service
-            .start_scan(platform::absolute(&root).unwrap(), None)
+            .start_scan(
+                platform::absolute(&root).unwrap(),
+                Some(notifications.callback.clone()),
+            )
             .unwrap();
-        let start = Instant::now();
-        while !service.job(&scan.scan_id).unwrap().terminal() {
-            assert!(start.elapsed() < Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let mut event = service.job(&scan.scan_id).unwrap().snapshot();
+        let mut event = notifications
+            .terminal
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .event;
+        assert!(notifications.terminal.try_recv().is_err());
         assert_eq!(
             finished_scan(&service, &scan.scan_id, &event)
                 .unwrap()
