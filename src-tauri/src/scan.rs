@@ -61,6 +61,9 @@ struct ScanProfile {
     aggregate_fallback_batches: usize,
     commit_ms: f64,
     writer_observation: crate::repository::WriterObservation,
+    reader_backpressure: ReaderWaitStats,
+    #[serde(skip)]
+    reader_wait_probe: Option<std::sync::Arc<ReaderWaitProbe>>,
     finish_ms: f64,
     close_ms: f64,
     batches: usize,
@@ -213,12 +216,162 @@ const READER_CHUNK_BYTES: usize = 256 * 1024;
 const READER_QUEUE_CHUNKS: usize = 32;
 const READER_DATA_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReaderWaitStats {
+    byte_permit_waits: usize,
+    message_send_waits: usize,
+    // Metadata, Entries, Done, Error, Fatal.
+    message_send_waits_by_kind: [usize; 5],
+    byte_permit_wait_ms: f64,
+    message_send_wait_ms: f64,
+    flush_windows: usize,
+    flush_window_ms: f64,
+    readers_blocked_during_flush_ms: f64,
+    byte_permit_blocked_during_flush_ms: f64,
+    message_send_blocked_during_flush_ms: f64,
+    byte_permit_waiter_ms_during_flush: f64,
+    message_send_waiter_ms_during_flush: f64,
+    commit_windows: usize,
+    commit_window_ms: f64,
+    readers_blocked_during_commit_ms: f64,
+    byte_permit_blocked_during_commit_ms: f64,
+    message_send_blocked_during_commit_ms: f64,
+    byte_permit_waiter_ms_during_commit: f64,
+    message_send_waiter_ms_during_commit: f64,
+    peak_byte_permit_waiters: usize,
+    peak_message_send_waiters: usize,
+    active_waiters: [usize; 2],
+}
+#[derive(Default)]
+struct ReaderWaitState {
+    stats: ReaderWaitStats,
+    last_transition: Option<Instant>,
+    flush_active: bool,
+    commit_active: bool,
+}
+impl ReaderWaitState {
+    fn settle(&mut self, now: Instant) {
+        if let Some(last) = self.last_transition {
+            let elapsed = now.saturating_duration_since(last).as_secs_f64() * 1000.0;
+            let [byte_waiters, send_waiters] = self.stats.active_waiters;
+            self.stats.byte_permit_wait_ms += elapsed * byte_waiters as f64;
+            self.stats.message_send_wait_ms += elapsed * send_waiters as f64;
+            if self.flush_active {
+                self.stats.flush_window_ms += elapsed;
+                if byte_waiters + send_waiters > 0 {
+                    self.stats.readers_blocked_during_flush_ms += elapsed;
+                }
+                if byte_waiters > 0 {
+                    self.stats.byte_permit_blocked_during_flush_ms += elapsed;
+                }
+                if send_waiters > 0 {
+                    self.stats.message_send_blocked_during_flush_ms += elapsed;
+                }
+                self.stats.byte_permit_waiter_ms_during_flush += elapsed * byte_waiters as f64;
+                self.stats.message_send_waiter_ms_during_flush += elapsed * send_waiters as f64;
+            }
+            if self.commit_active {
+                self.stats.commit_window_ms += elapsed;
+                if byte_waiters + send_waiters > 0 {
+                    self.stats.readers_blocked_during_commit_ms += elapsed;
+                }
+                if byte_waiters > 0 {
+                    self.stats.byte_permit_blocked_during_commit_ms += elapsed;
+                }
+                if send_waiters > 0 {
+                    self.stats.message_send_blocked_during_commit_ms += elapsed;
+                }
+                self.stats.byte_permit_waiter_ms_during_commit += elapsed * byte_waiters as f64;
+                self.stats.message_send_waiter_ms_during_commit += elapsed * send_waiters as f64;
+            }
+        }
+        self.last_transition = Some(now);
+    }
+}
+#[derive(Clone, Copy)]
+enum ReaderWaitRole {
+    BytePermit,
+    MessageSend(usize),
+    Flush,
+    Commit,
+}
+#[derive(Default)]
+struct ReaderWaitProbe(std::sync::Mutex<ReaderWaitState>);
+struct ReaderWaitSpan {
+    probe: std::sync::Arc<ReaderWaitProbe>,
+    role: ReaderWaitRole,
+}
+impl ReaderWaitProbe {
+    fn begin(self: &std::sync::Arc<Self>, role: ReaderWaitRole) -> ReaderWaitSpan {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.settle(Instant::now());
+        match role {
+            ReaderWaitRole::Flush => {
+                state.flush_active = true;
+                state.stats.flush_windows += 1;
+            }
+            ReaderWaitRole::Commit => {
+                state.commit_active = true;
+                state.stats.commit_windows += 1;
+            }
+            ReaderWaitRole::BytePermit => {
+                state.stats.byte_permit_waits += 1;
+                state.stats.active_waiters[0] += 1;
+                state.stats.peak_byte_permit_waiters = state
+                    .stats
+                    .peak_byte_permit_waiters
+                    .max(state.stats.active_waiters[0]);
+            }
+            ReaderWaitRole::MessageSend(kind) => {
+                state.stats.message_send_waits += 1;
+                state.stats.message_send_waits_by_kind[kind] += 1;
+                state.stats.active_waiters[1] += 1;
+                state.stats.peak_message_send_waiters = state
+                    .stats
+                    .peak_message_send_waiters
+                    .max(state.stats.active_waiters[1]);
+            }
+        }
+        ReaderWaitSpan {
+            probe: self.clone(),
+            role,
+        }
+    }
+    fn snapshot(&self) -> ReaderWaitStats {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.settle(Instant::now());
+        state.stats.clone()
+    }
+}
+impl Drop for ReaderWaitSpan {
+    fn drop(&mut self) {
+        let mut state = self
+            .probe
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.settle(Instant::now());
+        match self.role {
+            ReaderWaitRole::Flush => state.flush_active = false,
+            ReaderWaitRole::Commit => state.commit_active = false,
+            ReaderWaitRole::BytePermit => {
+                state.stats.active_waiters[0] = state.stats.active_waiters[0].saturating_sub(1)
+            }
+            ReaderWaitRole::MessageSend(_) => {
+                state.stats.active_waiters[1] = state.stats.active_waiters[1].saturating_sub(1)
+            }
+        }
+    }
+}
+
 /// Charges all queued and currently consumed reader chunks together. Each of
-/// the two chunks being constructed is separately limited by entries/bytes.
+/// each active reader's constructing chunk is separately limited by entries/bytes.
 #[derive(Default)]
 struct ReaderBudget {
     state: std::sync::Mutex<(usize, bool)>,
     changed: std::sync::Condvar,
+    observation: Option<std::sync::Arc<ReaderWaitProbe>>,
 }
 struct ReaderPermit {
     budget: std::sync::Arc<ReaderBudget>,
@@ -234,13 +387,21 @@ impl ReaderBudget {
         if bytes > READER_DATA_BYTES {
             return None;
         }
+        let mut waiting = None;
         while state.0 + bytes > READER_DATA_BYTES && !state.1 && !cancel.load(Ordering::Acquire) {
+            if waiting.is_none() {
+                waiting = self
+                    .observation
+                    .as_ref()
+                    .map(|probe| probe.begin(ReaderWaitRole::BytePermit));
+            }
             state = self
                 .changed
                 .wait_timeout(state, Duration::from_millis(50))
                 .unwrap()
                 .0;
         }
+        drop(waiting);
         if state.1 || cancel.load(Ordering::Acquire) {
             return None;
         }
@@ -324,6 +485,32 @@ enum DirectoryMessage {
     Done(ReaderTimings),
     Fatal(AppError),
 }
+struct ReaderOutput {
+    sender: crossbeam_channel::Sender<DirectoryMessage>,
+    observation: Option<std::sync::Arc<ReaderWaitProbe>>,
+}
+impl ReaderOutput {
+    fn send(&self, message: DirectoryMessage) -> std::result::Result<(), ()> {
+        let Some(probe) = &self.observation else {
+            return self.sender.send(message).map_err(|_| ());
+        };
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(()),
+            Err(crossbeam_channel::TrySendError::Full(message)) => {
+                let kind = match &message {
+                    DirectoryMessage::Metadata(_) => 0,
+                    DirectoryMessage::Entries { .. } => 1,
+                    DirectoryMessage::Done(_) => 2,
+                    DirectoryMessage::Error { .. } => 3,
+                    DirectoryMessage::Fatal(_) => 4,
+                };
+                let _waiting = probe.begin(ReaderWaitRole::MessageSend(kind));
+                self.sender.send(message).map_err(|_| ())
+            }
+        }
+    }
+}
 fn matches_directory_metadata(m: &platform::Metadata, expected: &Option<String>) -> bool {
     m.kind == "directory" && m.recurse && m.identity.as_ref() == expected.as_ref()
 }
@@ -350,6 +537,10 @@ fn read_directories(
     budget: std::sync::Arc<ReaderBudget>,
     directory_reader: platform::ScanDirectoryReader,
 ) {
+    let output = ReaderOutput {
+        sender: output,
+        observation: budget.observation.clone(),
+    };
     while let Ok((parent, path, depth, expected_identity, deferred)) = requests.recv() {
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             break;
@@ -666,8 +857,10 @@ fn scan_sync_with_options(
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
+    let profile_enabled = std::env::var_os("SPACEFOLD_PROFILE").is_some();
     let mut profile = ScanProfile {
-        enabled: std::env::var_os("SPACEFOLD_PROFILE").is_some(),
+        enabled: profile_enabled,
+        reader_wait_probe: profile_enabled.then(|| std::sync::Arc::new(ReaderWaitProbe::default())),
         consumed_limit,
         directory_readers: readers,
         started: Some(started),
@@ -744,7 +937,10 @@ fn scan_sync_with_options(
         let (request_tx, request_rx) = crossbeam_channel::bounded(DIRECTORY_PREFETCH);
         let (directory_tx, directory_rx) = crossbeam_channel::bounded(READER_QUEUE_CHUNKS);
         let enabled = profile.enabled;
-        let budget = std::sync::Arc::new(ReaderBudget::default());
+        let budget = std::sync::Arc::new(ReaderBudget {
+            observation: profile.reader_wait_probe.clone(),
+            ..Default::default()
+        });
         let reader_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut readers = Vec::with_capacity(profile.directory_readers);
         for _ in 0..profile.directory_readers {
@@ -1189,6 +1385,9 @@ fn scan_sync_with_options(
     profile.finish_ms = milliseconds(finish_started);
     if profile.enabled {
         // sqlite3_db_status only reads counters on this owned connection.
+        if let Some(probe) = &profile.reader_wait_probe {
+            profile.reader_backpressure = probe.snapshot();
+        }
         for (op, output) in [
             (
                 rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
@@ -1296,6 +1495,10 @@ fn flush_batch(
     }
     profile.peak_batch_entries = profile.peak_batch_entries.max(results.len());
     profile.metadata_wait_ms += milliseconds(metadata_started);
+    let flush_window = profile
+        .reader_wait_probe
+        .as_ref()
+        .map(|probe| probe.begin(ReaderWaitRole::Flush));
     let wait_started = Instant::now();
     let _writer = service.writer.lock().unwrap();
     profile.writer_wait_ms += milliseconds(wait_started);
@@ -1419,7 +1622,13 @@ fn flush_batch(
     tx.execute("DELETE FROM consumed_dirs", [])?;
     profile.aggregate_ms += milliseconds(aggregate_started);
     let commit_started = Instant::now();
+    let commit_window = profile
+        .reader_wait_probe
+        .as_ref()
+        .map(|probe| probe.begin(ReaderWaitRole::Commit));
     tx.commit()?;
+    drop(commit_window);
+    drop(flush_window);
     let commit_ms = milliseconds(commit_started);
     profile.commit_ms += commit_ms;
     if profile.enabled {
@@ -2068,6 +2277,122 @@ mod tests {
         budget.stop();
         assert!(reader.join().unwrap());
         drop(permit);
+        assert_eq!(budget.state.lock().unwrap().0, 0);
+    }
+
+    #[test]
+    fn profiled_channel_wait_preserves_order_and_clears_after_disconnect() {
+        let probe = Arc::new(ReaderWaitProbe::default());
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        sender
+            .send(DirectoryMessage::Done(ReaderTimings {
+                enumerate_ms: 0.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        let filler = sender.clone();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let output = ReaderOutput {
+            sender,
+            observation: Some(probe.clone()),
+        };
+        let producer = std::thread::spawn(move || {
+            for value in [1.0, 2.0] {
+                if output
+                    .send(DirectoryMessage::Done(ReaderTimings {
+                        enumerate_ms: value,
+                        ..Default::default()
+                    }))
+                    .is_err()
+                {
+                    return value;
+                }
+                if value == 1.0 {
+                    release_rx.recv().unwrap();
+                }
+            }
+            0.0
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe.snapshot().active_waiters[1] == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(probe.snapshot().active_waiters[1], 1);
+        for expected in [0.0, 1.0] {
+            let DirectoryMessage::Done(timing) =
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("unexpected message")
+            };
+            assert_eq!(timing.enumerate_ms, expected);
+        }
+        filler
+            .send(DirectoryMessage::Done(ReaderTimings {
+                enumerate_ms: 99.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe.snapshot().message_send_waits < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(receiver);
+        assert_eq!(producer.join().unwrap(), 2.0);
+        let saved = probe.snapshot();
+        assert_eq!(saved.active_waiters, [0, 0]);
+        assert_eq!(saved.message_send_waits, 2);
+        assert_eq!(saved.message_send_waits_by_kind, [0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn profiled_byte_budget_measures_commit_intersection_and_stop_releases_waiters() {
+        let probe = Arc::new(ReaderWaitProbe::default());
+        let budget = Arc::new(ReaderBudget {
+            observation: Some(probe.clone()),
+            ..Default::default()
+        });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permit = budget.acquire(READER_DATA_BYTES, &cancel).unwrap();
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let budget = budget.clone();
+            let cancel = cancel.clone();
+            readers.push(std::thread::spawn(move || {
+                budget.acquire(1, &cancel).is_none()
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe.snapshot().active_waiters[0] < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(probe.snapshot().active_waiters[0], 2);
+        let flush = probe.begin(ReaderWaitRole::Flush);
+        let commit = probe.begin(ReaderWaitRole::Commit);
+        std::thread::sleep(Duration::from_millis(5));
+        drop(commit);
+        drop(flush);
+        budget.stop();
+        for reader in readers {
+            assert!(reader.join().unwrap());
+        }
+        drop(permit);
+        let saved = probe.snapshot();
+        assert_eq!(saved.active_waiters, [0, 0]);
+        assert_eq!(saved.byte_permit_waits, 2);
+        assert_eq!(saved.commit_windows, 1);
+        assert_eq!(saved.flush_windows, 1);
+        assert!(saved.commit_window_ms > 0.0);
+        assert!(saved.readers_blocked_during_flush_ms >= saved.readers_blocked_during_commit_ms);
+        assert!(
+            saved.byte_permit_waiter_ms_during_commit
+                >= saved.byte_permit_blocked_during_commit_ms * 1.99
+        );
+        assert_eq!(
+            saved.readers_blocked_during_commit_ms,
+            saved.byte_permit_blocked_during_commit_ms
+        );
+        assert_eq!(saved.message_send_blocked_during_commit_ms, 0.0);
         assert_eq!(budget.state.lock().unwrap().0, 0);
     }
 
