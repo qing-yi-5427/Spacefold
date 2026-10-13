@@ -102,6 +102,7 @@ fn reader_count_override(value: Option<&str>) -> usize {
     match value {
         Some("2") => 2,
         Some("4") => 4,
+        Some("8") => 8,
         _ => DEFAULT_DIRECTORY_READERS,
     }
 }
@@ -605,7 +606,7 @@ type DeferredDirectoryHook = (
 static DEFERRED_DIRECTORY_HOOK: std::sync::Mutex<Option<DeferredDirectoryHook>> =
     std::sync::Mutex::new(None);
 
-/// Two readers overlap enumeration/encoding with the sole SQLite writer. Only
+/// Directory readers overlap enumeration/encoding with the sole SQLite writer. Only
 /// already-persisted directory IDs are requested. Bounded chunks provide
 /// backpressure, and no iterator/file handle crosses its owning thread.
 fn read_directories(
@@ -969,7 +970,7 @@ fn scan_sync_serial_with_queue_capacity(
     readers: usize,
     output_slots: usize,
 ) -> Result<Scan> {
-    assert!(matches!(readers, 2 | 4));
+    assert!(matches!(readers, 2 | 4 | 8));
     assert!(matches!(output_slots, 32 | 64 | 128));
     let started = Instant::now();
     let consumed_limit =
@@ -1945,59 +1946,87 @@ mod tests {
     // hooks. Serialize only their instrumentation, not production scan access.
     static READER_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
-    fn four_readers_cancel_with_idle_peers_and_join_after_a_panic() {
+    fn parallel_readers_cancel_with_idle_peers_and_join_after_a_panic() {
         let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
-        let fixture = tempfile::tempdir().unwrap();
-        let source = fixture.path().join("four-reader-source");
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("unread.txt"), b"abc").unwrap();
-        let root = platform::absolute(&source).unwrap();
-        let service = Service::new(&fixture.path().join("data")).unwrap();
-        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
-        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        *READER_TEST_HOOK.lock().unwrap() = Some(ReaderTestHook {
-            path: root.clone(),
-            entered: entered_tx,
-            waiting: waiting_tx,
-            release: release_rx,
-        });
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                *READER_TEST_HOOK.lock().unwrap() = None;
-                *READER_PANIC_PATH.lock().unwrap() = None;
+        for (readers, overlap) in [(4, false), (8, false), (8, true)] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("parallel-reader-source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("unread.txt"), b"abc").unwrap();
+            let root = platform::absolute(&source).unwrap();
+            let service = Service::new(&fixture.path().join("data")).unwrap();
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            *READER_TEST_HOOK.lock().unwrap() = Some(ReaderTestHook {
+                path: root.clone(),
+                entered: entered_tx,
+                waiting: waiting_tx,
+                release: release_rx,
+            });
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    *READER_TEST_HOOK.lock().unwrap() = None;
+                    *READER_PANIC_PATH.lock().unwrap() = None;
+                }
             }
-        }
-        let _clear = Clear;
-        let id = service.repo.new_scan_id().unwrap();
-        service.repo.insert_scan(&id, &root, false).unwrap();
-        let job = Arc::new(JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None));
-        std::thread::scope(|scope| {
-            let worker =
-                scope.spawn(|| scan_sync_with_options(&service, &id, &root, &job, true, 4));
-            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let _clear = Clear;
+            let id = service.repo.new_scan_id().unwrap();
+            service.repo.insert_scan(&id, &root, false).unwrap();
+            let job = Arc::new(JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None));
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    if overlap {
+                        writer_pipeline::scan(
+                            &service,
+                            &id,
+                            &root,
+                            &job,
+                            true,
+                            readers,
+                            READER_QUEUE_CHUNKS,
+                        )
+                    } else {
+                        scan_sync_with_options(&service, &id, &root, &job, true, readers)
+                    }
+                });
+                entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                let started = Instant::now();
+                job.cancel.store(true, Ordering::Release);
+                release_tx.send(()).unwrap();
+                let scan = worker.join().unwrap().unwrap();
+                assert_eq!(scan.status, "cancelled");
+                assert!(job.terminal());
+                assert_eq!(job.snapshot().status, "cancelled");
+                assert_eq!(scan.discovered_count, "1");
+                assert!(started.elapsed() < Duration::from_secs(1));
+            });
+            *READER_TEST_HOOK.lock().unwrap() = None;
+            *READER_PANIC_PATH.lock().unwrap() = Some(root.clone());
+            let id = service.repo.new_scan_id().unwrap();
+            service.repo.insert_scan(&id, &root, false).unwrap();
+            let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
             let started = Instant::now();
-            job.cancel.store(true, Ordering::Release);
-            release_tx.send(()).unwrap();
-            let scan = worker.join().unwrap().unwrap();
-            assert_eq!(scan.status, "cancelled");
-            assert!(job.terminal());
-            assert_eq!(job.snapshot().status, "cancelled");
-            assert_eq!(scan.discovered_count, "1");
+            let error = if overlap {
+                writer_pipeline::scan(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    true,
+                    readers,
+                    READER_QUEUE_CHUNKS,
+                )
+            } else {
+                scan_sync_with_options(&service, &id, &root, &job, true, readers)
+            }
+            .unwrap_err();
+            assert_eq!(error.code, "WORKER_FAILED");
             assert!(started.elapsed() < Duration::from_secs(1));
-        });
-        *READER_TEST_HOOK.lock().unwrap() = None;
-        *READER_PANIC_PATH.lock().unwrap() = Some(root.clone());
-        let id = service.repo.new_scan_id().unwrap();
-        service.repo.insert_scan(&id, &root, false).unwrap();
-        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
-        let started = Instant::now();
-        let error = scan_sync_with_options(&service, &id, &root, &job, true, 4).unwrap_err();
-        assert_eq!(error.code, "WORKER_FAILED");
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(service.repo.scan(&id).unwrap().discovered_count, "1");
+            assert_eq!(service.repo.scan(&id).unwrap().discovered_count, "1");
+        }
     }
     #[cfg(windows)]
     #[test]
@@ -2146,9 +2175,9 @@ mod tests {
         };
         let (old, legacy) = run(false, 2, 32, false);
         let (new, bulk) = run(true, 2, 32, false);
-        for slots in [32, 64, 128] {
+        for (readers, slots) in [(4, 32), (4, 64), (4, 128), (8, 32), (8, 64), (8, 128)] {
             for overlap in [false, true] {
-                let (parallel_scan, parallel) = run(true, 4, slots, overlap);
+                let (parallel_scan, parallel) = run(true, readers, slots, overlap);
                 assert_eq!(new.discovered_count, parallel_scan.discovered_count);
                 assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
                 assert_eq!(new.error_count, parallel_scan.error_count);
@@ -2169,17 +2198,17 @@ mod tests {
                         parent_path(&bulk, &node.node.parent_id),
                         parent_path(&parallel, &parallel[path].node.parent_id)
                     );
-                    let mut two = node.node.clone();
-                    let mut four = parallel[path].node.clone();
+                    let mut baseline = node.node.clone();
+                    let mut concurrent = parallel[path].node.clone();
                     // Discovery IDs and revisions are scheduling details. Every saved
                     // path, own metadata and aggregate remains identical.
-                    two.node_id.clear();
-                    four.node_id.clear();
-                    two.parent_id = None;
-                    four.parent_id = None;
+                    baseline.node_id.clear();
+                    concurrent.node_id.clear();
+                    baseline.parent_id = None;
+                    concurrent.parent_id = None;
                     assert_eq!(
-                        serde_json::to_value(two).unwrap(),
-                        serde_json::to_value(four).unwrap()
+                        serde_json::to_value(baseline).unwrap(),
+                        serde_json::to_value(concurrent).unwrap()
                     );
                 }
             }
@@ -3041,20 +3070,29 @@ mod directory_queue_tests {
         }
     }
     #[test]
-    fn reader_override_only_accepts_two_and_four_without_changing_default() {
+    fn reader_override_only_accepts_two_four_and_eight_without_changing_default() {
         assert_eq!(reader_count_override(Some("2")), 2);
+        assert_eq!(reader_count_override(Some("8")), 8);
         for value in [
             None,
             Some("0"),
             Some("1"),
             Some("3"),
-            Some("8"),
+            Some("16"),
             Some("4 "),
+            Some("8 "),
             Some("invalid"),
         ] {
             assert_eq!(reader_count_override(value), 4);
         }
         assert_eq!(reader_count_override(Some("4")), 4);
+        eprintln!(
+            "reader owned layout: Metadata={}, DirectoryEntry={}, EncodedNode={}, chunk slot={}",
+            std::mem::size_of::<platform::Metadata>(),
+            std::mem::size_of::<platform::DirectoryEntry>(),
+            std::mem::size_of::<EncodedNode>(),
+            std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>()
+        );
     }
 
     #[test]
