@@ -103,6 +103,7 @@ fn reader_count_override(value: Option<&str>) -> usize {
         Some("2") => 2,
         Some("4") => 4,
         Some("8") => 8,
+        Some("16") => 16,
         _ => DEFAULT_DIRECTORY_READERS,
     }
 }
@@ -970,7 +971,7 @@ fn scan_sync_serial_with_queue_capacity(
     readers: usize,
     output_slots: usize,
 ) -> Result<Scan> {
-    assert!(matches!(readers, 2 | 4 | 8));
+    assert!(matches!(readers, 2 | 4 | 8 | 16));
     assert!(matches!(output_slots, 32 | 64 | 128));
     let started = Instant::now();
     let consumed_limit =
@@ -1948,7 +1949,7 @@ mod tests {
     #[test]
     fn parallel_readers_cancel_with_idle_peers_and_join_after_a_panic() {
         let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
-        for (readers, overlap) in [(4, false), (8, false), (8, true)] {
+        for (readers, overlap) in [(4, false), (8, false), (8, true), (16, false), (16, true)] {
             let fixture = tempfile::tempdir().unwrap();
             let source = fixture.path().join("parallel-reader-source");
             fs::create_dir(&source).unwrap();
@@ -2175,7 +2176,17 @@ mod tests {
         };
         let (old, legacy) = run(false, 2, 32, false);
         let (new, bulk) = run(true, 2, 32, false);
-        for (readers, slots) in [(4, 32), (4, 64), (4, 128), (8, 32), (8, 64), (8, 128)] {
+        for (readers, slots) in [
+            (4, 32),
+            (4, 64),
+            (4, 128),
+            (8, 32),
+            (8, 64),
+            (8, 128),
+            (16, 32),
+            (16, 64),
+            (16, 128),
+        ] {
             for overlap in [false, true] {
                 let (parallel_scan, parallel) = run(true, readers, slots, overlap);
                 assert_eq!(new.discovered_count, parallel_scan.discovered_count);
@@ -3070,17 +3081,19 @@ mod directory_queue_tests {
         }
     }
     #[test]
-    fn reader_override_only_accepts_two_four_and_eight_without_changing_default() {
+    fn reader_override_only_accepts_bounded_values_without_changing_default() {
         assert_eq!(reader_count_override(Some("2")), 2);
         assert_eq!(reader_count_override(Some("8")), 8);
+        assert_eq!(reader_count_override(Some("16")), 16);
         for value in [
             None,
             Some("0"),
             Some("1"),
             Some("3"),
-            Some("16"),
+            Some("32"),
             Some("4 "),
             Some("8 "),
+            Some("16 "),
             Some("invalid"),
         ] {
             assert_eq!(reader_count_override(value), 4);
