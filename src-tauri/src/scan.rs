@@ -90,10 +90,12 @@ fn consumed_limit_override(value: Option<&str>) -> usize {
 }
 fn reader_count_override(value: Option<&str>) -> usize {
     match value {
+        Some("2") => 2,
         Some("4") => 4,
-        _ => 2,
+        _ => DEFAULT_DIRECTORY_READERS,
     }
 }
+const DEFAULT_DIRECTORY_READERS: usize = 4;
 
 #[derive(Default)]
 struct DirectoryQueueCursor {
@@ -2378,9 +2380,9 @@ mod directory_queue_tests {
     }
     #[test]
     fn reader_override_only_accepts_two_and_four_without_changing_default() {
+        assert_eq!(reader_count_override(Some("2")), 2);
         for value in [
             None,
-            Some("2"),
             Some("0"),
             Some("1"),
             Some("3"),
@@ -2388,7 +2390,7 @@ mod directory_queue_tests {
             Some("4 "),
             Some("invalid"),
         ] {
-            assert_eq!(reader_count_override(value), 2);
+            assert_eq!(reader_count_override(value), 4);
         }
         assert_eq!(reader_count_override(Some("4")), 4);
     }
