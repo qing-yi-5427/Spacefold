@@ -1550,9 +1550,11 @@ fn root_copy_is_real_and_returns_top_level_directory() {
     let done = wait_job(&service, &job.job_id);
     let result = &done.results.as_ref().unwrap()[0];
     assert_eq!(result.status, "success", "{done:?}");
+    // Windows TEMP may use an 8.3 alias while the operation returns its resolved
+    // long path. Compare the actual directories, retaining the top-level target.
     assert_eq!(
-        result.destination.as_deref(),
-        Some(platform::display(&target.join("source")).as_str())
+        fs::canonicalize(result.destination.as_deref().unwrap()).unwrap(),
+        fs::canonicalize(target.join("source")).unwrap()
     );
     assert_eq!(
         fs::read(target.join("source/中文🧭/nested/a.bin")).unwrap(),
