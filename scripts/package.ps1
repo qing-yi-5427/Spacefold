@@ -96,7 +96,7 @@ Windows 10 启动时会仅为包内 Runtime 准备微软规定的沙箱读取执
 Windows 10 分支尚未在实机验证；Windows 11 以发布验收证据为准。
 请解压到本地普通目录；微软 Fixed Runtime 不支持从网络位置或 UNC 路径运行。
 Fixed Runtime 不会自动更新；后续安全更新由新版 Spacefold 发布包提供。
-详细验证、性能比较与平台边界请查看源码 docs/acceptance.md 与 docs/performance.md。
+使用方式、平台边界与依赖许可请查看项目 README.md。
 '@ | Set-Content -LiteralPath (Join-Path $taskOutput '使用说明.txt') -Encoding utf8
 Copy-Item -LiteralPath (Join-Path $taskOutput '使用说明.txt') -Destination (Join-Path $taskPortable '使用说明.txt')
 $taskUtf8 = New-Object System.Text.UTF8Encoding($false)

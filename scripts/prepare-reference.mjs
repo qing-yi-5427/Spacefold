@@ -1,7 +1,9 @@
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-const doc = readFileSync('spacefold-ui-spec.md', 'utf8').replace(/\r\n/g, '\n');
-const fragment = doc.split('\n<!-- SPACEFOLD_REFERENCE_BEGIN -->\n````html\n')[1].split('\n````\n<!-- SPACEFOLD_REFERENCE_END -->')[0];
+const doc = existsSync('spacefold-ui-spec.md') ? readFileSync('spacefold-ui-spec.md', 'utf8').replace(/\r\n/g, '\n') : null;
+const fragment = doc === null
+  ? readFileSync('reference/spacefold-reference.html', 'utf8').replace(/\r\n/g, '\n')
+  : doc.split('\n<!-- SPACEFOLD_REFERENCE_BEGIN -->\n````html\n')[1].split('\n````\n<!-- SPACEFOLD_REFERENCE_END -->')[0];
 const digest = createHash('sha256').update(fragment).digest('hex');
 if (digest !== '898f933a7dd8f3fb50b4b086e53ef45122c936981fbdbcf18325dd89d98b7f2e') throw new Error(`Reference hash changed: ${digest}`);
 mkdirSync('reference', {recursive:true});

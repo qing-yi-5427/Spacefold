@@ -22,3 +22,16 @@ src-tauri/gen/
 *.p12
 *.pem
 *.key
+
+# 本地需求原文与开发过程材料，不随公开仓库分发。
+/spacefold-features-tech.md
+/spacefold-ui-spec.md
+/docs/acceptance.md
+/docs/environment.md
+/docs/performance-handoff.md
+/docs/performance-method.md
+/docs/performance.md
+/docs/requirements-sha256.txt
+/docs/third-party.md
+/docs/licenses/README.md
+/docs/screenshots/README.md
