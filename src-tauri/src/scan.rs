@@ -72,7 +72,7 @@ type QueuedDirectory = (i64, Vec<u8>, u32, Option<String>, bool);
 const FIRST_PENDING_DIRECTORIES: &str = "SELECT id,path,depth,expected_identity,metadata_deferred FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
 const NEXT_PENDING_DIRECTORIES: &str = "SELECT id,path,depth,expected_identity,metadata_deferred FROM pending_dirs WHERE scan_id=?1 AND id<?3 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
 const DIRECTORY_CACHE_BYTES: usize = 256 * 1024;
-const DEFAULT_CONSUMED_LIMIT: usize = 256;
+const DEFAULT_CONSUMED_LIMIT: usize = 1024;
 fn consumed_limit_override(value: Option<&str>) -> usize {
     match value {
         Some("256") => 256,
@@ -2218,6 +2218,7 @@ mod directory_queue_tests {
 
     #[test]
     fn consumed_override_only_accepts_the_three_bounded_comparison_values() {
+        assert_eq!(consumed_limit_override(None), 1024);
         assert_eq!(consumed_limit_override(Some("256")), 256);
         assert_eq!(consumed_limit_override(Some("1024")), 1024);
         assert_eq!(consumed_limit_override(Some("2048")), 2048);
