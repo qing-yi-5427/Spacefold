@@ -150,8 +150,14 @@ fn real_scan_hardlinks_empty_root_children_and_selection() {
     assert_eq!(summary.logical_total_bytes, "42");
     assert_eq!(summary.covered_ids, vec![child.node_id]);
     assert_eq!(find(&service, &scan, "empty").logical_total_bytes, "0");
-    assert_eq!(root.node.allocated_unknown_count, "5");
     let hard = find(&service, &scan, "hard.bin");
+    let hard_was_unknown = hard.allocated_bytes.is_none();
+    // NTFS bulk enumeration already measures allocation; the supported legacy
+    // fallback retains unknown values until the same explicit detail operation.
+    assert_eq!(
+        root.node.allocated_unknown_count,
+        if hard_was_unknown { "5" } else { "0" }
+    );
     let (measured, revision) = service
         .measure_node(&scan.scan_id, &hard.node_id, scan.revision)
         .unwrap();
@@ -164,7 +170,7 @@ fn real_scan_hardlinks_empty_root_children_and_selection() {
             .unwrap()
             .node
             .allocated_unknown_count,
-        "4"
+        if hard_was_unknown { "4" } else { "0" }
     );
     assert!(
         measured

@@ -235,6 +235,7 @@ fn read_directories(
     stop: &std::sync::atomic::AtomicBool,
     profile: bool,
     budget: std::sync::Arc<ReaderBudget>,
+    directory_reader: platform::ScanDirectoryReader,
 ) {
     while let Ok((parent, path, depth)) = requests.recv() {
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
@@ -266,37 +267,32 @@ fn read_directories(
         }
         let mut timings = ReaderTimings::default();
         let started = profile.then(Instant::now);
-        let fresh = platform::metadata(&path);
+        let prepared = directory_reader.prepare(&path);
         if let Some(started) = started {
             timings.directory_check_ms += milliseconds(started);
         }
-        let fresh = match fresh {
-            Ok(m) if m.recurse && m.kind == "directory" => Ok(m),
-            Ok(_) => Err(AppError::new(
-                "DIRECTORY_CHANGED",
-                "目录在扫描中变为跳转链接或不可本地枚举，未跟随",
-            )),
-            Err(e) => Err(e),
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if output
+                    .send(DirectoryMessage::Error {
+                        parent,
+                        path,
+                        stage: "directory_revalidate",
+                        error,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                    break;
+                }
+                continue;
+            }
         };
-        if let Err(error) = fresh {
-            if output
-                .send(DirectoryMessage::Error {
-                    parent,
-                    path,
-                    stage: "directory_revalidate",
-                    error,
-                })
-                .is_err()
-            {
-                break;
-            }
-            if output.send(DirectoryMessage::Done(timings)).is_err() {
-                break;
-            }
-            continue;
-        }
         let started = profile.then(Instant::now);
-        let iterator = platform::read_dir(&path);
+        let iterator = prepared.entries();
         if let Some(started) = started {
             timings.enumerate_ms += milliseconds(started);
         }
@@ -339,9 +335,7 @@ fn read_directories(
                 Ok(entry) => {
                     let started = profile.then(Instant::now);
                     let encoded = entry
-                        .hint
-                        .as_ref()
-                        .filter(|m| m.kind == "file")
+                        .scan_file_metadata()
                         .map(|m| encode_node(&entry.path, m))
                         .transpose();
                     if let Some(started) = started {
@@ -428,6 +422,23 @@ fn read_directories(
 }
 
 pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime) -> Result<Scan> {
+    // Diagnostic legacy switch changes enumeration only; persistence, budgets,
+    // metadata completion and finish/close semantics stay identical.
+    scan_sync_with_mode(
+        service,
+        scan_id,
+        root,
+        job,
+        std::env::var_os("SPACEFOLD_LEGACY_ENUMERATOR").is_none(),
+    )
+}
+fn scan_sync_with_mode(
+    service: &Service,
+    scan_id: &str,
+    root: &Path,
+    job: &JobRuntime,
+    fast: bool,
+) -> Result<Scan> {
     let started = Instant::now();
     let mut profile = ScanProfile {
         enabled: std::env::var_os("SPACEFOLD_PROFILE").is_some(),
@@ -441,6 +452,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
         "PRAGMA temp_store=MEMORY;CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);",
     )?;
     let rootmeta = platform::metadata(root)?;
+    let directory_reader = platform::ScanDirectoryReader::new(root, fast);
     if rootmeta.kind != "directory" {
         return Err(AppError::new("NOT_DIRECTORY", "扫描来源必须是目录"));
     }
@@ -510,6 +522,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
             let output = directory_tx.clone();
             let reader_budget = budget.clone();
             let stop = reader_stop.clone();
+            let directory_reader = directory_reader.clone();
             readers.push(scope.spawn(move || -> Result<()> {
                 let fault_output = output.clone();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -520,6 +533,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         &stop,
                         enabled,
                         reader_budget.clone(),
+                        directory_reader,
                     )
                 }));
                 if outcome.is_err() {
@@ -704,6 +718,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                             if job.cancel.load(Ordering::Acquire) {
                                 break 'directories;
                             }
+                            let ordinary_file = entry.scan_file_metadata().is_some();
                             let p = entry.path;
                             if p.starts_with(&service.repo.data_dir) || service.is_work_file(&p) {
                                 continue;
@@ -717,7 +732,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                                 + encoded.as_ref().map_or(0, EncodedNode::bytes);
                             profile.peak_batch_path_bytes =
                                 profile.peak_batch_path_bytes.max(batch_path_bytes);
-                            if let Some(metadata) = entry.hint.filter(|m| m.kind == "file") {
+                            if let Some(metadata) = entry.hint.filter(|_| ordinary_file) {
                                 results.push((id, parent, p, depth + 1, Ok(metadata), encoded));
                             } else {
                                 work_tx.send((id, parent, p, depth + 1)).map_err(|_| {
@@ -1146,6 +1161,88 @@ fn checked_aggregate(n: &Node, delta: i64, adelta: i64) -> Result<()> {
 mod tests {
     use super::*;
     use std::{fs, sync::Arc};
+
+    #[cfg(windows)]
+    #[test]
+    fn bulk_and_legacy_scans_keep_directory_metadata_and_exact_tree_counts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        fs::create_dir_all(root.join("branch/child")).unwrap();
+        fs::write(root.join("branch/child/中文🙂.bin"), b"abcdef").unwrap();
+        fs::hard_link(
+            root.join("branch/child/中文🙂.bin"),
+            root.join("hardlink.bin"),
+        )
+        .unwrap();
+        fs::write(root.join("empty.bin"), b"").unwrap();
+        let root = platform::absolute(&root).unwrap();
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let run = |fast| {
+            let id = service.repo.new_scan_id().unwrap();
+            service.repo.insert_scan(&id, &root, false).unwrap();
+            let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+            let scan = scan_sync_with_mode(&service, &id, &root, &job, fast).unwrap();
+            assert!(job.terminal());
+            assert_eq!(scan.status, "completed");
+            let connection = service.repo.connect().unwrap();
+            let mut stmt = connection
+                .prepare("SELECT id FROM nodes WHERE scan_id=?1")
+                .unwrap();
+            let ids = stmt
+                .query_map([&id], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let nodes = ids
+                .into_iter()
+                .map(|n| service.repo.node(&id, &n.to_string(), None).unwrap())
+                .map(|n| (platform::encode_path(&n.path), n))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (scan, nodes)
+        };
+        let (old, legacy) = run(false);
+        let (new, bulk) = run(true);
+        assert_eq!(old.discovered_count, new.discovered_count);
+        assert_eq!(old.logical_total_bytes, new.logical_total_bytes);
+        assert_eq!(old.error_count, new.error_count);
+        assert_eq!(bulk.len(), 6);
+        assert!(legacy.keys().eq(bulk.keys()));
+        for (path, stored) in &bulk {
+            let old = &legacy[path].node;
+            let node = &stored.node;
+            assert_eq!(node.kind, old.kind);
+            assert_eq!(node.depth, old.depth);
+            assert_eq!(node.logical_bytes, old.logical_bytes);
+            assert_eq!(node.logical_total_bytes, old.logical_total_bytes);
+            assert_eq!(node.file_count, old.file_count);
+            assert_eq!(node.directory_count, old.directory_count);
+            assert_eq!(node.children_count, old.children_count);
+            assert_eq!(node.error_code, old.error_code);
+            assert_eq!(node.incomplete, old.incomplete);
+            assert_eq!(node.link_count, old.link_count);
+            assert_eq!(node.modified_at, old.modified_at);
+            let measured = platform::metadata(&stored.path).unwrap();
+            assert_eq!(node.identity, measured.identity);
+            if node.kind == "file" {
+                assert_eq!(
+                    node.allocated_bytes,
+                    measured.allocated.map(|b| b.to_string())
+                );
+            }
+            if node.kind == "directory" {
+                assert_eq!(node.identity, old.identity);
+            }
+        }
+        let root_node = &bulk[&platform::encode_path(&root)].node;
+        let sum = bulk
+            .values()
+            .filter(|n| n.node.kind == "file")
+            .map(|n| parse_bytes(n.node.allocated_bytes.as_ref().unwrap()).unwrap())
+            .sum::<i64>();
+        assert_eq!(root_node.allocated_known_total_bytes, sum.to_string());
+        assert_eq!(root_node.allocated_unknown_count, "0");
+        assert_eq!(root_node.logical_total_bytes, "12");
+    }
 
     fn terminal(service: &Service, id: &str) -> JobEvent {
         let started = Instant::now();

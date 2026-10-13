@@ -25,6 +25,71 @@ pub struct DirectoryEntry {
     pub path: PathBuf,
     pub hint: Option<Metadata>,
 }
+impl DirectoryEntry {
+    /// Only ordinary files can bypass the full no-recall metadata worker.
+    /// Enumeration cannot supply link counts or link targets for special files.
+    pub fn scan_file_metadata(&self) -> Option<&Metadata> {
+        let m = self.hint.as_ref()?;
+        if m.kind != "file"
+            || m.link_type.is_some()
+            || m.cloud_state.is_some()
+            || m.reparse_tag != 0
+        {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::Storage::FileSystem::*;
+            if m.attributes
+                & (FILE_ATTRIBUTE_REPARSE_POINT.0
+                    | FILE_ATTRIBUTE_OFFLINE.0
+                    | FILE_ATTRIBUTE_RECALL_ON_OPEN.0
+                    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0)
+                != 0
+            {
+                return None;
+            }
+        }
+        if m.allocation_method.as_deref() == Some("FILE_ID_EXTD_DIR_INFO.AllocationSize")
+            && m.identity.is_none()
+        {
+            return None;
+        }
+        Some(m)
+    }
+}
+#[cfg(not(windows))]
+#[derive(Clone, Default)]
+pub struct ScanDirectoryReader;
+#[cfg(not(windows))]
+pub struct PreparedScanDirectory(PathBuf);
+#[cfg(not(windows))]
+impl ScanDirectoryReader {
+    pub fn new(_root: &Path, _fast: bool) -> Self {
+        Self
+    }
+    pub fn prepare(&self, path: &Path) -> Result<PreparedScanDirectory> {
+        validate_scan_directory(path)?;
+        Ok(PreparedScanDirectory(path.to_owned()))
+    }
+}
+#[cfg(not(windows))]
+impl PreparedScanDirectory {
+    pub fn entries(self) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>>>> {
+        read_dir(&self.0)
+    }
+}
+fn validate_scan_directory(path: &Path) -> Result<()> {
+    let m = metadata(path)?;
+    if m.recurse && m.kind == "directory" {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "DIRECTORY_CHANGED",
+            "目录在扫描中变为跳转链接或不可本地枚举，未跟随",
+        ))
+    }
+}
 #[cfg(not(windows))]
 pub fn read_dir(path: &Path) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>>>> {
     let iter = fs::read_dir(path)?;
@@ -599,6 +664,396 @@ mod win {
             done: false,
         }))
     }
+
+    // Fixed-size per reader, separate from the bounded encoded-output chunks.
+    // Public Win32 enumeration works on the exact handle whose attributes were
+    // checked. No raw-volume access, backup privilege, or content reads are used.
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+    #[derive(Clone)]
+    pub struct ScanDirectoryReader {
+        ntfs_volume: Option<u64>,
+    }
+    pub struct PreparedScanDirectory {
+        path: PathBuf,
+        fast: Option<BulkDirectoryIterator>,
+    }
+    impl ScanDirectoryReader {
+        pub fn new(root: &Path, fast: bool) -> Self {
+            let ntfs_volume = fast.then(|| local_ntfs_volume(root)).flatten();
+            Self { ntfs_volume }
+        }
+        pub fn prepare(&self, path: &Path) -> Result<PreparedScanDirectory> {
+            let Some(volume) = self.ntfs_volume else {
+                validate_scan_directory(path)?;
+                return Ok(PreparedScanDirectory {
+                    path: path.to_owned(),
+                    fast: None,
+                });
+            };
+            let handle = open_directory(path, true)?;
+            let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+            unsafe {
+                GetFileInformationByHandleEx(
+                    handle.0,
+                    FileAttributeTagInfo,
+                    &mut tag as *mut _ as *mut _,
+                    std::mem::size_of_val(&tag) as u32,
+                )
+            }
+            .map_err(win_error)?;
+            let attributes = tag.FileAttributes;
+            let reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+            let cloud = reparse
+                && ((tag.ReparseTag & 0xffff0fff) == 0x9000001a || tag.ReparseTag == 0x80000021);
+            let recall = attributes
+                & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0
+                    | FILE_ATTRIBUTE_RECALL_ON_OPEN.0
+                    | FILE_ATTRIBUTE_OFFLINE.0)
+                != 0;
+            if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+                || reparse && tag.ReparseTag & 0x20000000 != 0
+                || cloud
+                || recall
+            {
+                return Err(AppError::new(
+                    "DIRECTORY_CHANGED",
+                    "目录在扫描中变为跳转链接或不可本地枚举，未跟随",
+                ));
+            }
+            let id = handle_id(handle.0);
+            if id.as_ref().is_none_or(|id| id.VolumeSerialNumber != volume) {
+                // Filesystem/identity capability changed. Revalidate the legacy
+                // path before opening it; never reinterpret another volume's ID.
+                drop(handle);
+                validate_scan_directory(path)?;
+                return Ok(PreparedScanDirectory {
+                    path: path.to_owned(),
+                    fast: None,
+                });
+            }
+            Ok(PreparedScanDirectory {
+                path: path.to_owned(),
+                fast: Some(BulkDirectoryIterator {
+                    handle,
+                    root: path.to_owned(),
+                    volume,
+                    buffer: vec![0u64; DIRECTORY_BUFFER_BYTES / 8],
+                    offset: None,
+                    done: false,
+                    first: true,
+                    #[cfg(test)]
+                    query_fault: None,
+                }),
+            })
+        }
+    }
+    impl PreparedScanDirectory {
+        pub fn entries(self) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>>>> {
+            let Some(mut fast) = self.fast else {
+                return read_dir(&self.path);
+            };
+            match fast.refill() {
+                Ok(()) => Ok(Box::new(fast)),
+                Err(error)
+                    if error
+                        .os_code
+                        .is_some_and(|code| matches!(code, 1 | 50 | 87 | 120 | 124)) =>
+                {
+                    // Only the initial unsupported query may select fallback.
+                    // Once any entry was returned, errors stay errors; restarting
+                    // the directory would duplicate already persisted entries.
+                    drop(fast);
+                    validate_scan_directory(&self.path)?;
+                    read_dir(&self.path)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+    fn open_directory(path: &Path, list: bool) -> Result<OwnedHandle> {
+        let path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                FILE_READ_ATTRIBUTES.0 | if list { FILE_LIST_DIRECTORY.0 } else { 0 },
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | FILE_FLAG_OPEN_REPARSE_POINT
+                    | FILE_FLAG_OPEN_NO_RECALL,
+                None,
+            )
+        }
+        .map_err(win_error)?;
+        Ok(OwnedHandle(handle))
+    }
+    fn handle_id(handle: HANDLE) -> Option<FILE_ID_INFO> {
+        let mut id = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                &mut id as *mut _ as *mut _,
+                std::mem::size_of_val(&id) as u32,
+            )
+        }
+        .ok()
+        .map(|_| id)
+    }
+    fn local_ntfs_volume(root: &Path) -> Option<u64> {
+        use std::path::{Component, Prefix};
+        let drive = match root.components().next()? {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let drive_root = [drive as u16, 58, 92, 0];
+        if unsafe { GetDriveTypeW(PCWSTR(drive_root.as_ptr())) } == 4 {
+            return None;
+        }
+        let handle = open_directory(root, false).ok()?;
+        let mut filesystem = [0u16; 32];
+        unsafe {
+            GetVolumeInformationByHandleW(handle.0, None, None, None, None, Some(&mut filesystem))
+        }
+        .ok()?;
+        if !filesystem.starts_with(&[78, 84, 70, 83, 0]) {
+            return None;
+        }
+        handle_id(handle.0).map(|id| id.VolumeSerialNumber)
+    }
+    struct BulkDirectoryIterator {
+        handle: OwnedHandle,
+        root: PathBuf,
+        volume: u64,
+        // u64 alignment also satisfies FILE_ID_EXTD_DIR_INFO alignment.
+        buffer: Vec<u64>,
+        offset: Option<usize>,
+        done: bool,
+        first: bool,
+        #[cfg(test)]
+        query_fault: Option<u32>,
+    }
+    impl BulkDirectoryIterator {
+        fn refill(&mut self) -> Result<()> {
+            self.offset = None;
+            #[cfg(test)]
+            if let Some(code) = self.query_fault.take() {
+                return Err(win_error(windows::core::Error::from_hresult(
+                    windows::core::HRESULT::from_win32(code),
+                )));
+            }
+            self.buffer.fill(0);
+            let class = if self.first {
+                FileIdExtdDirectoryRestartInfo
+            } else {
+                FileIdExtdDirectoryInfo
+            };
+            self.first = false;
+            let result = unsafe {
+                GetFileInformationByHandleEx(
+                    self.handle.0,
+                    class,
+                    self.buffer.as_mut_ptr().cast(),
+                    DIRECTORY_BUFFER_BYTES as u32,
+                )
+            };
+            match result {
+                Ok(()) => {
+                    self.offset = Some(0);
+                    Ok(())
+                }
+                Err(error) if error.code().0 & 0xffff == 18 => {
+                    self.done = true;
+                    Ok(())
+                }
+                Err(error) => Err(win_error(error)),
+            }
+        }
+        fn decode(&self, offset: usize) -> Result<(Option<usize>, Vec<u16>, Metadata)> {
+            // GetFileInformationByHandleEx does not expose byte-count output.
+            // Buffer is zeroed before each query and every field/name read is
+            // checked against the fixed buffer and the next record's boundary.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.buffer.as_ptr().cast::<u8>(),
+                    DIRECTORY_BUFFER_BYTES,
+                )
+            };
+            decode_directory_record(bytes, offset, self.volume)
+        }
+    }
+    fn decode_directory_record(
+        bytes: &[u8],
+        offset: usize,
+        volume: u64,
+    ) -> Result<(Option<usize>, Vec<u16>, Metadata)> {
+        fn invalid() -> AppError {
+            AppError::new(
+                "DIRECTORY_DATA_INVALID",
+                "目录枚举返回了无效或不完整的元数据",
+            )
+        }
+        const HEADER: usize = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+        if !offset.is_multiple_of(8) {
+            return Err(invalid());
+        }
+        let data = bytes.get(offset..).ok_or_else(invalid)?;
+        if data.len() < HEADER {
+            return Err(invalid());
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let i64_at = |at: usize| i64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let step = u32_at(0) as usize;
+        let len = u32_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength)) as usize;
+        let boundary = if step == 0 { data.len() } else { step };
+        if len == 0
+            || len > 510
+            || !len.is_multiple_of(2)
+            || boundary > data.len()
+            || boundary < HEADER
+            || step != 0 && !step.is_multiple_of(8)
+            || len > boundary - HEADER
+        {
+            return Err(invalid());
+        }
+        let name = data[HEADER..HEADER + len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| u16::from_le_bytes([v[0], v[1]]))
+            .collect::<Vec<_>>();
+        if name.iter().any(|v| matches!(*v, 0 | 47 | 92)) {
+            return Err(invalid());
+        }
+        let attrs = u32_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileAttributes));
+        let reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+        let tag = if reparse {
+            u32_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, ReparsePointTag))
+        } else {
+            0
+        };
+        let isdir = attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        let surrogate = reparse && tag & 0x20000000 != 0;
+        let cloud = reparse && ((tag & 0xffff0fff) == 0x9000001a || tag == 0x80000021);
+        let recall = attrs
+            & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0
+                | FILE_ATTRIBUTE_RECALL_ON_OPEN.0
+                | FILE_ATTRIBUTE_OFFLINE.0)
+            != 0;
+        let eof = i64_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, EndOfFile));
+        let allocation = i64_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, AllocationSize));
+        if eof < 0 || allocation < 0 {
+            return Err(invalid());
+        }
+        let kind = if surrogate {
+            if tag == 0xa0000003 {
+                "junction"
+            } else {
+                "symlink"
+            }
+        } else if isdir {
+            "directory"
+        } else {
+            "file"
+        };
+        let logical = if isdir || surrogate { 0 } else { eof as u64 };
+        integer(logical)?;
+        let allocated = if isdir || surrogate {
+            Some(0)
+        } else if cloud || recall {
+            None
+        } else {
+            Some(allocation as u64)
+        };
+        let ticks = i64_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, LastWriteTime));
+        let unix_ms = ticks as i128 / 10_000 - 11_644_473_600_000i128;
+        let modified = i64::try_from(unix_ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let id_at = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileId);
+        let id = &data[id_at..id_at + 16];
+        let identity = id.iter().any(|v| *v != 0).then(|| {
+            // One bounded string, rather than sixteen temporary hex strings per
+            // entry. Format is exactly the existing FILE_ID_INFO identity.
+            use std::fmt::Write;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut identity = String::with_capacity(49);
+            write!(&mut identity, "{volume:016x}:").unwrap();
+            for byte in id {
+                identity.push(HEX[(byte >> 4) as usize] as char);
+                identity.push(HEX[(byte & 15) as usize] as char);
+            }
+            identity
+        });
+        Ok((
+            if step == 0 { None } else { Some(offset + step) },
+            name,
+            Metadata {
+                kind: kind.into(),
+                logical,
+                allocated,
+                modified,
+                identity,
+                links: None,
+                attributes: attrs,
+                reparse_tag: tag,
+                link_type: surrogate.then(|| format!("reparse:0x{tag:08x}")),
+                link_target: None,
+                cloud_state: (cloud || recall).then(|| {
+                    if recall {
+                        "placeholder_not_recalled"
+                    } else {
+                        "cloud_metadata_only"
+                    }
+                    .into()
+                }),
+                allocation_method: allocated.map(|_| "FILE_ID_EXTD_DIR_INFO.AllocationSize".into()),
+                recurse: isdir && !surrogate && !cloud && !recall,
+            },
+        ))
+    }
+    impl Iterator for BulkDirectoryIterator {
+        type Item = Result<DirectoryEntry>;
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                if self.done {
+                    return None;
+                }
+                if self.offset.is_none() {
+                    if let Err(error) = self.refill() {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    if self.done {
+                        return None;
+                    }
+                }
+                let decoded = self.decode(self.offset.unwrap());
+                let (next, name, hint) = match decoded {
+                    Ok(record) => record,
+                    Err(error) => {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                };
+                self.offset = next;
+                if name == [46] || name == [46, 46] {
+                    continue;
+                }
+                use std::os::windows::ffi::OsStringExt;
+                return Some(Ok(DirectoryEntry {
+                    path: self.root.join(std::ffi::OsString::from_wide(&name)),
+                    hint: Some(hint),
+                }));
+            }
+        }
+    }
+
     pub fn disk_space(path: &Path) -> Option<DiskSpace> {
         let w = wide(path);
         let (mut avail, mut total, mut free) = (0, 0, 0);
@@ -617,9 +1072,269 @@ mod win {
             available_bytes: avail.to_string(),
         })
     }
+    #[cfg(test)]
+    mod bulk_directory_tests {
+        use super::*;
+        use std::{collections::BTreeMap, ffi::OsString, os::windows::ffi::OsStringExt};
+
+        fn raw(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().collect()
+        }
+        fn entries(
+            iter: Box<dyn Iterator<Item = Result<DirectoryEntry>>>,
+        ) -> BTreeMap<Vec<u16>, Metadata> {
+            iter.map(|entry| {
+                let entry = entry.unwrap();
+                (raw(&entry.path), entry.hint.unwrap())
+            })
+            .collect()
+        }
+        fn record(name: &[u16]) -> Vec<u8> {
+            let header = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+            let mut bytes = vec![0u8; (header + name.len() * 2).next_multiple_of(8)];
+            bytes[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength)..][..4]
+                .copy_from_slice(&(name.len() as u32 * 2).to_le_bytes());
+            bytes[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileAttributes)..][..4]
+                .copy_from_slice(&FILE_ATTRIBUTE_NORMAL.0.to_le_bytes());
+            bytes[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileId)] = 19;
+            for (i, unit) in name.iter().enumerate() {
+                bytes[header + i * 2..][..2].copy_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+        #[test]
+        fn checked_parser_preserves_raw_units_and_rejects_malformed_records() {
+            let name = [97, 0xd800, 0xdc00, 0xdfff];
+            let bytes = record(&name);
+            let (next, actual, m) = decode_directory_record(&bytes, 0, 7).unwrap();
+            assert_eq!(actual, name);
+            assert_eq!(next, None);
+            assert_eq!(
+                m.identity.as_deref(),
+                Some("0000000000000007:13000000000000000000000000000000")
+            );
+            let mut corruptions = vec![bytes[..30].to_vec()];
+            for (at, value) in [
+                (0usize, 1u32),
+                (0, 8),
+                (0, 999992),
+                (
+                    std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength),
+                    1,
+                ),
+                (
+                    std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength),
+                    65536,
+                ),
+            ] {
+                let mut corrupt = bytes.clone();
+                corrupt[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                corruptions.push(corrupt);
+            }
+            for at in [
+                std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, EndOfFile),
+                std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, AllocationSize),
+            ] {
+                let mut corrupt = bytes.clone();
+                corrupt[at..at + 8].copy_from_slice(&(-1i64).to_le_bytes());
+                corruptions.push(corrupt);
+            }
+            for name in [[0u16], [92u16], [47u16]] {
+                corruptions.push(record(&name));
+            }
+            for corrupt in corruptions {
+                assert_eq!(
+                    decode_directory_record(&corrupt, 0, 7).unwrap_err().code,
+                    "DIRECTORY_DATA_INVALID"
+                );
+            }
+            assert_eq!(
+                decode_directory_record(&bytes, 1, 7).unwrap_err().code,
+                "DIRECTORY_DATA_INVALID"
+            );
+            let mut sparse = record(&[115]);
+            sparse[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, EndOfFile)..][..8]
+                .copy_from_slice(&17i64.to_le_bytes());
+            let (_, _, m) = decode_directory_record(&sparse, 0, 7).unwrap();
+            assert_eq!(m.logical, 17);
+            assert_eq!(m.allocated, Some(0));
+            let mut cloud = sparse;
+            cloud[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileAttributes)..][..4]
+                .copy_from_slice(
+                    &(FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_OFFLINE.0).to_le_bytes(),
+                );
+            cloud[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, ReparsePointTag)..][..4]
+                .copy_from_slice(&0x9000001au32.to_le_bytes());
+            let (_, _, m) = decode_directory_record(&cloud, 0, 7).unwrap();
+            assert_eq!(m.allocated, None);
+            assert!(!m.recurse);
+            assert_eq!(m.cloud_state.as_deref(), Some("placeholder_not_recalled"));
+        }
+        #[test]
+        fn special_file_and_missing_identity_require_full_metadata_completion() {
+            let check = |bytes: &[u8]| {
+                let (_, _, hint) = decode_directory_record(bytes, 0, 7).unwrap();
+                DirectoryEntry {
+                    path: PathBuf::from(r"C:\fixture\file"),
+                    hint: Some(hint),
+                }
+                .scan_file_metadata()
+                .is_some()
+            };
+            let bytes = record(&[102]);
+            assert!(check(&bytes));
+            let mut zero_id = bytes.clone();
+            let id_at = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileId);
+            zero_id[id_at..id_at + 16].fill(0);
+            assert!(!check(&zero_id));
+            for flag in [
+                FILE_ATTRIBUTE_REPARSE_POINT.0,
+                FILE_ATTRIBUTE_OFFLINE.0,
+                FILE_ATTRIBUTE_RECALL_ON_OPEN.0,
+                FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0,
+            ] {
+                let mut special = bytes.clone();
+                let at = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileAttributes);
+                special[at..at + 4].copy_from_slice(&flag.to_le_bytes());
+                // Even an absent/undefined tag must not make a special file ordinary.
+                assert!(!check(&special));
+            }
+            let mut wof = bytes;
+            wof[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileAttributes)..][..4]
+                .copy_from_slice(&FILE_ATTRIBUTE_REPARSE_POINT.0.to_le_bytes());
+            wof[std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, ReparsePointTag)..][..4]
+                .copy_from_slice(&0x80000017u32.to_le_bytes());
+            assert!(!check(&wof));
+        }
+        #[test]
+        fn bulk_matches_legacy_raw_paths_and_direct_handle_metadata_across_buffers() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let fast = ScanDirectoryReader::new(&root, true);
+            assert!(fast.ntfs_volume.is_some(), "fixture requires local NTFS");
+            fs::write(root.join("中文🙂.txt"), b"payload").unwrap();
+            fs::hard_link(root.join("中文🙂.txt"), root.join("hardlink.bin")).unwrap();
+            fs::write(
+                root.join(OsString::from_wide(&[117, 0xd800, 46, 116, 120, 116])),
+                b"raw",
+            )
+            .unwrap();
+            fs::write(root.join("trailing."), b"verbatim").unwrap();
+            fs::create_dir(root.join("child")).unwrap();
+            let sparse = root.join("sparse.bin");
+            let sparse_file = fs::File::create(&sparse).unwrap();
+            assert!(std::process::Command::new("fsutil")
+                .args(["sparse", "setflag"])
+                .arg(&sparse)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+            sparse_file.set_len(64 * 1024 * 1024).unwrap();
+            drop(sparse_file);
+            let compressed = root.join("compressed.bin");
+            fs::write(&compressed, vec![0u8; 128 * 1024]).unwrap();
+            assert!(std::process::Command::new("compact")
+                .args(["/c", "/i", "/q"])
+                .arg(temp.path().join("compressed.bin"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+            for i in 0..1200 {
+                fs::write(
+                    root.join(format!("entry-{i:04}-{}.bin", "x".repeat(70))),
+                    b"x",
+                )
+                .unwrap();
+            }
+            let old = entries(read_dir(&root).unwrap());
+            let new = entries(fast.prepare(&root).unwrap().entries().unwrap());
+            assert_eq!(new.len(), old.len());
+            assert!(old.keys().eq(new.keys()));
+            for (path, m) in &new {
+                let path = PathBuf::from(OsString::from_wide(path));
+                let measured = metadata(&path).unwrap();
+                assert_eq!(m.kind, measured.kind);
+                assert_eq!(m.logical, measured.logical);
+                assert_eq!(m.modified, measured.modified);
+                assert_eq!(m.attributes, measured.attributes);
+                assert_eq!(m.reparse_tag, measured.reparse_tag);
+                assert_eq!(m.identity, measured.identity);
+                assert_eq!(m.allocated, measured.allocated);
+                assert_eq!(m.logical, old[&raw(&path)].logical);
+            }
+            let mut long = root.join("long");
+            fs::create_dir(&long).unwrap();
+            while raw(&long).len() < 400 {
+                long = long.join("abcdefghijklmno");
+                fs::create_dir(&long).unwrap();
+            }
+            fs::write(long.join("尾部🌌.bin"), b"long").unwrap();
+            let new = entries(fast.prepare(&long).unwrap().entries().unwrap());
+            assert_eq!(new.len(), 1);
+            assert_eq!(new.values().next().unwrap().logical, 4);
+        }
+        #[test]
+        fn first_unsupported_falls_back_but_middle_error_does_not_restart() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            fs::write(root.join("one.bin"), b"one").unwrap();
+            let reader = ScanDirectoryReader::new(&root, true);
+            let mut prepared = reader.prepare(&root).unwrap();
+            prepared.fast.as_mut().unwrap().query_fault = Some(87);
+            assert_eq!(entries(prepared.entries().unwrap()).len(), 1);
+            let mut iterator = reader.prepare(&root).unwrap().fast.unwrap();
+            iterator.refill().unwrap();
+            iterator.query_fault = Some(87);
+            let mut results = Vec::new();
+            for item in iterator.by_ref() {
+                results.push(item);
+            }
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+            assert_eq!(
+                results.last().unwrap().as_ref().err().unwrap().os_code,
+                Some(87)
+            );
+            assert!(iterator.next().is_none());
+        }
+        #[test]
+        fn stream_closes_on_drop_and_reparse_directory_is_never_followed() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let source = root.join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("own.bin"), b"own").unwrap();
+            let reader = ScanDirectoryReader::new(&root, true);
+            let iterator = reader.prepare(&source).unwrap().entries().unwrap();
+            drop(iterator); // Same path can then be removed, with no leaked handle.
+            fs::remove_file(source.join("own.bin")).unwrap();
+            fs::remove_dir(&source).unwrap();
+            let junction = root.join("loop");
+            let status = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(
+                reader.prepare(&junction).err().unwrap().code,
+                "DIRECTORY_CHANGED"
+            );
+            fs::remove_dir(junction).unwrap();
+        }
+    }
 }
 #[cfg(windows)]
-pub use win::{disk_space, metadata, read_dir, wide, win_error};
+pub use win::{
+    disk_space, metadata, read_dir, wide, win_error, PreparedScanDirectory, ScanDirectoryReader,
+};
 
 #[cfg(windows)]
 pub fn opened_file_identity(file: &std::fs::File) -> Result<String> {

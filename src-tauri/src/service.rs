@@ -101,7 +101,10 @@ impl Service {
     /// Supplement selected-item metadata without doing a handle query for every scanned file.
     pub fn measure_node(&self, scan_id: &str, node_id: &str, revision: u32) -> Result<(Node, u32)> {
         let stored = self.repo.node(scan_id, node_id, Some(revision))?;
-        if stored.node.allocated_bytes.is_some() && stored.node.identity.is_some() {
+        if stored.node.allocated_bytes.is_some()
+            && stored.node.identity.is_some()
+            && stored.node.link_count.is_some()
+        {
             return Ok((stored.node, revision));
         }
         let meta = platform::metadata(&stored.path)?;
