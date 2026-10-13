@@ -79,3 +79,5 @@ python scripts/record-benchmark-load.py "$taskRun/background-after.json"
 [当前冻结构建的单次正确性复验](../artifacts/perf-round2/final-a61e19e6-scan-correctness/results.json)已覆盖首次旧库升级（历史列保持）、MSVC 和深目录，分别重读 100,101/376/1,345 新节点，全部 WAL0/immutable 主库/完整树通过；它们仍未重做正式五轮性能对照。gdu/dua 当前同收尾边界、冷缓存/HDD/网络盘/整卷或百万真实文件扫描未测，旧结果不能补作新验收。真实云占位、断卷/断网、配额账户和缺 WebView2 新系统仍依赖实机条件，未建立就保留未测。最终百万合成库、GUI 和生产包的新增证据由 QA 写入 [acceptance.md](acceptance.md)，后续只把对应构建/路径/边界补回本节，不将单次正确性变成性能结论。
 
 将来的优化可先拆出实际扫描、natural close、event 和 50 ms 轮询等待，或调查宽目录 metadataWait/ancestor aggregation/queue、单目录 SQL/index 页写放大及真实百万库查询；修改观测脚本须旧/新同方法复测，不能单改轮询凑分数。当前无需继续这些工作。
+
+最终交付已闭合，见 [0.1.1验收](acceptance.md)：成品业务源码 `2e47cfc2` 仅在扫描冻结点 `a61e19e6` 后增加包内Fixed Runtime启动与报告HANDLE目标显式UTF16 NUL修复，未重采扫描性能。44项完整后端测试通过；百万分页的修改时间排序约1.9秒、线性定位边界保留。最终EXE `a676be39…`、便携ZIP `becc786e…`、安装包 `3ae03d6c…` 的完整哈希/源码映射见交付BUILDINFO及验收文档；包内Fixed155的256文件逐SHA、实际运行进程路径、四报告重读/取消/临时身份、真实重启、公开三图与隔离安装均有对应证据。正式性能probe仍是 `artifacts/perf-round2/probes/spacefold-probe-final-a61e19e6.exe` 的C0BB指纹，不能用当前target重编probe替换归属。ZIP内构建信息保持原样，纯验收/文档提交不重复构建。

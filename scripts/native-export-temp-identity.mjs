@@ -3,7 +3,7 @@ import {mkdirSync,writeFileSync,readFileSync,readdirSync,renameSync,existsSync} 
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
-const out=path.resolve('artifacts/export-temp-identity',randomUUID());mkdirSync(out,{recursive:true});
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/export-temp-identity',randomUUID());mkdirSync(out,{recursive:true});
 const target=path.join(out,'report.csv');writeFileSync(target,'original report sentinel');
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
 const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});

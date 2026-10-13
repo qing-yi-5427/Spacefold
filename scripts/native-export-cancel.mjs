@@ -2,7 +2,7 @@ import {chromium} from '@playwright/test';
 import {mkdirSync,writeFileSync,readFileSync,readdirSync} from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-const out=path.resolve('artifacts/export-cancellation');mkdirSync(out,{recursive:true});
+const out=path.resolve(process.env.QA_OUTPUT_DIRECTORY||'artifacts/export-cancellation');mkdirSync(out,{recursive:true});
 const browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.QA_CDP_PORT||9224}`),page=browser.contexts()[0].pages().find(p=>!p.url().startsWith('devtools:'));
 const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 async function waitScan(id){for(let i=0;i<1200;i++){const scan=await invoke('get_scan',{scanId:id});if(!['running','queued','cancelling'].includes(scan.status))return scan;await page.waitForTimeout(10);}throw Error('scan timeout');}
