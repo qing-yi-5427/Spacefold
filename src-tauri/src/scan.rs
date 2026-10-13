@@ -31,15 +31,21 @@ struct ScanProfile {
     directory_queue_peak_cached_entries: usize,
     directory_queue_peak_cached_bytes: usize,
     consumed_limit: usize,
+    directory_readers: usize,
+    directory_api: platform::DirectoryApiProfile,
     reader_wait_ms: f64,
     directory_check_ms: f64,
     encode_ms: f64,
     sql_insert_ms: f64,
     pending_insert_ms: f64,
+    directory_metadata_apply_ms: f64,
+    directory_metadata_updates: usize,
     max_flush_ms: f64,
     peak_batch_entries: usize,
     peak_batch_path_bytes: usize,
     cache_write_pages: i32,
+    cache_hit_pages: i32,
+    cache_miss_pages: i32,
     cache_spill_pages: i32,
     cache_used_bytes: i32,
     page_size: i32,
@@ -54,6 +60,7 @@ struct ScanProfile {
     aggregate_ancestor_rows: usize,
     aggregate_fallback_batches: usize,
     commit_ms: f64,
+    writer_observation: crate::repository::WriterObservation,
     finish_ms: f64,
     close_ms: f64,
     batches: usize,
@@ -79,6 +86,12 @@ fn consumed_limit_override(value: Option<&str>) -> usize {
         Some("1024") => 1024,
         Some("2048") => 2048,
         _ => DEFAULT_CONSUMED_LIMIT,
+    }
+}
+fn reader_count_override(value: Option<&str>) -> usize {
+    match value {
+        Some("4") => 4,
+        _ => 2,
     }
 }
 
@@ -380,7 +393,7 @@ fn read_directories(
             Ok(prepared) => prepared,
             Err(error) => {
                 if deferred {
-                    let measured = platform::metadata(&path);
+                    let measured = directory_reader.fallback_metadata(&path);
                     let changed = measured
                         .as_ref()
                         .is_ok_and(|m| !matches_directory_metadata(m, &expected_identity));
@@ -440,7 +453,7 @@ fn read_directories(
             // Only a rare failed complete query uses the old metadata fallback;
             // the common directory stays on this one validated handle.
             if measured.is_err() {
-                measured = platform::metadata(&path);
+                measured = directory_reader.fallback_metadata(&path);
             }
             if let Some(started) = started {
                 timings.directory_check_ms += milliseconds(started);
@@ -635,12 +648,26 @@ fn scan_sync_with_mode(
     job: &JobRuntime,
     fast: bool,
 ) -> Result<Scan> {
+    let readers =
+        reader_count_override(std::env::var("SPACEFOLD_DIRECTORY_READERS").ok().as_deref());
+    scan_sync_with_options(service, scan_id, root, job, fast, readers)
+}
+fn scan_sync_with_options(
+    service: &Service,
+    scan_id: &str,
+    root: &Path,
+    job: &JobRuntime,
+    fast: bool,
+    readers: usize,
+) -> Result<Scan> {
+    assert!(matches!(readers, 2 | 4));
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
     let mut profile = ScanProfile {
         enabled: std::env::var_os("SPACEFOLD_PROFILE").is_some(),
         consumed_limit,
+        directory_readers: readers,
         started: Some(started),
         ..Default::default()
     };
@@ -651,7 +678,8 @@ fn scan_sync_with_mode(
         "PRAGMA temp_store=MEMORY;CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);",
     )?;
     let rootmeta = platform::metadata(root)?;
-    let directory_reader = platform::ScanDirectoryReader::new(root, fast);
+    let directory_reader =
+        platform::ScanDirectoryReader::new(root, fast).with_profiling(profile.enabled);
     if rootmeta.kind != "directory" {
         return Err(AppError::new("NOT_DIRECTORY", "扫描来源必须是目录"));
     }
@@ -716,8 +744,8 @@ fn scan_sync_with_mode(
         let enabled = profile.enabled;
         let budget = std::sync::Arc::new(ReaderBudget::default());
         let reader_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut readers = Vec::with_capacity(2);
-        for _ in 0..2 {
+        let mut readers = Vec::with_capacity(profile.directory_readers);
+        for _ in 0..profile.directory_readers {
             let requests = request_rx.clone();
             let output = directory_tx.clone();
             let reader_budget = budget.clone();
@@ -1106,6 +1134,9 @@ fn scan_sync_with_mode(
     if let Err(error) = pipeline_result {
         failed = Some(error);
     }
+    if profile.enabled {
+        profile.directory_api = directory_reader.api_profile();
+    }
     // Cancellation keeps every already-discovered metadata result in the partial
     // snapshot. Errors keep the preceding committed revision and fail the job.
     if failed.is_none() && (pending > 0 || !results.is_empty() || !directory_updates.is_empty()) {
@@ -1160,6 +1191,14 @@ fn scan_sync_with_mode(
             (
                 rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
                 &mut profile.cache_write_pages,
+            ),
+            (
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+                &mut profile.cache_hit_pages,
+            ),
+            (
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut profile.cache_miss_pages,
             ),
             (
                 rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL,
@@ -1351,8 +1390,15 @@ fn flush_batch(
         profile.pending_insert_ms += timings.pending_ms;
     }
     drop(inserter);
+    let metadata_started = profile.enabled.then(Instant::now);
+    if profile.enabled {
+        profile.directory_metadata_updates += directory_updates.len();
+    }
     for update in directory_updates.drain(..) {
         apply_directory_metadata(&tx, scan_id, &update)?;
+    }
+    if let Some(started) = metadata_started {
+        profile.directory_metadata_apply_ms += milliseconds(started);
     }
     profile.insert_ms += milliseconds(insert_started);
     let aggregate_started = Instant::now();
@@ -1372,7 +1418,11 @@ fn flush_batch(
     profile.aggregate_ms += milliseconds(aggregate_started);
     let commit_started = Instant::now();
     tx.commit()?;
-    profile.commit_ms += milliseconds(commit_started);
+    let commit_ms = milliseconds(commit_started);
+    profile.commit_ms += commit_ms;
+    if profile.enabled {
+        profile.writer_observation.on_commit(c, scan_id, commit_ms);
+    }
     profile.batches += 1;
     profile.max_flush_ms = profile.max_flush_ms.max(milliseconds(flush_started));
     if profile.first_commit_ms.is_none() && profile.peak_batch_entries > 0 {
@@ -1481,6 +1531,64 @@ fn checked_aggregate(n: &Node, delta: i64, adelta: i64) -> Result<()> {
 mod tests {
     use super::*;
     use std::{fs, sync::Arc};
+    // These three deterministic tests inject the same process-global reader
+    // hooks. Serialize only their instrumentation, not production scan access.
+    static READER_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn four_readers_cancel_with_idle_peers_and_join_after_a_panic() {
+        let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("four-reader-source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("unread.txt"), b"abc").unwrap();
+        let root = platform::absolute(&source).unwrap();
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        *READER_TEST_HOOK.lock().unwrap() = Some(ReaderTestHook {
+            path: root.clone(),
+            entered: entered_tx,
+            waiting: waiting_tx,
+            release: release_rx,
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *READER_TEST_HOOK.lock().unwrap() = None;
+                *READER_PANIC_PATH.lock().unwrap() = None;
+            }
+        }
+        let _clear = Clear;
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let job = Arc::new(JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None));
+        std::thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| scan_sync_with_options(&service, &id, &root, &job, true, 4));
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let started = Instant::now();
+            job.cancel.store(true, Ordering::Release);
+            release_tx.send(()).unwrap();
+            let scan = worker.join().unwrap().unwrap();
+            assert_eq!(scan.status, "cancelled");
+            assert!(job.terminal());
+            assert_eq!(job.snapshot().status, "cancelled");
+            assert_eq!(scan.discovered_count, "1");
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+        *READER_TEST_HOOK.lock().unwrap() = None;
+        *READER_PANIC_PATH.lock().unwrap() = Some(root.clone());
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let started = Instant::now();
+        let error = scan_sync_with_options(&service, &id, &root, &job, true, 4).unwrap_err();
+        assert_eq!(error.code, "WORKER_FAILED");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(service.repo.scan(&id).unwrap().discovered_count, "1");
+    }
     #[cfg(windows)]
     #[test]
     fn cancelled_deferred_directory_retains_explicit_unknown_metadata_after_recovery() {
@@ -1596,11 +1704,11 @@ mod tests {
         fs::write(root.join("empty.bin"), b"").unwrap();
         let root = platform::absolute(&root).unwrap();
         let service = Service::new(&fixture.path().join("data")).unwrap();
-        let run = |fast| {
+        let run = |fast, readers| {
             let id = service.repo.new_scan_id().unwrap();
             service.repo.insert_scan(&id, &root, false).unwrap();
             let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
-            let scan = scan_sync_with_mode(&service, &id, &root, &job, fast).unwrap();
+            let scan = scan_sync_with_options(&service, &id, &root, &job, fast, readers).unwrap();
             assert!(job.terminal());
             assert_eq!(scan.status, "completed");
             let connection = service.repo.connect().unwrap();
@@ -1619,8 +1727,41 @@ mod tests {
                 .collect::<std::collections::BTreeMap<_, _>>();
             (scan, nodes)
         };
-        let (old, legacy) = run(false);
-        let (new, bulk) = run(true);
+        let (old, legacy) = run(false, 2);
+        let (new, bulk) = run(true, 2);
+        let (parallel_scan, parallel) = run(true, 4);
+        assert_eq!(new.discovered_count, parallel_scan.discovered_count);
+        assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
+        assert_eq!(new.error_count, parallel_scan.error_count);
+        assert!(bulk.keys().eq(parallel.keys()));
+        for (path, node) in &bulk {
+            let parent_path = |nodes: &std::collections::BTreeMap<Vec<u8>, StoredNode>,
+                               parent: &Option<String>| {
+                parent.as_ref().map(|id| {
+                    nodes
+                        .values()
+                        .find(|n| &n.node.node_id == id)
+                        .map(|n| platform::encode_path(&n.path))
+                        .unwrap()
+                })
+            };
+            assert_eq!(
+                parent_path(&bulk, &node.node.parent_id),
+                parent_path(&parallel, &parallel[path].node.parent_id)
+            );
+            let mut two = node.node.clone();
+            let mut four = parallel[path].node.clone();
+            // Discovery IDs and revisions are scheduling details. Every saved
+            // path, own metadata and aggregate remains identical.
+            two.node_id.clear();
+            four.node_id.clear();
+            two.parent_id = None;
+            four.parent_id = None;
+            assert_eq!(
+                serde_json::to_value(two).unwrap(),
+                serde_json::to_value(four).unwrap()
+            );
+        }
         assert_eq!(old.discovered_count, new.discovered_count);
         assert_eq!(old.logical_total_bytes, new.logical_total_bytes);
         assert_eq!(old.error_count, new.error_count);
@@ -1867,6 +2008,7 @@ mod tests {
 
     #[test]
     fn cancellation_while_reader_and_empty_receiver_are_blocked_is_cancelled() {
+        let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -1999,6 +2141,7 @@ mod tests {
 
     #[test]
     fn reader_panic_with_idle_peer_fails_and_joins_both_readers() {
+        let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -2232,6 +2375,22 @@ mod directory_queue_tests {
         ] {
             assert_eq!(consumed_limit_override(value), DEFAULT_CONSUMED_LIMIT);
         }
+    }
+    #[test]
+    fn reader_override_only_accepts_two_and_four_without_changing_default() {
+        for value in [
+            None,
+            Some("2"),
+            Some("0"),
+            Some("1"),
+            Some("3"),
+            Some("8"),
+            Some("4 "),
+            Some("invalid"),
+        ] {
+            assert_eq!(reader_count_override(value), 2);
+        }
+        assert_eq!(reader_count_override(Some("4")), 4);
     }
 
     #[test]

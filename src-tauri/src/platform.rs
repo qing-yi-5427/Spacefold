@@ -25,6 +25,25 @@ pub struct DirectoryEntry {
     pub path: PathBuf,
     pub hint: Option<Metadata>,
 }
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryApiCall {
+    pub calls: u64,
+    pub elapsed_ms: f64,
+}
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryApiProfile {
+    pub open: DirectoryApiCall,
+    pub tag: DirectoryApiCall,
+    pub identity: DirectoryApiCall,
+    pub links: DirectoryApiCall,
+    pub first_query: DirectoryApiCall,
+    pub refill_query: DirectoryApiCall,
+    pub fallback: DirectoryApiCall,
+    pub buffer_allocate: DirectoryApiCall,
+    pub buffer_clear: DirectoryApiCall,
+}
 impl DirectoryEntry {
     /// Only ordinary files can bypass the full no-recall metadata worker.
     /// Enumeration cannot supply link counts or link targets for special files.
@@ -74,6 +93,15 @@ impl ScanDirectoryReader {
     pub fn prepare(&self, path: &Path) -> Result<PreparedScanDirectory> {
         validate_scan_directory(path)?;
         Ok(PreparedScanDirectory(path.to_owned()))
+    }
+    pub fn with_profiling(self, _enabled: bool) -> Self {
+        self
+    }
+    pub fn api_profile(&self) -> DirectoryApiProfile {
+        DirectoryApiProfile::default()
+    }
+    pub fn fallback_metadata(&self, path: &Path) -> Result<Metadata> {
+        metadata(path)
     }
 }
 #[cfg(not(windows))]
@@ -686,9 +714,49 @@ mod win {
     // Public Win32 enumeration works on the exact handle whose attributes were
     // checked. No raw-volume access, backup privilege, or content reads are used.
     const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+    #[derive(Clone, Default)]
+    struct DirectoryApiRecorder(Option<std::sync::Arc<std::sync::Mutex<DirectoryApiProfile>>>);
+    #[derive(Clone, Copy)]
+    enum DirectoryApiStage {
+        Open,
+        Tag,
+        Identity,
+        Links,
+        First,
+        Refill,
+        Fallback,
+        BufferAllocate,
+        BufferClear,
+    }
+    impl DirectoryApiRecorder {
+        fn measure<T>(&self, stage: DirectoryApiStage, operation: impl FnOnce() -> T) -> T {
+            let Some(stats) = &self.0 else {
+                return operation();
+            };
+            let started = std::time::Instant::now();
+            let result = operation();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let mut stats = stats.lock().unwrap();
+            let field = match stage {
+                DirectoryApiStage::Open => &mut stats.open,
+                DirectoryApiStage::Tag => &mut stats.tag,
+                DirectoryApiStage::Identity => &mut stats.identity,
+                DirectoryApiStage::Links => &mut stats.links,
+                DirectoryApiStage::First => &mut stats.first_query,
+                DirectoryApiStage::Refill => &mut stats.refill_query,
+                DirectoryApiStage::Fallback => &mut stats.fallback,
+                DirectoryApiStage::BufferAllocate => &mut stats.buffer_allocate,
+                DirectoryApiStage::BufferClear => &mut stats.buffer_clear,
+            };
+            field.calls += 1;
+            field.elapsed_ms += elapsed;
+            result
+        }
+    }
     #[derive(Clone)]
     pub struct ScanDirectoryReader {
         ntfs_volume: Option<u64>,
+        api: DirectoryApiRecorder,
     }
     pub struct PreparedScanDirectory {
         path: PathBuf,
@@ -697,7 +765,27 @@ mod win {
     impl ScanDirectoryReader {
         pub fn new(root: &Path, fast: bool) -> Self {
             let ntfs_volume = fast.then(|| local_ntfs_volume(root)).flatten();
-            Self { ntfs_volume }
+            Self {
+                ntfs_volume,
+                api: DirectoryApiRecorder::default(),
+            }
+        }
+        pub fn with_profiling(mut self, enabled: bool) -> Self {
+            self.api = DirectoryApiRecorder(enabled.then(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(DirectoryApiProfile::default()))
+            }));
+            self
+        }
+        pub fn api_profile(&self) -> DirectoryApiProfile {
+            self.api
+                .0
+                .as_ref()
+                .map(|s| s.lock().unwrap().clone())
+                .unwrap_or_default()
+        }
+        pub fn fallback_metadata(&self, path: &Path) -> Result<Metadata> {
+            self.api
+                .measure(DirectoryApiStage::Fallback, || metadata(path))
         }
         pub fn prepare(&self, path: &Path) -> Result<PreparedScanDirectory> {
             let Some(volume) = self.ntfs_volume else {
@@ -707,17 +795,20 @@ mod win {
                     fast: None,
                 });
             };
-            let handle = open_directory(path, true)?;
+            let handle = self
+                .api
+                .measure(DirectoryApiStage::Open, || open_directory(path, true))?;
             let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
-            unsafe {
-                GetFileInformationByHandleEx(
-                    handle.0,
-                    FileAttributeTagInfo,
-                    &mut tag as *mut _ as *mut _,
-                    std::mem::size_of_val(&tag) as u32,
-                )
-            }
-            .map_err(win_error)?;
+            self.api
+                .measure(DirectoryApiStage::Tag, || unsafe {
+                    GetFileInformationByHandleEx(
+                        handle.0,
+                        FileAttributeTagInfo,
+                        &mut tag as *mut _ as *mut _,
+                        std::mem::size_of_val(&tag) as u32,
+                    )
+                })
+                .map_err(win_error)?;
             let attributes = tag.FileAttributes;
             let reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
             let cloud = reparse
@@ -737,7 +828,9 @@ mod win {
                     "目录在扫描中变为跳转链接或不可本地枚举，未跟随",
                 ));
             }
-            let id = handle_id(handle.0);
+            let id = self
+                .api
+                .measure(DirectoryApiStage::Identity, || handle_id(handle.0));
             if id.as_ref().is_none_or(|id| id.VolumeSerialNumber != volume) {
                 // Filesystem/identity capability changed. Revalidate the legacy
                 // path before opening it; never reinterpret another volume's ID.
@@ -757,7 +850,10 @@ mod win {
                     directory_identity: format_identity(volume, &id.unwrap().FileId.Identifier),
                     directory_attributes: attributes,
                     directory_tag: if reparse { tag.ReparseTag } else { 0 },
-                    buffer: vec![0u64; DIRECTORY_BUFFER_BYTES / 8],
+                    buffer: self.api.measure(DirectoryApiStage::BufferAllocate, || {
+                        vec![0u64; DIRECTORY_BUFFER_BYTES / 8]
+                    }),
+                    api: self.api.clone(),
                     offset: None,
                     done: false,
                     first: true,
@@ -870,6 +966,7 @@ mod win {
         directory_tag: u32,
         // u64 alignment also satisfies FILE_ID_EXTD_DIR_INFO alignment.
         buffer: Vec<u64>,
+        api: DirectoryApiRecorder,
         offset: Option<usize>,
         done: bool,
         first: bool,
@@ -879,7 +976,11 @@ mod win {
     impl BulkDirectoryIterator {
         fn directory_metadata(&self) -> Result<Metadata> {
             let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
-            unsafe { GetFileInformationByHandle(self.handle.0, &mut legacy) }.map_err(win_error)?;
+            self.api
+                .measure(DirectoryApiStage::Links, || unsafe {
+                    GetFileInformationByHandle(self.handle.0, &mut legacy)
+                })
+                .map_err(win_error)?;
             let ticks = ((legacy.ftLastWriteTime.dwHighDateTime as u64) << 32)
                 | legacy.ftLastWriteTime.dwLowDateTime as u64;
             Ok(Metadata {
@@ -908,21 +1009,29 @@ mod win {
                     windows::core::HRESULT::from_win32(code),
                 )));
             }
-            self.buffer.fill(0);
+            self.api
+                .measure(DirectoryApiStage::BufferClear, || self.buffer.fill(0));
             let class = if self.first {
                 FileIdExtdDirectoryRestartInfo
             } else {
                 FileIdExtdDirectoryInfo
             };
             self.first = false;
-            let result = unsafe {
-                GetFileInformationByHandleEx(
-                    self.handle.0,
-                    class,
-                    self.buffer.as_mut_ptr().cast(),
-                    DIRECTORY_BUFFER_BYTES as u32,
-                )
-            };
+            let result = self.api.measure(
+                if class == FileIdExtdDirectoryRestartInfo {
+                    DirectoryApiStage::First
+                } else {
+                    DirectoryApiStage::Refill
+                },
+                || unsafe {
+                    GetFileInformationByHandleEx(
+                        self.handle.0,
+                        class,
+                        self.buffer.as_mut_ptr().cast(),
+                        DIRECTORY_BUFFER_BYTES as u32,
+                    )
+                },
+            );
             match result {
                 Ok(()) => {
                     self.offset = Some(0);
@@ -1142,6 +1251,31 @@ mod win {
     #[cfg(test)]
     mod bulk_directory_tests {
         use super::*;
+        #[test]
+        fn api_counters_are_explicitly_enabled_and_include_handle_and_query_calls() {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("own.bin"), b"abc").unwrap();
+            let root = absolute(fixture.path()).unwrap();
+            let plain = ScanDirectoryReader::new(&root, true);
+            let prepared = plain.prepare(&root).unwrap();
+            assert!(prepared.directory_metadata().unwrap().links.is_some());
+            assert_eq!(prepared.entries().unwrap().count(), 1);
+            assert_eq!(plain.api_profile().open.calls, 0);
+            let reader = ScanDirectoryReader::new(&root, true).with_profiling(true);
+            let prepared = reader.prepare(&root).unwrap();
+            assert!(prepared.directory_metadata().unwrap().links.is_some());
+            assert_eq!(prepared.entries().unwrap().count(), 1);
+            let stats = reader.api_profile();
+            assert_eq!(stats.open.calls, 1);
+            assert_eq!(stats.tag.calls, 1);
+            assert_eq!(stats.identity.calls, 1);
+            assert_eq!(stats.links.calls, 1);
+            assert_eq!(stats.buffer_allocate.calls, 1);
+            assert_eq!(stats.first_query.calls, 1);
+            assert_eq!(stats.refill_query.calls, 1);
+            assert_eq!(stats.buffer_clear.calls, 2);
+            assert_eq!(stats.fallback.calls, 0);
+        }
         use std::{collections::BTreeMap, ffi::OsString, os::windows::ffi::OsStringExt};
 
         fn raw(path: &Path) -> Vec<u16> {

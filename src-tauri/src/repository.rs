@@ -21,6 +21,172 @@ type ViewReadHook = (
 );
 #[cfg(test)]
 static VIEW_READ_HOOK: std::sync::Mutex<Option<ViewReadHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static VIEW_SERIALIZE_HOOK: std::sync::Mutex<Option<ViewReadHook>> = std::sync::Mutex::new(None);
+
+struct SnapshotReadObservation<'a> {
+    scan_id: &'a str,
+    started: Option<Instant>,
+    started_at_ms: i64,
+    completed: bool,
+}
+impl<'a> SnapshotReadObservation<'a> {
+    fn new(scan_id: &'a str) -> Self {
+        let enabled = std::env::var_os("SPACEFOLD_PROFILE").is_some();
+        Self {
+            scan_id,
+            started: enabled.then(Instant::now),
+            started_at_ms: if enabled {
+                chrono::Utc::now().timestamp_millis()
+            } else {
+                0
+            },
+            completed: false,
+        }
+    }
+}
+impl Drop for SnapshotReadObservation<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "{}",
+                serde_json::json!({"viewReadProfile": {
+                    "scanId": self.scan_id, "startedAtMs": self.started_at_ms,
+                    "readTransactionMs": started.elapsed().as_secs_f64() * 1000.0,
+                    "completed": self.completed
+                }})
+            );
+        }
+    }
+}
+
+/// Bounded diagnostics on the existing writer; NOOP never checkpoints frames.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriterObservation {
+    /// Upper bounds are 1, 2, 4, 8, 16, 32, 64 ms; the final bucket is >=64 ms.
+    commit_buckets: [usize; 8],
+    max_commit_ms: f64,
+    wal_samples: usize,
+    wal_unavailable: usize,
+    wal_busy: usize,
+    max_wal_frames: i32,
+    max_uncheckpointed_frames: i32,
+    #[serde(skip)]
+    last_sample: Option<Instant>,
+}
+impl WriterObservation {
+    /// Call only when profiling is enabled, after a successful commit.
+    pub fn on_commit(&mut self, c: &Connection, scan_id: &str, commit_ms: f64) {
+        let bucket = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+            .iter()
+            .position(|upper| commit_ms < *upper)
+            .unwrap_or(7);
+        self.commit_buckets[bucket] += 1;
+        self.max_commit_ms = self.max_commit_ms.max(commit_ms);
+        if self
+            .last_sample
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_sample = Some(Instant::now());
+        self.wal_samples += 1;
+        let started = Instant::now();
+        let observation = c.query_row("PRAGMA main.wal_checkpoint(NOOP)", [], |r| {
+            Ok((
+                r.get::<_, i32>(0)?,
+                r.get::<_, i32>(1)?,
+                r.get::<_, i32>(2)?,
+            ))
+        });
+        let observation_ms = started.elapsed().as_secs_f64() * 1000.0;
+        match observation {
+            Ok((busy, log_frames, checkpointed_frames))
+                if busy == 0 && log_frames >= 0 && checkpointed_frames >= 0 =>
+            {
+                let remaining = log_frames.saturating_sub(checkpointed_frames);
+                self.max_wal_frames = self.max_wal_frames.max(log_frames);
+                self.max_uncheckpointed_frames = self.max_uncheckpointed_frames.max(remaining);
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"writerWalProfile": {
+                        "scanId": scan_id, "atMs": chrono::Utc::now().timestamp_millis(),
+                        "commitMs": commit_ms, "observationMs": observation_ms,
+                        "logFrames": log_frames, "checkpointedFrames": checkpointed_frames,
+                        "uncheckpointedFrames": remaining
+                    }})
+                );
+            }
+            other => {
+                self.wal_unavailable += 1;
+                let busy = match &other {
+                    Ok((busy, _, _)) => *busy != 0,
+                    Err(rusqlite::Error::SqliteFailure(error, _)) => {
+                        error.code == rusqlite::ErrorCode::DatabaseBusy
+                    }
+                    _ => false,
+                };
+                self.wal_busy += usize::from(busy);
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"writerWalProfile": {
+                        "scanId": scan_id, "atMs": chrono::Utc::now().timestamp_millis(),
+                        "commitMs": commit_ms, "observationMs": observation_ms,
+                        "unavailable": true, "busy": busy
+                    }})
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod writer_observation_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_noop_reports_frames_without_backfill_or_file_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("checkpoint.sqlite3");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE items(id INTEGER PRIMARY KEY,data BLOB);").unwrap();
+        let tx = c.transaction().unwrap();
+        for _ in 0..40 {
+            tx.execute("INSERT INTO items(data) VALUES(zeroblob(4096))", [])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let observe = |mode: &str| {
+            c.query_row(&format!("PRAGMA main.wal_checkpoint({mode})"), [], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
+            })
+            .unwrap()
+        };
+        let before = observe("NOOP");
+        assert_eq!(before.0, 0);
+        assert!(before.1 > 0);
+        assert_eq!(before.2, 0);
+        let database_before = std::fs::read(&path).unwrap();
+        let wal_path = path.with_file_name("checkpoint.sqlite3-wal");
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        for _ in 0..5 {
+            assert_eq!(observe("NOOP"), before);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), database_before);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+        let checkpoint = observe("PASSIVE");
+        assert_eq!(checkpoint.0, 0);
+        assert_eq!(checkpoint.1, before.1);
+        assert_eq!(checkpoint.2, before.1);
+        assert_eq!(observe("NOOP"), checkpoint);
+        assert_ne!(std::fs::read(&path).unwrap(), database_before);
+    }
+}
 impl ViewBudget {
     fn charge(&mut self, value: &impl serde::Serialize, nodes: usize) -> Result<()> {
         self.bytes = self.bytes.saturating_add(serde_json::to_vec(value)?.len());
@@ -941,6 +1107,7 @@ impl Repository {
             return Err(AppError::new("INVALID_SORT", "视图排序方式无效"));
         }
         let c = self.connect()?;
+        let mut read_observation = SnapshotReadObservation::new(&request.scan_id);
         let tx = c.unchecked_transaction()?;
         // This first SELECT establishes the WAL read snapshot. Future writer
         // commits cannot advance its revision or any rows read by this request.
@@ -1165,6 +1332,24 @@ impl Repository {
             summary,
             details,
         };
+        // Every cohort field now owns its data. Release the WAL read snapshot
+        // before exact serialization; it no longer needs any database queries.
+        tx.commit()?;
+        read_observation.completed = true;
+        drop(read_observation);
+        #[cfg(test)]
+        {
+            let hook = VIEW_SERIALIZE_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|hook| hook.0 == self.path)
+                .cloned();
+            if let Some((_, entered, release)) = hook {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
         // Keep both output guards exact, including envelopes/string arrays. The
         // incremental guard above also bounds construction before serialization.
         if budget.nodes > NODE_LIMIT || serde_json::to_vec(&snapshot)?.len() > PAYLOAD_LIMIT {
@@ -1173,7 +1358,6 @@ impl Repository {
                 "视图超出记录或 8 MiB 返回预算，请减少展开目录或所选项",
             ));
         }
-        tx.commit()?;
         Ok(snapshot)
     }
     pub fn errors(&self, scan_id: &str, cursor: Option<&str>, page_size: u32) -> Result<ErrorPage> {
@@ -1714,6 +1898,135 @@ mod directory_metadata_tests {
         (temp, service, scan, child, complete)
     }
     #[test]
+    fn equal_timestamp_completion_avoids_secondary_writes_and_changed_timestamp_sorts_exactly() {
+        let (_temp, service, scan, child, complete) = setup();
+        let mut c = service.repo.connect().unwrap();
+        let opcodes = |sql: &str| {
+            let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            let count = stmt.parameter_count();
+            let codes = stmt
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n(
+                        rusqlite::types::Value::Null,
+                        count,
+                    )),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            codes
+        };
+        let payload_only = opcodes(DIRECTORY_PAYLOAD_UPDATE);
+        let timestamp = opcodes(DIRECTORY_TIMED_PAYLOAD_UPDATE);
+        let secondary_root: i64 = c
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='nodes_special_kind_v2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // WITHOUT ROWID uses IdxInsert for the primary table too. Identify the
+        // actual secondary cursor instead of mistaking that table write for it.
+        assert!(
+            !payload_only
+                .iter()
+                .any(|(op, _, page)| op == "OpenWrite" && *page == secondary_root),
+            "SQLite {} {payload_only:?}",
+            rusqlite::version()
+        );
+        let secondary_cursor = timestamp
+            .iter()
+            .find(|(op, _, page)| op == "OpenWrite" && *page == secondary_root)
+            .unwrap()
+            .1;
+        assert!(timestamp
+            .iter()
+            .any(|(op, cursor, _)| op == "IdxDelete" && *cursor == secondary_cursor));
+        assert!(timestamp
+            .iter()
+            .any(|(op, cursor, _)| op == "IdxInsert" && *cursor == secondary_cursor));
+        let tx = c.transaction().unwrap();
+        let mut comparison = complete.clone();
+        comparison.modified = Some("2020-01-01T00:00:00+00:00".into());
+        comparison.identity = Some("comparison-fixture-identity".into());
+        insert_node(
+            &tx,
+            &scan,
+            3,
+            Some(1),
+            &child.with_file_name("comparison"),
+            1,
+            &comparison,
+            None,
+        )
+        .unwrap();
+        aggregate_batch(&tx, &scan, 1, 0, 0, 0, 0, 2, 2).unwrap();
+        tx.commit().unwrap();
+        let before = service.repo.scan(&scan).unwrap();
+        for (index, modified) in [
+            complete.modified.clone(),
+            Some("2030-01-01T00:00:00+00:00".into()),
+            None,
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut metadata = complete.clone();
+            metadata.modified = modified.clone();
+            metadata.links = Some(7 + index as u64);
+            metadata.attributes |= 1;
+            let tx = c.transaction().unwrap();
+            apply_directory_metadata(
+                &tx,
+                &scan,
+                &DirectoryMetadataUpdate {
+                    id: 2,
+                    expected_identity: complete.identity.clone().unwrap(),
+                    result: Ok(metadata.clone()),
+                },
+            )
+            .unwrap();
+            let saved = Repository::node_conn(&tx, &scan, 2).unwrap();
+            assert_eq!(saved.node.modified_at, modified);
+            assert_eq!(saved.node.link_count, metadata.links.map(|n| n.to_string()));
+            assert_eq!(saved.fingerprint.attributes, metadata.attributes);
+            assert_eq!(saved.node.identity, metadata.identity);
+            tx.commit().unwrap();
+            if index == 1 {
+                let page = service
+                    .repo
+                    .page(
+                        &PageRequest {
+                            scan_id: scan.clone(),
+                            revision: before.revision,
+                            parent_id: Some("1".into()),
+                            sort: Some("modified_desc".into()),
+                            filter: None,
+                            cursor: None,
+                            page_size: Some(200),
+                        },
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(page.nodes[0].node_id, "2");
+                assert_eq!(page.nodes[1].node_id, "3");
+            }
+        }
+        let after = service.repo.scan(&scan).unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.discovered_count, before.discovered_count);
+        assert_eq!(after.logical_total_bytes, before.logical_total_bytes);
+        check_directory_metadata_complete(&c, &scan).unwrap();
+    }
+    #[test]
     fn saved_and_handle_identity_checks_precede_atomic_metadata_completion() {
         let (_temp, service, scan, _child, complete) = setup();
         let mut c = service.repo.connect().unwrap();
@@ -1866,15 +2179,20 @@ mod directory_metadata_tests {
 }
 /// Applies only metadata captured on the directory's validated handle. This
 /// function shares the caller's discovery/aggregation/revision transaction.
+const DIRECTORY_PAYLOAD_UPDATE: &str = "UPDATE nodes SET payload=?3 WHERE scan_id=?1 AND id=?2";
+const DIRECTORY_TIMED_PAYLOAD_UPDATE: &str =
+    "UPDATE nodes SET payload=?3,modified=?4 WHERE scan_id=?1 AND id=?2";
 pub fn apply_directory_metadata(
     tx: &Transaction<'_>,
     scan_id: &str,
     update: &DirectoryMetadataUpdate,
 ) -> Result<()> {
     let mut select =
-        tx.prepare_cached("SELECT kind,payload FROM nodes WHERE scan_id=?1 AND id=?2")?;
-    let (kind, payload): (String, String) =
-        select.query_row(params![scan_id, update.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        tx.prepare_cached("SELECT kind,payload,modified FROM nodes WHERE scan_id=?1 AND id=?2")?;
+    let (kind, payload, modified): (String, String, Option<String>) = select
+        .query_row(params![scan_id, update.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
     drop(select);
     let (identity, logical, allocated) = if payload.starts_with("{\"v\":3") {
         let old: TinyPayload = serde_json::from_str(&payload)?;
@@ -1921,15 +2239,17 @@ pub fn apply_directory_metadata(
             }
             // Directory-own allocation is zero under the existing accounting
             // policy. No aggregate/discovered/direct-child value changes here.
-            tx.prepare_cached(
-                "UPDATE nodes SET payload=?3,modified=?4 WHERE scan_id=?1 AND id=?2",
-            )?
-            .execute(params![
-                scan_id,
-                update.id,
-                serde_json::to_string(&TinyPayload::from_meta(m))?,
-                m.modified
-            ])?;
+            let payload = serde_json::to_string(&TinyPayload::from_meta(m))?;
+            if m.modified == modified {
+                // SQLite maintains indexes for a SET column even if its value
+                // is identical. The unchanged timestamp stays exact without
+                // rewriting the directory's secondary-index entry.
+                tx.prepare_cached(DIRECTORY_PAYLOAD_UPDATE)?
+                    .execute(params![scan_id, update.id, payload])?;
+            } else {
+                tx.prepare_cached(DIRECTORY_TIMED_PAYLOAD_UPDATE)?
+                    .execute(params![scan_id, update.id, payload, m.modified])?;
+            }
         }
         Ok(_) => {
             return Err(AppError::new(
@@ -2537,6 +2857,50 @@ mod view_snapshot_tests {
         assert_eq!(snapshot.summary.covered_ids, ["3"]);
         assert_eq!(snapshot.details[0].node_id, "2");
         assert_eq!(snapshot.details[0].nodes[0].logical_bytes, expected);
+    }
+
+    #[test]
+    fn view_snapshot_releases_reader_before_final_serialization() {
+        let (_fixture, repo, scan_id) = fixture();
+        let prior_revision = repo.scan(&scan_id).unwrap().revision;
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        *VIEW_SERIALIZE_HOOK.lock().unwrap() = Some((repo.path.clone(), entered_tx, release_rx));
+        let reader_repo = repo.clone();
+        let read_request = request(&scan_id);
+        let reader = std::thread::spawn(move || reader_repo.view_snapshot(&read_request));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = repo.connect().unwrap();
+        writer
+            .execute(
+                "UPDATE scans SET revision=revision+1 WHERE id=?1",
+                [&scan_id],
+            )
+            .unwrap();
+        let checkpoint = writer
+            .query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
+            })
+            .unwrap();
+        // The reader connection is still open and the response is paused, but
+        // its completed transaction cannot retain an old checkpoint end mark.
+        let fully_checkpointed =
+            checkpoint.0 == 0 && checkpoint.1 > 0 && checkpoint.1 == checkpoint.2;
+        release_tx.send(()).unwrap();
+        let snapshot = reader.join().unwrap().unwrap();
+        *VIEW_SERIALIZE_HOOK.lock().unwrap() = None;
+        assert!(fully_checkpointed, "{checkpoint:?}");
+        assert_eq!(snapshot.scan.revision, prior_revision);
+        assert!(snapshot
+            .pages
+            .iter()
+            .all(|page| page.page.revision == prior_revision));
+        assert_eq!(snapshot.chart.revision, prior_revision);
+        assert_eq!(repo.scan(&scan_id).unwrap().revision, prior_revision + 1);
     }
 
     #[test]
