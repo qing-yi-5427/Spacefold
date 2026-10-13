@@ -442,9 +442,15 @@ pub fn write_report(
 fn commit_report_handle(file: &std::fs::File, target: &Path) -> Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::*};
-    let name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name.len() * std::mem::size_of::<u16>();
+    // FILE_RENAME_INFO.FileName is a NUL-terminated Win32 path, even though
+    // FileNameLength describes only the path bytes. Allocator alignment padding
+    // is not a terminator: aligned lengths previously let Win32 read past the
+    // buffer and append unrelated heap units to the actual destination name.
+    name.push(0);
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let bytes = offset + name.len() * 2;
+    let bytes = offset + name.len() * std::mem::size_of::<u16>();
     let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
     let handle = HANDLE(file.as_raw_handle());
     unsafe {
@@ -465,7 +471,7 @@ fn commit_report_handle(file: &std::fs::File, target: &Path) -> Result<()> {
                 ReplaceIfExists: true,
             },
             RootDirectory: HANDLE::default(),
-            FileNameLength: (name.len() * 2) as u32,
+            FileNameLength: name_bytes as u32,
             FileName: [0],
         });
         std::ptr::copy_nonoverlapping(
@@ -809,6 +815,50 @@ fn write_xlsx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn report_handle_commit_preserves_exact_unicode_names_and_existing_targets() {
+        use std::{collections::BTreeSet, ffi::OsString, io::Write};
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = platform::absolute(fixture.path())
+            .unwrap()
+            .join("目标中文🧭");
+        std::fs::create_dir(&parent).unwrap();
+        let mut expected_names = BTreeSet::<OsString>::new();
+        let mut length_remainders = BTreeSet::new();
+        for format in ["csv", "xlsx", "json", "html"] {
+            for replace in [false, true] {
+                for padding in 0..8 {
+                    let filename =
+                        format!("报告😀-{}-{}.{format}", replace as u8, "x".repeat(padding));
+                    let target = parent.join(&filename);
+                    use std::os::windows::ffi::OsStrExt;
+                    length_remainders.insert(target.as_os_str().encode_wide().count() % 8);
+                    if replace {
+                        std::fs::write(&target, b"original sentinel").unwrap();
+                    }
+                    let mut temp = report_tempfile(&parent).unwrap();
+                    temp.disable_cleanup(true);
+                    let content = format!("actual opened object: {filename}");
+                    temp.as_file_mut().write_all(content.as_bytes()).unwrap();
+                    temp.as_file().sync_all().unwrap();
+                    commit_report_handle(temp.as_file(), &target).unwrap();
+                    drop(temp);
+                    assert_eq!(std::fs::read(&target).unwrap(), content.as_bytes());
+                    expected_names.insert(OsString::from(filename));
+                    let actual_names = std::fs::read_dir(&parent)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(
+                        actual_names, expected_names,
+                        "rename created an unexpected suffix or kept a temp path"
+                    );
+                }
+            }
+        }
+        assert_eq!(length_remainders, (0..8).collect());
+    }
     #[test]
     fn formula_and_html() {
         for s in ["=1+1", "\t@x", "  ＋foo", "-12", "\rname"] {
