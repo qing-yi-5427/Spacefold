@@ -1572,6 +1572,177 @@ pub fn aggregate_batch(
     )?;
     Ok(())
 }
+
+#[derive(Debug, Default)]
+pub struct AggregateStats {
+    pub direct_parents: usize,
+    pub ancestor_rows: usize,
+    pub coalesced: bool,
+}
+#[derive(Default)]
+struct AggregateRow {
+    parent: Option<i64>,
+    current: [i64; 6],
+    delta: [i64; 6],
+}
+/// Coalesce shared ancestors once per committed batch. The maps contain only
+/// fixed-size IDs/counters, no paths or metadata. At most 32,768 ancestor rows
+/// are retained; an unusually dispersed/deep batch uses the original bounded
+/// per-parent SQL without partially applying the coalesced representation.
+pub fn aggregate_many(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+) -> Result<AggregateStats> {
+    aggregate_many_with_limit(tx, scan_id, direct, 32_768)
+}
+fn aggregate_many_with_limit(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    limit: usize,
+) -> Result<AggregateStats> {
+    fn add_delta(a: i64, b: i64) -> Result<i64> {
+        a.checked_add(b)
+            .ok_or_else(|| AppError::new("SIZE_OUT_OF_RANGE", "扫描增量超过支持的精确整数范围"))
+    }
+    let mut rows = std::collections::BTreeMap::<i64, AggregateRow>::new();
+    let mut load = tx.prepare_cached("SELECT parent_id,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count FROM nodes WHERE scan_id=?1 AND id=?2")?;
+    for parent in direct.keys() {
+        let mut next = Some(*parent);
+        let mut seen = HashSet::new();
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return Err(AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"));
+            }
+            if seen.len() > 4096 {
+                return Err(AppError::new("DEPTH_LIMIT", "目录深度超过支持上限"));
+            }
+            if rows.contains_key(&id) {
+                break;
+            }
+            if rows.len() >= limit {
+                drop(load);
+                drop(rows);
+                for (parent, delta) in direct {
+                    aggregate_batch(
+                        tx, scan_id, *parent, delta[0], delta[1], delta[2], delta[3], delta[4],
+                        delta[5],
+                    )?;
+                }
+                return Ok(AggregateStats {
+                    direct_parents: direct.len(),
+                    ancestor_rows: 0,
+                    coalesced: false,
+                });
+            }
+            let row = load
+                .query_row(params![scan_id, id], |r| {
+                    Ok(AggregateRow {
+                        parent: r.get(0)?,
+                        current: [
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ],
+                        ..Default::default()
+                    })
+                })
+                .optional()?
+                .ok_or_else(|| AppError::new("NODE_NOT_FOUND", "聚合父目录已不存在"))?;
+            next = row.parent;
+            rows.insert(id, row);
+        }
+    }
+    drop(load);
+    let mut discovered_delta = 0i64;
+    for (id, delta) in direct {
+        rows.get_mut(id).unwrap().delta = *delta;
+        discovered_delta = add_delta(discovered_delta, delta[5])?;
+    }
+    // Traverse the actual parent graph, rather than trusting depth or discovery
+    // ID order (which can differ after a scoped refresh or legacy import).
+    let mut unfinished = rows
+        .keys()
+        .map(|id| (*id, 0usize))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for row in rows.values() {
+        if let Some(parent) = row.parent {
+            *unfinished.get_mut(&parent).unwrap() += 1;
+        }
+    }
+    let mut ready = unfinished
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| *id)
+        .collect::<std::collections::VecDeque<_>>();
+    let mut visited = 0usize;
+    while let Some(id) = ready.pop_front() {
+        visited += 1;
+        let row = &rows[&id];
+        let parent = row.parent;
+        let delta = row.delta;
+        if let Some(parent) = parent {
+            let ancestor = rows.get_mut(&parent).unwrap();
+            for (total, change) in ancestor.delta[..5].iter_mut().zip(delta[..5].iter()) {
+                *total = add_delta(*total, *change)?;
+            }
+            let count = unfinished.get_mut(&parent).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(parent);
+            }
+        }
+    }
+    if visited != rows.len() {
+        return Err(AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"));
+    }
+    let discovered: i64 = tx.query_row(
+        "SELECT discovered FROM scans WHERE id=?1",
+        [scan_id],
+        |row| row.get(0),
+    )?;
+    let discovered = checked_add(discovered, discovered_delta)?;
+    if discovered < 0 {
+        return Err(AppError::new("SIZE_OUT_OF_RANGE", "扫描计数超出支持范围"));
+    }
+    for row in rows.values_mut() {
+        for (current, delta) in row.current.iter_mut().zip(row.delta.iter()) {
+            *current = checked_add(*current, *delta)?;
+            if *current < 0 {
+                return Err(AppError::new("SIZE_OUT_OF_RANGE", "扫描统计不能为负数"));
+            }
+        }
+    }
+    // All sums are checked before the first UPDATE. The caller's transaction
+    // also contains nodes, direct child counts, queue consumption and revision.
+    let mut update = tx.prepare_cached("UPDATE nodes SET logical_total=?3,allocated_total=?4,allocated_unknown=?5,file_count=?6,dir_count=?7,children_count=?8 WHERE scan_id=?1 AND id=?2")?;
+    for (id, row) in &rows {
+        update.execute(params![
+            scan_id,
+            id,
+            row.current[0],
+            row.current[1],
+            row.current[2],
+            row.current[3],
+            row.current[4],
+            row.current[5]
+        ])?;
+    }
+    drop(update);
+    tx.execute(
+        "UPDATE scans SET discovered=?2 WHERE id=?1",
+        params![scan_id, discovered],
+    )?;
+    Ok(AggregateStats {
+        direct_parents: direct.len(),
+        ancestor_rows: rows.len(),
+        coalesced: true,
+    })
+}
 #[allow(clippy::too_many_arguments)] // Shared insertion primitive for both modes.
 fn insert_node_inner(
     tx: &Transaction<'_>,
@@ -1934,5 +2105,218 @@ mod view_snapshot_tests {
             "VIEW_PAYLOAD_BUDGET"
         );
         assert!(Repository::node_conn(&c, &scan_id, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_many_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn fixture() -> (tempfile::TempDir, Repository, String, String) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        let layout = [
+            (1, None, "", 0),
+            (20, Some(1), "A", 1),
+            (2, Some(20), "A/nested", 2),
+            (30, Some(1), "B", 1),
+            (4, Some(30), "B/nested", 2),
+            (6, Some(2), "A/nested/deep", 3),
+            (7, Some(4), "B/nested/deep", 3),
+        ];
+        for (_, _, path, _) in &layout {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        }
+        let root = platform::absolute(&root).unwrap();
+        let repo = Repository::new(&fixture.path().join("db")).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let scan_id = repo.new_scan_id().unwrap();
+            repo.insert_scan(&scan_id, &root, false).unwrap();
+            let mut c = repo.connect().unwrap();
+            let tx = c.transaction().unwrap();
+            for (id, parent, path, depth) in &layout {
+                let path = root.join(path);
+                insert_node(
+                    &tx,
+                    &scan_id,
+                    *id,
+                    *parent,
+                    &path,
+                    *depth,
+                    &platform::metadata(&path).unwrap(),
+                    None,
+                )
+                .unwrap();
+            }
+            tx.execute("UPDATE nodes SET error_code='ACCESS_DENIED',incomplete=1 WHERE scan_id=?1 AND id=7", [&scan_id]).unwrap();
+            tx.commit().unwrap();
+            ids.push(scan_id);
+        }
+        (fixture, repo, ids.remove(0), ids.remove(0))
+    }
+
+    fn values(c: &Connection, scan_id: &str) -> serde_json::Value {
+        let mut statement = c
+            .prepare(&format!(
+                "SELECT {NODE_COLUMNS} FROM nodes WHERE scan_id=?1 ORDER BY id"
+            ))
+            .unwrap();
+        let nodes = statement
+            .query_map([scan_id], read_node)
+            .unwrap()
+            .map(|row| row.unwrap().node)
+            .collect::<Vec<_>>();
+        let counters: (i64, i64) = c
+            .query_row(
+                "SELECT discovered,revision FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        serde_json::json!({"nodes":nodes,"counters":counters})
+    }
+
+    fn apply(
+        repo: &Repository,
+        legacy: &str,
+        folded: &str,
+        changes: &BTreeMap<i64, [i64; 6]>,
+        limit: usize,
+    ) -> AggregateStats {
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        for (id, delta) in changes {
+            aggregate_batch(
+                &tx, legacy, *id, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5],
+            )
+            .unwrap();
+        }
+        let stats = aggregate_many_with_limit(&tx, folded, changes, limit).unwrap();
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id IN (?1,?2)",
+            params![legacy, folded],
+        )
+        .unwrap();
+        assert_eq!(values(&tx, legacy), values(&tx, folded));
+        tx.commit().unwrap();
+        assert_eq!(values(&c, legacy), values(&c, folded));
+        stats
+    }
+
+    #[test]
+    fn coalesced_shared_ancestors_match_legacy_for_branches_nested_parents_and_signed_deltas() {
+        let (_fixture, repo, legacy, folded) = fixture();
+        let positive = BTreeMap::from([
+            (20, [10, 8, 1, 2, 0, 2]),
+            (30, [20, 15, 2, 3, 1, 4]),
+            (2, [30, 20, 3, 4, 2, 6]),
+            (6, [40, 30, 4, 5, 3, 8]),
+        ]);
+        let stats = apply(&repo, &legacy, &folded, &positive, 32_768);
+        assert!(stats.coalesced);
+        assert_eq!(stats.direct_parents, 4);
+        assert_eq!(stats.ancestor_rows, 5); // Shared root/A parents are updated once.
+        let c = repo.connect().unwrap();
+        let root = Repository::node_conn(&c, &folded, 1).unwrap().node;
+        assert_eq!(root.logical_total_bytes, "100");
+        assert_eq!(root.children_count, "2"); // Never descendant count propagated upward.
+        let discovered: i64 = c
+            .query_row(
+                "SELECT discovered FROM scans WHERE id=?1",
+                [&folded],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(discovered, 27);
+        assert_eq!(
+            Repository::node_conn(&c, &folded, 20)
+                .unwrap()
+                .node
+                .logical_total_bytes,
+            "80"
+        );
+        let negative = BTreeMap::from([
+            (20, [-2, -2, 0, 0, 0, -1]),
+            (30, [-5, -3, -1, -1, 0, -1]),
+            (2, [-5, -4, -1, -1, -1, -1]),
+            (6, [-10, -5, -2, -2, -1, -2]),
+        ]);
+        assert!(apply(&repo, &legacy, &folded, &negative, 32_768).coalesced);
+    }
+
+    #[test]
+    fn coalescing_limit_falls_back_before_any_update_and_matches_legacy() {
+        let (_fixture, repo, legacy, folded) = fixture();
+        let changes = BTreeMap::from([(2, [31, 20, 2, 2, 1, 3]), (7, [13, 9, 1, 1, 0, 1])]);
+        let stats = apply(&repo, &legacy, &folded, &changes, 2);
+        assert!(!stats.coalesced);
+        assert_eq!(stats.direct_parents, 2);
+        assert!(
+            !apply(
+                &repo,
+                &legacy,
+                &folded,
+                &BTreeMap::from([(2, [-1, -1, 0, 0, 0, 0])]),
+                0
+            )
+            .coalesced
+        );
+    }
+
+    #[test]
+    fn coalesced_overflow_rejects_before_updates_and_rolls_back_batch_revision() {
+        let (_fixture, repo, _legacy, folded) = fixture();
+        let mut c = repo.connect().unwrap();
+        let before = values(&c, &folded);
+        let tx = c.transaction().unwrap();
+        let changes = BTreeMap::from([(2, [i64::MAX, 0, 0, 0, 0, 0]), (7, [1, 0, 0, 0, 0, 0])]);
+        assert_eq!(
+            aggregate_many(&tx, &folded, &changes).unwrap_err().code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        assert_eq!(values(&tx, &folded), before);
+        // Other work in this uncommitted batch is not exposed after an error.
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id=?1",
+            [&folded],
+        )
+        .unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(values(&c, &folded), before);
+        let tx = c.transaction().unwrap();
+        let underflow = BTreeMap::from([(2, [-1, 0, 0, 0, 0, 0])]);
+        assert_eq!(
+            aggregate_many(&tx, &folded, &underflow).unwrap_err().code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        assert_eq!(values(&tx, &folded), before);
+    }
+
+    #[test]
+    fn fallback_overflow_after_prior_parent_updates_rolls_back_every_counter_and_revision() {
+        let (_fixture, repo, _legacy, folded) = fixture();
+        let mut c = repo.connect().unwrap();
+        let before = values(&c, &folded);
+        let tx = c.transaction().unwrap();
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id=?1",
+            [&folded],
+        )
+        .unwrap();
+        let changes = BTreeMap::from([(2, [i64::MAX, 0, 0, 0, 0, 0]), (7, [1, 0, 0, 0, 0, 0])]);
+        assert_eq!(
+            aggregate_many_with_limit(&tx, &folded, &changes, 0)
+                .unwrap_err()
+                .code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        // The legacy fallback has already changed A/shared root when B
+        // overflows. No observer may see those uncommitted partial changes.
+        assert_ne!(values(&tx, &folded), before);
+        assert_eq!(values(&repo.connect().unwrap(), &folded), before);
+        tx.rollback().unwrap();
+        assert_eq!(values(&c, &folded), before);
     }
 }

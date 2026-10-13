@@ -1,9 +1,7 @@
 use crate::{
     model::*,
     platform,
-    repository::{
-        aggregate_batch, encode_node, insert_node, EncodedNode, NodeInserter, Repository,
-    },
+    repository::{aggregate_many, encode_node, insert_node, EncodedNode, NodeInserter, Repository},
     service::{JobRuntime, Service},
 };
 use rusqlite::params;
@@ -39,6 +37,9 @@ struct ScanProfile {
     writer_wait_ms: f64,
     insert_ms: f64,
     aggregate_ms: f64,
+    aggregate_direct_parents: usize,
+    aggregate_ancestor_rows: usize,
+    aggregate_fallback_batches: usize,
     commit_ms: f64,
     finish_ms: f64,
     close_ms: f64,
@@ -530,6 +531,8 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                             .collect::<std::result::Result<Vec<_>, _>>()?;
                         found
                     };
+                    let mut mark_consumed =
+                        c.prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")?;
                     for (parent, path, depth) in directories {
                         #[cfg(test)]
                         {
@@ -551,7 +554,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                             return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                         }
                         let path = platform::decode_path(path);
-                        c.execute("INSERT INTO consumed_dirs(id) VALUES(?1)", [parent])?;
+                        mark_consumed.execute([parent])?;
                         consumed += 1;
                         if depth >= 4096 {
                             record_error(
@@ -956,11 +959,10 @@ fn flush_batch(
     drop(inserter);
     profile.insert_ms += milliseconds(insert_started);
     let aggregate_started = Instant::now();
-    for (parent, [logical, allocated, unknown, files, dirs, children]) in aggregates {
-        aggregate_batch(
-            &tx, scan_id, parent, logical, allocated, unknown, files, dirs, children,
-        )?;
-    }
+    let aggregation = aggregate_many(&tx, scan_id, &aggregates)?;
+    profile.aggregate_direct_parents += aggregation.direct_parents;
+    profile.aggregate_ancestor_rows += aggregation.ancestor_rows;
+    profile.aggregate_fallback_batches += usize::from(!aggregation.coalesced);
     tx.execute(
         "UPDATE scans SET revision=revision+1 WHERE id=?1",
         [scan_id],
