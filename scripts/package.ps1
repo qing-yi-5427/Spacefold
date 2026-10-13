@@ -28,6 +28,9 @@ if (-not $SkipChecks) {
   if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
   npm test
   if ($LASTEXITCODE -ne 0) { throw 'Frontend checks failed' }
+  # generate_context! embeds ../dist for custom-protocol checks on a clean clone.
+  npm run build
+  if ($LASTEXITCODE -ne 0) { throw 'Frontend production build failed' }
   cargo fmt --manifest-path src-tauri/Cargo.toml --check
   if ($LASTEXITCODE -ne 0) { throw 'Rust formatting failed' }
   cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
