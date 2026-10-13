@@ -1,5 +1,2 @@
 [env]
-# SQLite's optional global allocation accounting adds allocator synchronization.
-# Application limits use the bounded queues, per-connection page cache and OS
-# measurements. Keep SQLite threading/API checks and WAL/NORMAL durability.
 LIBSQLITE3_FLAGS = { value = "SQLITE_DEFAULT_MEMSTATUS=0", force = true }

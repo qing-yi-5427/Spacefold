@@ -14,7 +14,7 @@ playwright-report/
 !.env.example
 coverage/
 dist-release/
-reference/index.html
+/reference/
 *.tsbuildinfo
 src-tauri/gen/
 .vs/
@@ -23,15 +23,15 @@ src-tauri/gen/
 *.pem
 *.key
 
-# 本地需求原文与开发过程材料，不随公开仓库分发。
+/AGENTS.md
 /spacefold-features-tech.md
 /spacefold-ui-spec.md
-/docs/acceptance.md
-/docs/environment.md
-/docs/performance-handoff.md
-/docs/performance-method.md
-/docs/performance.md
-/docs/requirements-sha256.txt
-/docs/third-party.md
-/docs/licenses/README.md
-/docs/screenshots/README.md
+/docs/
+/THIRD-PARTY-LICENSES.txt
+/scripts/*
+!/scripts/package.ps1
+/src-tauri/icons/*
+!/src-tauri/icons/32x32.png
+!/src-tauri/icons/128x128.png
+!/src-tauri/icons/128x128@2x.png
+!/src-tauri/icons/icon.ico

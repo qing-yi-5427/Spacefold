@@ -27,9 +27,9 @@
 
 Windows WebView2 应用扫描自建演示文件的截图，文件名与分布为测试夹具。
 
-![目录树](docs/screenshots/tree.png)
-![空间地图](docs/screenshots/map.png)
-![层级透镜](docs/screenshots/lens.png)
+![目录树](screenshots/tree.png)
+![空间地图](screenshots/map.png)
+![层级透镜](screenshots/lens.png)
 
 ## 开发构建
 
@@ -47,4 +47,4 @@ npm run tauri build
 
 ## 许可
 
-源码采用 [MIT](LICENSE)；第三方版权与许可见 [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt)，其中组件可按锁文件及声明中的版本从 Cargo/npm 获取原始源码。随包 WebView2 遵循 [微软固定版许可](docs/licenses/WebView2-Fixed-License.html)。WebView2 包含 SmartScreen，可能按[微软隐私声明](https://aka.ms/privacy)和 [Edge 隐私说明](https://learn.microsoft.com/en-us/microsoft-edge/privacy-whitepaper#smartscreen)向微软发送相关信息；磁盘分析在本机完成。
+源码采用 [MIT](LICENSE)；依赖声明见 [第三方版权与许可](licenses/THIRD-PARTY-LICENSES.txt)，其中组件可按锁文件及声明中的版本从 Cargo/npm 获取原始源码。随包 WebView2 遵循 [微软固定版许可](licenses/WebView2-Fixed-License.html)。WebView2 包含 SmartScreen，可能按[微软隐私声明](https://aka.ms/privacy)和 [Edge 隐私说明](https://learn.microsoft.com/en-us/microsoft-edge/privacy-whitepaper#smartscreen)向微软发送相关信息；磁盘分析在本机完成。

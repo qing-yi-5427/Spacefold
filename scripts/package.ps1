@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Force $taskOutput | Out-Null
 $taskPortableName = "Spacefold_${taskVersion}_x64-portable"
 $taskPortable = Join-Path $taskOutput $taskPortableName
 if (Test-Path -LiteralPath $taskPortable) { throw "Portable output already exists; choose a new OutputDirectory: $taskPortable" }
-foreach ($taskNotice in @('LICENSE','THIRD-PARTY-LICENSES.txt','docs/licenses/WebView2-Fixed-License.html')) {
+foreach ($taskNotice in @('LICENSE','licenses/THIRD-PARTY-LICENSES.txt','licenses/WebView2-Fixed-License.html')) {
   if (-not (Test-Path -LiteralPath $taskNotice -PathType Leaf)) { throw "Missing redistribution notice: $taskNotice" }
 }
 if (-not $SkipChecks) {
@@ -66,7 +66,7 @@ $taskRuntimeBytes = ($taskRuntimeItems | Where-Object { -not $_.PSIsContainer } 
 if (@($taskRuntimeItems | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint }).Count -gt 0) { throw 'Fixed Runtime archive contains an unsupported reparse point' }
 $taskRuntimeDestination = Join-Path $taskPortable 'WebView2Runtime'
 Copy-Item -LiteralPath $taskRuntimeSource -Destination $taskRuntimeDestination -Recurse
-foreach ($taskNotice in @('LICENSE','THIRD-PARTY-LICENSES.txt','docs/licenses/WebView2-Fixed-License.html')) {
+foreach ($taskNotice in @('LICENSE','licenses/THIRD-PARTY-LICENSES.txt','licenses/WebView2-Fixed-License.html')) {
   Copy-Item -LiteralPath $taskNotice -Destination (Join-Path $taskPortable (Split-Path $taskNotice -Leaf))
 }
 $taskCommit = git rev-parse HEAD
@@ -75,7 +75,7 @@ $taskProbe = Join-Path $taskRoot 'src-tauri/target/release/spacefold-probe.exe'
 $taskSqlite = & $taskProbe version | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or -not $taskSqlite.sqliteCompileOptions.threadsafe1 -or -not $taskSqlite.sqliteCompileOptions.enableApiArmor -or $taskSqlite.sqliteThreadsafe -ne 1) { throw 'Packaged probe SQLite threading/API checks were not verified' }
 $taskAssets = @(Get-ChildItem -LiteralPath 'dist/assets' -File | ForEach-Object { [ordered]@{name=$_.Name;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()} })
-[ordered]@{version=$taskVersion;sourceCommit=$taskCommit;scannerSourceCommit='a61e19e6db35a6721d051c89db6e3ba487474561';benchmarkProbeSha256='c0bb7f00f6e2d8f5551ec8e39f7a0cc8e63217fa6b5e92c6e5dfde965301ef84';frozenBenchmarkProbePath='artifacts/perf-round2/probes/spacefold-probe-final-a61e19e6.exe';probeFingerprintBoundary='probeSha256 identifies this packaged build; benchmarkProbeSha256 identifies the immutable performance build before portable startup changes';builtAt=(Get-Date).ToString('o');rust=(cargo --version);rustc=(rustc --version);node=(node --version);npm=(npm --version);frontendLockSha256=(Get-FileHash package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant();rustLockSha256=(Get-FileHash src-tauri/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant();productionFeatures=@('desktop','custom-protocol');probeSha256=(Get-FileHash -LiteralPath $taskProbe -Algorithm SHA256).Hash.ToLowerInvariant();sqlite=$taskSqlite;frontendAssets=$taskAssets;fixedRuntime=[ordered]@{version=$taskRuntimeVersion;architecture='x64';officialSource=$taskRuntimeUrl;cabSha256=$taskCabHash;executableSha256=(Get-FileHash -LiteralPath $taskRuntimeExecutable.FullName -Algorithm SHA256).Hash.ToLowerInvariant();microsoftSignature=$taskSignature.Status.ToString();unpackedBytes=$taskRuntimeBytes}} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $taskOutput 'BUILDINFO.json') -Encoding utf8
+[ordered]@{version=$taskVersion;sourceCommit=$taskCommit;builtAt=(Get-Date).ToString('o');rust=(cargo --version);rustc=(rustc --version);node=(node --version);npm=(npm --version);frontendLockSha256=(Get-FileHash package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant();rustLockSha256=(Get-FileHash src-tauri/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant();productionFeatures=@('desktop','custom-protocol');probeSha256=(Get-FileHash -LiteralPath $taskProbe -Algorithm SHA256).Hash.ToLowerInvariant();sqlite=$taskSqlite;frontendAssets=$taskAssets;fixedRuntime=[ordered]@{version=$taskRuntimeVersion;architecture='x64';officialSource=$taskRuntimeUrl;cabSha256=$taskCabHash;executableSha256=(Get-FileHash -LiteralPath $taskRuntimeExecutable.FullName -Algorithm SHA256).Hash.ToLowerInvariant();microsoftSignature=$taskSignature.Status.ToString();unpackedBytes=$taskRuntimeBytes}} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $taskOutput 'BUILDINFO.json') -Encoding utf8
 Copy-Item -LiteralPath (Join-Path $taskOutput 'BUILDINFO.json') -Destination (Join-Path $taskPortable 'BUILDINFO.json')
 @'
 间隙 Spacefold
