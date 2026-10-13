@@ -55,6 +55,7 @@ struct ScanProfile {
     directory_metadata_apply_ms: f64,
     directory_metadata_updates: usize,
     directory_write_sql: crate::repository::DirectoryWriteSqlStats,
+    directory_write_mode: crate::repository::DirectoryWriteMode,
     max_flush_ms: f64,
     peak_batch_entries: usize,
     peak_batch_path_bytes: usize,
@@ -1205,6 +1206,11 @@ fn scan_sync_serial_with_queue_capacity(
         directory_readers: readers,
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "serial",
+        directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
+            std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
+                .ok()
+                .as_deref(),
+        ),
         checkpoint_mode: "off",
         output_slots,
         // crossbeam's bounded slot holds one atomic stamp and the message,
@@ -2052,6 +2058,7 @@ fn flush_batch_with_errors(
             profile.pending_insert_ms += timings.pending_ms;
         }
         drop(inserter);
+        let row_insert_ms = milliseconds(insert_started);
         let metadata_started = profile.enabled.then(Instant::now);
         let mut sql_probe = profile
             .enabled
@@ -2059,26 +2066,51 @@ fn flush_batch_with_errors(
         if profile.enabled {
             profile.directory_metadata_updates += directory_updates.len();
         }
-        for update in directory_updates.drain(..) {
-            crate::repository::apply_directory_metadata_observed(
+        let fusion = if profile.directory_write_mode.fused() {
+            crate::repository::prepare_directory_fusion(
                 &tx,
                 scan_id,
-                &update,
+                directory_updates,
+                &aggregates,
+                !errors.is_empty(),
+                sql_probe.as_mut(),
+            )?
+        } else {
+            None
+        };
+        let aggregation = if let Some(plan) = fusion {
+            let result = plan.apply(&tx, scan_id, sql_probe.as_mut())?;
+            // Eligibility excludes error-bearing batches, so this remains an
+            // empty no-op and error order is unchanged on every fallback.
+            writer_pipeline::persist_errors(&tx, scan_id, errors)?;
+            profile.directory_metadata_apply_ms += result.metadata_ms;
+            profile.insert_ms += row_insert_ms + result.metadata_ms;
+            profile.aggregate_ms += result.aggregate_ms;
+            result.aggregate
+        } else {
+            for update in directory_updates.iter() {
+                crate::repository::apply_directory_metadata_observed(
+                    &tx,
+                    scan_id,
+                    update,
+                    sql_probe.as_mut(),
+                )?;
+            }
+            writer_pipeline::persist_errors(&tx, scan_id, errors)?;
+            let metadata_ms = metadata_started.map_or(0.0, milliseconds);
+            profile.directory_metadata_apply_ms += metadata_ms;
+            profile.insert_ms += row_insert_ms + metadata_ms;
+            let aggregate_started = Instant::now();
+            let result = crate::repository::aggregate_many_observed(
+                &tx,
+                scan_id,
+                &aggregates,
                 sql_probe.as_mut(),
             )?;
-        }
-        writer_pipeline::persist_errors(&tx, scan_id, errors)?;
-        if let Some(started) = metadata_started {
-            profile.directory_metadata_apply_ms += milliseconds(started);
-        }
-        profile.insert_ms += milliseconds(insert_started);
-        let aggregate_started = Instant::now();
-        let aggregation = crate::repository::aggregate_many_observed(
-            &tx,
-            scan_id,
-            &aggregates,
-            sql_probe.as_mut(),
-        )?;
+            profile.aggregate_ms += milliseconds(aggregate_started);
+            result
+        };
+        directory_updates.clear();
         if let Some(probe) = sql_probe {
             profile.directory_write_sql.merge(probe.finish());
         }
@@ -2096,7 +2128,6 @@ fn flush_batch_with_errors(
         tx.execute("DELETE FROM consumed_dirs", [])?;
         #[cfg(test)]
         writer_pipeline::test_before_commit(scan_id, &service.repo.data_dir);
-        profile.aggregate_ms += milliseconds(aggregate_started);
         let commit_started = Instant::now();
         let commit_window = profile
             .reader_wait_probe

@@ -1862,6 +1862,472 @@ pub fn check_directory_metadata_complete(c: &Connection, scan_id: &str) -> Resul
 mod directory_metadata_tests {
     use super::*;
     use crate::service::Service;
+    const FUSION_COLUMNS: &str = "id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,stale,error_code,search_path";
+    fn copy_scan(service: &Service, seed: &str) -> String {
+        let root = service.repo.node(seed, "1", None).unwrap().path;
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute(&format!("INSERT INTO nodes(scan_id,{FUSION_COLUMNS}) SELECT ?2,{FUSION_COLUMNS} FROM nodes WHERE scan_id=?1"),params![seed,id]).unwrap();
+        tx.execute("INSERT INTO pending_dirs SELECT ?2,id,path,depth,expected_identity,metadata_deferred FROM pending_dirs WHERE scan_id=?1",params![seed,id]).unwrap();
+        tx.execute("INSERT INTO directory_metadata_pending SELECT ?2,id FROM directory_metadata_pending WHERE scan_id=?1",params![seed,id]).unwrap();
+        tx.execute("UPDATE scans SET discovered=(SELECT discovered FROM scans WHERE id=?1),revision=(SELECT revision FROM scans WHERE id=?1),status=(SELECT status FROM scans WHERE id=?1),error_count=(SELECT error_count FROM scans WHERE id=?1) WHERE id=?2",params![seed,id]).unwrap();
+        tx.commit().unwrap();
+        id
+    }
+    fn raw_nodes(c: &Connection, scan: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut select = c
+            .prepare(&format!(
+                "SELECT {FUSION_COLUMNS} FROM nodes WHERE scan_id=?1 ORDER BY id"
+            ))
+            .unwrap();
+        let columns = select.column_count();
+        select
+            .query_map([scan], |r| (0..columns).map(|i| r.get(i)).collect())
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+    fn run_directory_write(
+        tx: &Transaction<'_>,
+        scan: &str,
+        updates: &[DirectoryMetadataUpdate],
+        direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+        fused: bool,
+    ) -> DirectoryWriteSqlStats {
+        let mut probe = DirectoryWriteSqlProbe::default();
+        let plan = if fused {
+            prepare_directory_fusion(tx, scan, updates, direct, false, Some(&mut probe)).unwrap()
+        } else {
+            None
+        };
+        if let Some(plan) = plan {
+            plan.apply(tx, scan, Some(&mut probe)).unwrap();
+        } else {
+            for update in updates {
+                apply_directory_metadata_observed(tx, scan, update, Some(&mut probe)).unwrap();
+            }
+            aggregate_many_observed(tx, scan, direct, Some(&mut probe)).unwrap();
+        }
+        probe.finish()
+    }
+    #[test]
+    fn fused_directory_writes_match_all_stored_fields_for_signed_and_zero_deltas_and_metadata_only_rows(
+    ) {
+        for changed_mtime in [0, 1, 2] {
+            for sign in [-1, 0, 1] {
+                let (_temp, service, seed, child, mut complete) = setup();
+                let file = child.join("file");
+                std::fs::write(
+                    &file,
+                    if sign == 0 {
+                        b"".as_slice()
+                    } else {
+                        b"abc".as_slice()
+                    },
+                )
+                .unwrap();
+                let meta = platform::metadata(&file).unwrap();
+                let other = child.parent().unwrap().join("metadata-only");
+                std::fs::create_dir(&other).unwrap();
+                let other_complete = platform::metadata(&other).unwrap();
+                let mut partial = other_complete.clone();
+                partial.links = None;
+                let mut c = service.repo.connect().unwrap();
+                let tx = c.transaction().unwrap();
+                insert_node(&tx, &seed, 4, Some(1), &other, 1, &partial, None).unwrap();
+                if sign < 0 {
+                    insert_node(&tx, &seed, 3, Some(2), &file, 2, &meta, None).unwrap();
+                }
+                tx.commit().unwrap();
+                let separate = copy_scan(&service, &seed);
+                let fused = copy_scan(&service, &seed);
+                if changed_mtime == 1 {
+                    complete.modified = Some("2020-01-01T00:00:00+00:00".into());
+                } else if changed_mtime == 2 {
+                    complete.modified = None;
+                }
+                let updates = vec![
+                    DirectoryMetadataUpdate {
+                        id: 2,
+                        expected_identity: complete.identity.clone().unwrap(),
+                        result: Ok(complete),
+                    },
+                    DirectoryMetadataUpdate {
+                        id: 4,
+                        expected_identity: other_complete.identity.clone().unwrap(),
+                        result: Ok(other_complete),
+                    },
+                ];
+                let multiplier = if sign < 0 { -1 } else { 1 };
+                let direct = std::collections::BTreeMap::from([(
+                    2,
+                    [
+                        integer(meta.logical).unwrap() * multiplier,
+                        meta.allocated
+                            .map(integer)
+                            .transpose()
+                            .unwrap()
+                            .unwrap_or(0)
+                            * multiplier,
+                        i64::from(meta.allocated.is_none()) * multiplier,
+                        multiplier,
+                        0,
+                        multiplier,
+                    ],
+                )]);
+                let mut summaries = Vec::new();
+                for (id, enabled) in [(&separate, false), (&fused, true)] {
+                    let tx = c.transaction().unwrap();
+                    if sign < 0 {
+                        tx.execute("DELETE FROM nodes WHERE scan_id=?1 AND id=3", [id])
+                            .unwrap();
+                    } else {
+                        insert_node_shallow(&tx, id, 3, Some(2), &file, 2, &meta, None).unwrap();
+                    }
+                    summaries.push(run_directory_write(&tx, id, &updates, &direct, enabled));
+                    tx.commit().unwrap();
+                }
+                assert_eq!(
+                    raw_nodes(&c, &separate),
+                    raw_nodes(&c, &fused),
+                    "mtime={changed_mtime} sign={sign}"
+                );
+                assert_eq!(
+                    service.repo.scan(&separate).unwrap().discovered_count,
+                    service.repo.scan(&fused).unwrap().discovered_count
+                );
+                let a = &summaries[0];
+                let b = &summaries[1];
+                assert_eq!(a.metadata_select_calls + a.aggregate_node_select_calls, 4);
+                assert_eq!(b.metadata_select_calls + b.aggregate_node_select_calls, 3);
+                assert_eq!(
+                    a.metadata_payload_update_calls + a.aggregate_node_update_calls,
+                    4
+                );
+                assert_eq!(
+                    b.metadata_payload_update_calls
+                        + b.aggregate_node_update_calls
+                        + b.fusion_joint_update_calls,
+                    3
+                );
+                assert_eq!(b.fusion_joint_update_calls, 1);
+                assert_eq!(b.fusion_applied_batches, 1);
+                assert_eq!(b.aggregate_graph_rows, 2); // Metadata-only ID4 is not an aggregate root.
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM directory_metadata_pending WHERE scan_id IN(?1,?2)",
+                        params![separate, fused],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    if sign == 0 {
+                        b"".as_slice()
+                    } else {
+                        b"abc".as_slice()
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn fusion_preflight_fallbacks_never_write_a_prefix_and_keep_original_error_order() {
+        for reason in ["duplicate", "links", "error", "legacy", "budget", "graph"] {
+            let (_temp, service, seed, child, complete) = setup();
+            if reason == "legacy" {
+                let revision = service.repo.scan(&seed).unwrap().revision;
+                service.measure_node(&seed, "2", revision).unwrap();
+            }
+            let separate = copy_scan(&service, &seed);
+            let candidate = copy_scan(&service, &seed);
+            let mut meta = complete.clone();
+            if reason == "links" {
+                meta.links = None;
+            }
+            let mut updates = vec![DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: if reason == "error" {
+                    Err(AppError::new("READ_FAILED", "own fixture"))
+                } else {
+                    Ok(meta)
+                },
+            }];
+            if reason == "duplicate" {
+                updates.push(DirectoryMetadataUpdate {
+                    id: 2,
+                    expected_identity: complete.identity.clone().unwrap(),
+                    result: Ok(complete),
+                });
+            }
+            let direct = std::collections::BTreeMap::from([(2, [0, 0, 0, 0, 0, 0])]);
+            let mut c = service.repo.connect().unwrap();
+            let tx = c.transaction().unwrap();
+            let before = raw_nodes(&tx, &candidate);
+            let mut probe = DirectoryWriteSqlProbe::default();
+            let plan = prepare_directory_fusion_with_limits(
+                &tx,
+                &candidate,
+                &updates,
+                &direct,
+                false,
+                if reason == "budget" { 1 } else { 1024 * 1024 },
+                if reason == "graph" { 1 } else { 32768 },
+                Some(&mut probe),
+            )
+            .unwrap();
+            assert!(plan.is_none(), "{reason}");
+            assert_eq!(raw_nodes(&tx, &candidate), before, "{reason} wrote prefix");
+            for update in &updates {
+                apply_directory_metadata_observed(&tx, &candidate, update, Some(&mut probe))
+                    .unwrap();
+            }
+            aggregate_many_observed(&tx, &candidate, &direct, Some(&mut probe)).unwrap();
+            let stats = probe.finish();
+            assert_eq!(stats.fusion_applied_batches, 0);
+            assert_eq!(
+                stats.fusion_fallback_issue_batches
+                    + stats.fusion_fallback_duplicate_batches
+                    + stats.fusion_fallback_legacy_batches
+                    + stats.fusion_fallback_budget_batches
+                    + stats.fusion_fallback_graph_limit_batches,
+                1
+            );
+            tx.commit().unwrap();
+            let tx = c.transaction().unwrap();
+            run_directory_write(&tx, &separate, &updates, &direct, false);
+            tx.commit().unwrap();
+            assert_eq!(
+                raw_nodes(&c, &candidate),
+                raw_nodes(&c, &separate),
+                "{reason}"
+            );
+            let errors = |id: &str| {
+                c.prepare("SELECT payload FROM scan_errors WHERE scan_id=?1 ORDER BY id")
+                    .unwrap()
+                    .query_map([id], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(errors(&candidate), errors(&separate));
+            assert_eq!(
+                service.repo.scan(&candidate).unwrap().error_count,
+                service.repo.scan(&separate).unwrap().error_count
+            );
+            assert_eq!(std::fs::read_dir(&child).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    fn fusion_checks_identity_and_overflow_before_updates_and_rolls_back_late_sql_failure() {
+        for failure in ["identity", "overflow", "negative", "cycle", "late-sql"] {
+            let (_temp, service, scan, child, complete) = setup();
+            let file = child.join("file");
+            std::fs::write(&file, b"abc").unwrap();
+            let meta = platform::metadata(&file).unwrap();
+            let mut c = service.repo.connect().unwrap();
+            if failure == "identity" {
+                c.execute("UPDATE nodes SET payload=json_set(payload,'$.i','changed') WHERE scan_id=?1 AND id=2",[&scan]).unwrap();
+            }
+            if failure == "overflow" {
+                c.execute(
+                    "UPDATE nodes SET logical_total=?2 WHERE scan_id=?1 AND id=1",
+                    params![scan, i64::MAX],
+                )
+                .unwrap();
+            }
+            if failure == "cycle" {
+                c.execute(
+                    "UPDATE nodes SET parent_id=2 WHERE scan_id=?1 AND id=1",
+                    [&scan],
+                )
+                .unwrap();
+            }
+            if failure == "late-sql" {
+                c.execute_batch("CREATE TEMP TRIGGER reject_joint BEFORE UPDATE ON nodes WHEN NEW.id=2 BEGIN SELECT RAISE(ABORT,'own fixture failure'); END;").unwrap();
+            }
+            let baseline = raw_nodes(&c, &scan);
+            let tx = c.transaction().unwrap();
+            insert_node_shallow(&tx, &scan, 3, Some(2), &file, 2, &meta, None).unwrap();
+            let before = raw_nodes(&tx, &scan);
+            let updates = [DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: Ok(complete),
+            }];
+            let mut direct = std::collections::BTreeMap::from([(
+                2,
+                [
+                    3,
+                    meta.allocated
+                        .map(integer)
+                        .transpose()
+                        .unwrap()
+                        .unwrap_or(0),
+                    0,
+                    1,
+                    0,
+                    1,
+                ],
+            )]);
+            if failure == "negative" {
+                for value in direct.get_mut(&2).unwrap() {
+                    *value = -*value;
+                }
+            }
+            let prepared = prepare_directory_fusion(&tx, &scan, &updates, &direct, false, None);
+            if failure == "late-sql" {
+                assert!(prepared.unwrap().unwrap().apply(&tx, &scan, None).is_err());
+            } else {
+                let error = match prepared {
+                    Err(error) => error,
+                    _ => panic!("{failure} was admitted"),
+                };
+                assert_eq!(
+                    error.code,
+                    if failure == "identity" {
+                        "SOURCE_CHANGED"
+                    } else if failure == "cycle" {
+                        "CORRUPT_HIERARCHY"
+                    } else {
+                        "SIZE_OUT_OF_RANGE"
+                    }
+                );
+                assert_eq!(raw_nodes(&tx, &scan), before);
+            }
+            drop(tx);
+            assert_eq!(raw_nodes(&c, &scan), baseline, "{failure}");
+            assert_eq!(std::fs::read(&file).unwrap(), b"abc");
+        }
+    }
+    #[test]
+    fn fusion_payload_capacity_budget_rejects_after_a_valid_prefix_without_updating_it() {
+        let (_temp, service, scan, child, complete) = setup();
+        let other = child.parent().unwrap().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut other_complete = platform::metadata(&other).unwrap();
+        let mut partial = other_complete.clone();
+        partial.links = None;
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        insert_node(&tx, &scan, 4, Some(1), &other, 1, &partial, None).unwrap();
+        tx.commit().unwrap();
+        other_complete.link_target = Some("x".repeat(4096));
+        let updates = [
+            DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: Ok(complete),
+            },
+            DirectoryMetadataUpdate {
+                id: 4,
+                expected_identity: other_complete.identity.clone().unwrap(),
+                result: Ok(other_complete),
+            },
+        ];
+        let direct = std::collections::BTreeMap::from([(2, [0; 6])]);
+        let tx = c.transaction().unwrap();
+        let before = raw_nodes(&tx, &scan);
+        let mut probe = DirectoryWriteSqlProbe::default();
+        assert!(prepare_directory_fusion_with_limits(
+            &tx,
+            &scan,
+            &updates,
+            &direct,
+            false,
+            2048,
+            32768,
+            Some(&mut probe)
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(raw_nodes(&tx, &scan), before);
+        assert_eq!(probe.stats.fusion_preflight_metadata_select_calls, 2);
+        assert_eq!(probe.stats.fusion_fallback_budget_batches, 1);
+        assert_eq!(probe.stats.metadata_calls, 0); // A rejected prefix is not duplicate input.
+        assert_eq!(
+            tx.query_row(
+                "SELECT count(*) FROM directory_metadata_pending WHERE scan_id=?1",
+                [&scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        for update in &updates {
+            apply_directory_metadata_observed(&tx, &scan, update, Some(&mut probe)).unwrap();
+        }
+        aggregate_many_observed(&tx, &scan, &direct, Some(&mut probe)).unwrap();
+        let stats = probe.finish();
+        assert_eq!(stats.metadata_calls, 2);
+        assert_eq!(stats.metadata_duplicate_ids, 0);
+        tx.commit().unwrap();
+        assert!(service
+            .repo
+            .node(&scan, "2", None)
+            .unwrap()
+            .node
+            .link_count
+            .is_some());
+    }
+    #[test]
+    fn fusion_conditional_sql_preserves_index_omissions_and_exact_private_mode() {
+        let (_temp, service, _scan, _child, _complete) = setup();
+        let c = service.repo.connect().unwrap();
+        let size_root: i64 = c
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='nodes_parent_size_v3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let special_root: i64 = c
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='nodes_special_kind_v2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (sql, timed, logical) in [
+            (FUSED_PAYLOAD_VALUES_UPDATE, false, true),
+            (FUSED_TIMED_PAYLOAD_VALUES_UPDATE, true, true),
+            (FUSED_PAYLOAD_NON_LOGICAL_UPDATE, false, false),
+            (FUSED_TIMED_PAYLOAD_NON_LOGICAL_UPDATE, true, false),
+        ] {
+            let mut statement = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            let writes = statement
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n(
+                        rusqlite::types::Value::Null,
+                        10,
+                    )),
+                    |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)),
+                )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                writes
+                    .iter()
+                    .any(|(op, page)| op == "OpenWrite" && *page == size_root),
+                logical
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .any(|(op, page)| op == "OpenWrite" && *page == special_root),
+                logical || timed
+            );
+        }
+        assert!(!DirectoryWriteMode::from_override(Some("off")).fused());
+        assert!(DirectoryWriteMode::from_override(None).fused());
+        assert!(DirectoryWriteMode::from_override(Some("OFF")).fused());
+    }
     fn setup() -> (
         tempfile::TempDir,
         std::sync::Arc<Service>,
@@ -2319,6 +2785,19 @@ pub(crate) struct DirectoryWriteSqlStats {
     candidate_zero_logical_delta_rows: usize,
     tracking_truncated_batches: usize,
     peak_tracked_metadata_ids: usize,
+    fusion_attempted_batches: usize,
+    fusion_applied_batches: usize,
+    fusion_empty_metadata_batches: usize,
+    fusion_fallback_issue_batches: usize,
+    fusion_fallback_duplicate_batches: usize,
+    fusion_fallback_legacy_batches: usize,
+    fusion_fallback_budget_batches: usize,
+    fusion_fallback_graph_limit_batches: usize,
+    fusion_joint_update_calls: usize,
+    fusion_preflight_metadata_select_calls: usize,
+    fusion_saved_select_calls: usize,
+    fusion_saved_update_calls: usize,
+    fusion_patch_peak_owned_bytes: usize,
 }
 impl DirectoryWriteSqlStats {
     pub(crate) fn merge(&mut self, other: Self) {
@@ -2346,11 +2825,26 @@ impl DirectoryWriteSqlStats {
             candidate_saved_update_calls,
             candidate_same_mtime_rows,
             candidate_zero_logical_delta_rows,
-            tracking_truncated_batches
+            tracking_truncated_batches,
+            fusion_attempted_batches,
+            fusion_applied_batches,
+            fusion_empty_metadata_batches,
+            fusion_fallback_issue_batches,
+            fusion_fallback_duplicate_batches,
+            fusion_fallback_legacy_batches,
+            fusion_fallback_budget_batches,
+            fusion_fallback_graph_limit_batches,
+            fusion_joint_update_calls,
+            fusion_preflight_metadata_select_calls,
+            fusion_saved_select_calls,
+            fusion_saved_update_calls
         );
         self.peak_tracked_metadata_ids = self
             .peak_tracked_metadata_ids
             .max(other.peak_tracked_metadata_ids);
+        self.fusion_patch_peak_owned_bytes = self
+            .fusion_patch_peak_owned_bytes
+            .max(other.fusion_patch_peak_owned_bytes);
     }
 }
 #[derive(Default)]
@@ -2371,6 +2865,7 @@ pub(crate) struct DirectoryWriteSqlProbe {
     metadata: std::collections::HashMap<i64, MetadataSqlEntry>,
     truncated: bool,
     fallback: bool,
+    fused: bool,
 }
 impl DirectoryWriteSqlProbe {
     fn metadata_call(&mut self, id: i64) {
@@ -2393,7 +2888,8 @@ impl DirectoryWriteSqlProbe {
                 usize::from(entry.payload_updates > 0 && entry.aggregate_write);
             // Duplicates and error-bearing completions retain the original
             // ordered path. A fallback/truncated batch is not a fusion claim.
-            let candidate = !self.fallback
+            let candidate = !self.fused
+                && !self.fallback
                 && !self.truncated
                 && entry.calls == 1
                 && entry.payload_updates == 1
@@ -2617,11 +3113,415 @@ pub struct AggregateStats {
     pub ancestor_rows: usize,
     pub coalesced: bool,
 }
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct AggregateRow {
     parent: Option<i64>,
     current: [i64; 6],
     delta: [i64; 6],
+}
+struct AggregatePlan {
+    rows: std::collections::BTreeMap<i64, AggregateRow>,
+    discovered: i64,
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DirectoryWriteMode {
+    Separate,
+    #[default]
+    Fused,
+}
+impl DirectoryWriteMode {
+    pub(crate) fn from_override(value: Option<&str>) -> Self {
+        if value == Some("off") {
+            Self::Separate
+        } else {
+            Self::Fused
+        }
+    }
+    pub(crate) fn fused(self) -> bool {
+        matches!(self, Self::Fused)
+    }
+}
+struct DirectoryPatch<'a> {
+    id: i64,
+    row: AggregateRow,
+    payload: String,
+    modified: Option<&'a str>,
+    modified_changed: bool,
+}
+struct DirectoryPatches<'a> {
+    entries: Vec<DirectoryPatch<'a>>,
+    index: std::collections::HashMap<i64, usize>,
+    payload_owned_bytes: usize,
+}
+impl DirectoryPatches<'_> {
+    fn owned_bytes(&self) -> usize {
+        // String capacities are exact. Fixed collection storage uses capacity,
+        // with a conservative per-bucket allowance for controls/alignment;
+        // allocator headers and the existing aggregate graph are separate.
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<DirectoryPatch<'_>>()
+            + (self.index.capacity() + 1) * (std::mem::size_of::<(i64, usize)>() + 16)
+            + self.payload_owned_bytes
+    }
+}
+pub(crate) struct DirectoryFusionPlan<'a> {
+    patches: DirectoryPatches<'a>,
+    aggregates: AggregatePlan,
+    direct_parents: usize,
+    metadata_ms: f64,
+    aggregate_ms: f64,
+}
+pub(crate) struct DirectoryFusionResult {
+    pub(crate) aggregate: AggregateStats,
+    pub(crate) metadata_ms: f64,
+    pub(crate) aggregate_ms: f64,
+}
+#[derive(Clone, Copy)]
+enum FusionFallback {
+    Empty,
+    Issue,
+    Duplicate,
+    Legacy,
+    Budget,
+    GraphLimit,
+}
+fn fusion_fallback(probe: Option<&mut DirectoryWriteSqlProbe>, reason: FusionFallback) {
+    if let Some(probe) = probe {
+        probe.fallback = true;
+        match reason {
+            FusionFallback::Empty => probe.stats.fusion_empty_metadata_batches += 1,
+            FusionFallback::Issue => probe.stats.fusion_fallback_issue_batches += 1,
+            FusionFallback::Duplicate => probe.stats.fusion_fallback_duplicate_batches += 1,
+            FusionFallback::Legacy => probe.stats.fusion_fallback_legacy_batches += 1,
+            FusionFallback::Budget => probe.stats.fusion_fallback_budget_batches += 1,
+            FusionFallback::GraphLimit => probe.stats.fusion_fallback_graph_limit_batches += 1,
+        }
+    }
+}
+pub(crate) fn prepare_directory_fusion<'a>(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    updates: &'a [DirectoryMetadataUpdate],
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    has_errors: bool,
+    probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<Option<DirectoryFusionPlan<'a>>> {
+    prepare_directory_fusion_with_limits(
+        tx,
+        scan_id,
+        updates,
+        direct,
+        has_errors,
+        1024 * 1024,
+        32_768,
+        probe,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Testable, separate patch and graph bounds.
+fn prepare_directory_fusion_with_limits<'a>(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    updates: &'a [DirectoryMetadataUpdate],
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    has_errors: bool,
+    patch_bytes: usize,
+    graph_rows: usize,
+    mut probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<Option<DirectoryFusionPlan<'a>>> {
+    let metadata_started = probe.as_ref().map(|_| Instant::now());
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.stats.fusion_attempted_batches += 1;
+    }
+    let reason = if has_errors
+        || updates.iter().any(|u| match &u.result {
+            Err(_) => true,
+            Ok(m) => {
+                m.kind != "directory"
+                    || !m.recurse
+                    || m.identity.as_deref() != Some(&u.expected_identity)
+                    || m.logical != 0
+                    || m.allocated != Some(0)
+                    || m.links.is_none()
+            }
+        }) {
+        Some(FusionFallback::Issue)
+    } else if updates.is_empty() {
+        Some(FusionFallback::Empty)
+    } else if updates.len() > 2048 {
+        Some(FusionFallback::Budget)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        fusion_fallback(probe, reason);
+        return Ok(None);
+    }
+    let mut patches = DirectoryPatches {
+        entries: Vec::with_capacity(updates.len()),
+        index: std::collections::HashMap::with_capacity(updates.len()),
+        payload_owned_bytes: 0,
+    };
+    for (index, update) in updates.iter().enumerate() {
+        if patches.index.insert(update.id, index).is_some() {
+            fusion_fallback(probe, FusionFallback::Duplicate);
+            return Ok(None);
+        }
+    }
+    if patches.owned_bytes() > patch_bytes {
+        fusion_fallback(probe, FusionFallback::Budget);
+        return Ok(None);
+    }
+    let mut select = tx.prepare_cached("SELECT kind,payload,modified,parent_id,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count FROM nodes WHERE scan_id=?1 AND id=?2")?;
+    for update in updates {
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.metadata_select_calls += 1;
+            probe.stats.fusion_preflight_metadata_select_calls += 1;
+        }
+        let (kind, payload, modified, row): (String, String, Option<String>, AggregateRow) = select
+            .query_row(params![scan_id, update.id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    AggregateRow {
+                        parent: r.get(3)?,
+                        current: [
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                        ],
+                        ..Default::default()
+                    },
+                ))
+            })?;
+        if payload.capacity() > patch_bytes {
+            drop(payload);
+            fusion_fallback(probe, FusionFallback::Budget);
+            return Ok(None);
+        }
+        if !payload.starts_with("{\"v\":3") {
+            drop(payload);
+            fusion_fallback(probe, FusionFallback::Legacy);
+            return Ok(None);
+        }
+        let old: TinyPayload = serde_json::from_str(&payload)?;
+        if kind != "directory"
+            || old.i.as_deref() != Some(&update.expected_identity)
+            || old.b != 0
+            || old.a != Some(0)
+        {
+            return Err(AppError::new(
+                "SOURCE_CHANGED",
+                "待补目录记录的原身份或统计语义已改变，未覆盖元数据",
+            ));
+        }
+        let metadata = update.result.as_ref().unwrap(); // Eligibility was checked before all SELECTs.
+        let payload = serde_json::to_string(&TinyPayload::from_meta(metadata))?;
+        let modified_changed = metadata.modified != modified;
+        if patches.owned_bytes().saturating_add(payload.capacity()) > patch_bytes {
+            drop(payload);
+            fusion_fallback(probe, FusionFallback::Budget);
+            return Ok(None);
+        }
+        patches.payload_owned_bytes = patches
+            .payload_owned_bytes
+            .saturating_add(payload.capacity());
+        patches.entries.push(DirectoryPatch {
+            id: update.id,
+            row,
+            payload,
+            modified: metadata.modified.as_deref(),
+            modified_changed,
+        });
+        let owned = patches.owned_bytes();
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.fusion_patch_peak_owned_bytes =
+                probe.stats.fusion_patch_peak_owned_bytes.max(owned);
+        }
+        if owned > patch_bytes {
+            fusion_fallback(probe, FusionFallback::Budget);
+            return Ok(None);
+        }
+    }
+    drop(select);
+    let metadata_ms = metadata_started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
+    let aggregate_started = probe.as_ref().map(|_| Instant::now());
+    let Some(aggregates) = prepare_aggregate_plan(
+        tx,
+        scan_id,
+        direct,
+        graph_rows,
+        Some(&patches),
+        probe.as_deref_mut(),
+    )?
+    else {
+        fusion_fallback(probe, FusionFallback::GraphLimit);
+        return Ok(None);
+    };
+    if let Some(probe) = probe {
+        // Register each incoming completion once only after the whole plan is
+        // admitted. A rejected prefix's SELECTs remain counted, without making
+        // the original fallback look like duplicate incoming metadata.
+        for patch in &patches.entries {
+            probe.metadata_call(patch.id);
+            if let Some(entry) = probe.metadata.get_mut(&patch.id) {
+                entry.same_mtime = !patch.modified_changed;
+                entry.aggregate_read = aggregates.rows.contains_key(&patch.id);
+            }
+        }
+        probe.stats.fusion_saved_select_calls += patches
+            .entries
+            .iter()
+            .filter(|patch| aggregates.rows.contains_key(&patch.id))
+            .count();
+    }
+    Ok(Some(DirectoryFusionPlan {
+        patches,
+        aggregates,
+        direct_parents: direct.len(),
+        metadata_ms,
+        aggregate_ms: aggregate_started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0),
+    }))
+}
+const FUSED_PAYLOAD_VALUES_UPDATE: &str = "UPDATE nodes SET payload=?3,logical_total=?5,allocated_total=?6,allocated_unknown=?7,file_count=?8,dir_count=?9,children_count=?10 WHERE scan_id=?1 AND id=?2";
+const FUSED_TIMED_PAYLOAD_VALUES_UPDATE: &str = "UPDATE nodes SET payload=?3,modified=?4,logical_total=?5,allocated_total=?6,allocated_unknown=?7,file_count=?8,dir_count=?9,children_count=?10 WHERE scan_id=?1 AND id=?2";
+const FUSED_PAYLOAD_NON_LOGICAL_UPDATE: &str = "UPDATE nodes SET payload=?3,allocated_total=?6,allocated_unknown=?7,file_count=?8,dir_count=?9,children_count=?10 WHERE scan_id=?1 AND id=?2";
+const FUSED_TIMED_PAYLOAD_NON_LOGICAL_UPDATE: &str = "UPDATE nodes SET payload=?3,modified=?4,allocated_total=?6,allocated_unknown=?7,file_count=?8,dir_count=?9,children_count=?10 WHERE scan_id=?1 AND id=?2";
+impl DirectoryFusionPlan<'_> {
+    pub(crate) fn apply(
+        mut self,
+        tx: &Transaction<'_>,
+        scan_id: &str,
+        mut probe: Option<&mut DirectoryWriteSqlProbe>,
+    ) -> Result<DirectoryFusionResult> {
+        let aggregate_started = probe.as_ref().map(|_| Instant::now());
+        let mut fused = [
+            tx.prepare_cached(FUSED_PAYLOAD_VALUES_UPDATE)?,
+            tx.prepare_cached(FUSED_TIMED_PAYLOAD_VALUES_UPDATE)?,
+            tx.prepare_cached(FUSED_PAYLOAD_NON_LOGICAL_UPDATE)?,
+            tx.prepare_cached(FUSED_TIMED_PAYLOAD_NON_LOGICAL_UPDATE)?,
+        ];
+        let mut values = tx.prepare_cached(AGGREGATE_VALUES_UPDATE)?;
+        let mut non_logical = tx.prepare_cached(AGGREGATE_NON_LOGICAL_UPDATE)?;
+        for (id, row) in &self.aggregates.rows {
+            if row.delta == [0; 6] {
+                continue;
+            }
+            if let Some(index) = self.patches.index.get(id) {
+                let patch = &self.patches.entries[*index];
+                let statement =
+                    usize::from(patch.modified_changed) + 2 * usize::from(row.delta[0] == 0);
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.stats.fusion_joint_update_calls += 1;
+                    probe.stats.fusion_saved_update_calls += 1;
+                    if let Some(entry) = probe.metadata.get_mut(id) {
+                        entry.payload_updates += 1;
+                        entry.aggregate_write = true;
+                        entry.zero_logical_delta = row.delta[0] == 0;
+                    }
+                }
+                fused[statement].execute(params![
+                    scan_id,
+                    id,
+                    patch.payload,
+                    patch.modified,
+                    row.current[0],
+                    row.current[1],
+                    row.current[2],
+                    row.current[3],
+                    row.current[4],
+                    row.current[5]
+                ])?;
+            } else if row.delta[0] == 0 {
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.stats.aggregate_node_update_calls += 1;
+                }
+                non_logical.execute(params![
+                    scan_id,
+                    id,
+                    row.current[1],
+                    row.current[2],
+                    row.current[3],
+                    row.current[4],
+                    row.current[5]
+                ])?;
+            } else {
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.stats.aggregate_node_update_calls += 1;
+                }
+                values.execute(params![
+                    scan_id,
+                    id,
+                    row.current[0],
+                    row.current[1],
+                    row.current[2],
+                    row.current[3],
+                    row.current[4],
+                    row.current[5]
+                ])?;
+            }
+        }
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.aggregate_scan_update_calls += 1;
+        }
+        tx.execute(
+            "UPDATE scans SET discovered=?2 WHERE id=?1",
+            params![scan_id, self.aggregates.discovered],
+        )?;
+        self.aggregate_ms += aggregate_started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
+        let metadata_started = probe.as_ref().map(|_| Instant::now());
+        let mut payload = tx.prepare_cached(DIRECTORY_PAYLOAD_UPDATE)?;
+        let mut timed_payload = tx.prepare_cached(DIRECTORY_TIMED_PAYLOAD_UPDATE)?;
+        let mut remove =
+            tx.prepare_cached("DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id=?2")?;
+        for patch in &self.patches.entries {
+            if !self
+                .aggregates
+                .rows
+                .get(&patch.id)
+                .is_some_and(|r| r.delta != [0; 6])
+            {
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.stats.metadata_payload_update_calls += 1;
+                    if let Some(entry) = probe.metadata.get_mut(&patch.id) {
+                        entry.payload_updates += 1;
+                    }
+                }
+                if patch.modified_changed {
+                    timed_payload.execute(params![
+                        scan_id,
+                        patch.id,
+                        patch.payload,
+                        patch.modified
+                    ])?;
+                } else {
+                    payload.execute(params![scan_id, patch.id, patch.payload])?;
+                }
+            }
+            if let Some(probe) = probe.as_deref_mut() {
+                probe.stats.metadata_marker_delete_calls += 1;
+            }
+            remove.execute(params![scan_id, patch.id])?;
+        }
+        self.metadata_ms += metadata_started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
+        if let Some(probe) = probe {
+            probe.fused = true;
+            probe.stats.fusion_applied_batches += 1;
+        }
+        Ok(DirectoryFusionResult {
+            aggregate: AggregateStats {
+                direct_parents: self.direct_parents,
+                ancestor_rows: self.aggregates.rows.len(),
+                coalesced: true,
+            },
+            metadata_ms: self.metadata_ms,
+            aggregate_ms: self.aggregate_ms,
+        })
+    }
 }
 const AGGREGATE_VALUES_UPDATE: &str = "UPDATE nodes SET logical_total=?3,allocated_total=?4,allocated_unknown=?5,file_count=?6,dir_count=?7,children_count=?8 WHERE scan_id=?1 AND id=?2";
 const AGGREGATE_NON_LOGICAL_UPDATE: &str = "UPDATE nodes SET allocated_total=?3,allocated_unknown=?4,file_count=?5,dir_count=?6,children_count=?7 WHERE scan_id=?1 AND id=?2";
@@ -2652,13 +3552,14 @@ fn aggregate_many_with_limit(
 ) -> Result<AggregateStats> {
     aggregate_many_with_limit_observed(tx, scan_id, direct, limit, None)
 }
-fn aggregate_many_with_limit_observed(
+fn prepare_aggregate_plan(
     tx: &Transaction<'_>,
     scan_id: &str,
     direct: &std::collections::BTreeMap<i64, [i64; 6]>,
     limit: usize,
+    patches: Option<&DirectoryPatches<'_>>,
     mut probe: Option<&mut DirectoryWriteSqlProbe>,
-) -> Result<AggregateStats> {
+) -> Result<Option<AggregatePlan>> {
     fn add_delta(a: i64, b: i64) -> Result<i64> {
         a.checked_add(b)
             .ok_or_else(|| AppError::new("SIZE_OUT_OF_RANGE", "扫描增量超过支持的精确整数范围"))
@@ -2679,40 +3580,21 @@ fn aggregate_many_with_limit_observed(
                 break;
             }
             if rows.len() >= limit {
-                drop(load);
-                drop(rows);
-                if let Some(probe) = probe.as_deref_mut() {
-                    probe.fallback = true;
-                    probe.stats.aggregate_fallback_batches += 1;
-                }
-                for (parent, delta) in direct {
-                    aggregate_batch_observed(
-                        tx,
-                        scan_id,
-                        *parent,
-                        delta[0],
-                        delta[1],
-                        delta[2],
-                        delta[3],
-                        delta[4],
-                        delta[5],
-                        probe.as_deref_mut(),
-                    )?;
-                }
-                return Ok(AggregateStats {
-                    direct_parents: direct.len(),
-                    ancestor_rows: 0,
-                    coalesced: false,
-                });
+                return Ok(None);
             }
             if let Some(probe) = probe.as_deref_mut() {
-                probe.stats.aggregate_node_select_calls += 1;
                 if let Some(entry) = probe.metadata.get_mut(&id) {
                     entry.aggregate_read = true;
                 }
             }
-            let row = load
-                .query_row(params![scan_id, id], |r| {
+            let cached = patches.and_then(|p| p.index.get(&id).map(|index| p.entries[*index].row));
+            let row = if let Some(cached) = cached {
+                cached
+            } else {
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.stats.aggregate_node_select_calls += 1;
+                }
+                load.query_row(params![scan_id, id], |r| {
                     Ok(AggregateRow {
                         parent: r.get(0)?,
                         current: [
@@ -2727,7 +3609,8 @@ fn aggregate_many_with_limit_observed(
                     })
                 })
                 .optional()?
-                .ok_or_else(|| AppError::new("NODE_NOT_FOUND", "聚合父目录已不存在"))?;
+                .ok_or_else(|| AppError::new("NODE_NOT_FOUND", "聚合父目录已不存在"))?
+            };
             next = row.parent;
             rows.insert(id, row);
         }
@@ -2778,7 +3661,7 @@ fn aggregate_many_with_limit_observed(
     if visited != rows.len() {
         return Err(AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"));
     }
-    if let Some(probe) = probe.as_deref_mut() {
+    if let Some(probe) = probe {
         probe.stats.aggregate_scan_select_calls += 1;
     }
     let discovered: i64 = tx.query_row(
@@ -2798,6 +3681,42 @@ fn aggregate_many_with_limit_observed(
             }
         }
     }
+    Ok(Some(AggregatePlan { rows, discovered }))
+}
+fn aggregate_many_with_limit_observed(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    limit: usize,
+    mut probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<AggregateStats> {
+    let Some(AggregatePlan { rows, discovered }) =
+        prepare_aggregate_plan(tx, scan_id, direct, limit, None, probe.as_deref_mut())?
+    else {
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.fallback = true;
+            probe.stats.aggregate_fallback_batches += 1;
+        }
+        for (parent, delta) in direct {
+            aggregate_batch_observed(
+                tx,
+                scan_id,
+                *parent,
+                delta[0],
+                delta[1],
+                delta[2],
+                delta[3],
+                delta[4],
+                delta[5],
+                probe.as_deref_mut(),
+            )?;
+        }
+        return Ok(AggregateStats {
+            direct_parents: direct.len(),
+            ancestor_rows: 0,
+            coalesced: false,
+        });
+    };
     // All sums are checked before the first UPDATE. The caller's transaction
     // also contains nodes, direct child counts, queue consumption and revision.
     let mut update = tx.prepare_cached(AGGREGATE_VALUES_UPDATE)?;

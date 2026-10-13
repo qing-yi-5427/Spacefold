@@ -1128,6 +1128,11 @@ pub(super) fn scan(
         directory_readers: plan.readers,
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "overlap",
+        directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
+            std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
+                .ok()
+                .as_deref(),
+        ),
         checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
@@ -1177,6 +1182,7 @@ pub(super) fn scan(
     let stop = Arc::new(AtomicBool::new(false));
     let writer_profile = ScanProfile {
         enabled,
+        directory_write_mode: profile.directory_write_mode,
         defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
