@@ -1,5 +1,5 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Scan, Node, NodePage, PageRequest, ChartData, ChartNode, SelectionSummary, Settings, Source, OperationRequest, OperationPlan, Job, JobEvent, ExportRequest, ExportPreview, ScanError } from './contracts';
+import type { Scan, Node, NodePage, PageRequest, ChartData, ChartNode, SelectionSummary, ViewSnapshot, ViewSnapshotRequest, Settings, Source, OperationRequest, OperationPlan, Job, JobEvent, ExportRequest, ExportPreview, ScanError } from './contracts';
 export type View = 'map'|'tree'|'lens';
 export const defaults: Settings = {schemaVersion:1,accent:'purple',theme:'system',sizeUnit:'decimal',defaultView:'tree',recentLocations:[],lastExportFormat:'csv'};
 export interface DataSource {
@@ -17,6 +17,7 @@ export interface DataSource {
   ancestors(scanId:string,nodeId:string,revision:number):Promise<Node[]>;
   chart(scanId:string,scopeId:string,revision:number):Promise<ChartData>;
   summary(scanId:string,nodeIds:string[],revision:number):Promise<SelectionSummary>;
+  viewSnapshot(request:ViewSnapshotRequest):Promise<ViewSnapshot>;
   errors(scanId:string,cursor?:string|null):Promise<{errors:ScanError[];nextCursor:string|null}>;
   plan(request:OperationRequest):Promise<OperationPlan>; execute(planId:string,callback:(event:JobEvent)=>void):Promise<Job>; cancelOperation(jobId:string):Promise<void>;
   open(scanId:string,nodeId:string,action:'open'|'reveal'|'properties'):Promise<void>; copyPaths(scanId:string,nodeIds:string[]):Promise<string>;
@@ -40,6 +41,7 @@ export class NativeDataSource implements DataSource {
   ancestors=(scanId:string,nodeId:string,revision:number)=>invoke<Node[]>('get_ancestors',{scanId,nodeId,revision});
   chart=(scanId:string,scopeId:string,revision:number)=>invoke<ChartData>('get_chart_data',{scanId,scopeId,revision,depth:2,nodeBudget:400});
   summary=(scanId:string,nodeIds:string[],revision:number)=>invoke<SelectionSummary>('get_selection_summary',{scanId,nodeIds,revision});
+  viewSnapshot=(request:ViewSnapshotRequest)=>invoke<ViewSnapshot>('get_view_snapshot',{request});
   errors=(scanId:string,cursor?:string|null)=>invoke<{errors:ScanError[];nextCursor:string|null}>('get_scan_errors',{scanId,cursor,pageSize:100});
   plan=(request:OperationRequest)=>invoke<OperationPlan>('plan_operation',{request});execute=(planId:string,callback:(event:JobEvent)=>void)=>invoke<Job>('execute_operation',{planId,onProgress:progress(callback)});
   cancelOperation=(jobId:string)=>invoke<void>('cancel_operation',{jobId});job=(jobId:string)=>invoke<JobEvent>('get_job',{jobId});
@@ -82,6 +84,22 @@ export class FixtureDataSource implements DataSource {
   async ancestors(_scanId:string,nodeId:string){const trail:Node[]=[];let p=this.data.nodes.get(nodeId)?.parentId;while(p){const n=this.data.nodes.get(p)!;trail.unshift(n);p=n.parentId;}return trail;}
   async chart(_scanId:string,scopeId:string){const build=(id:string,depth:number):ChartNode=>({node:this.data.nodes.get(id)!,children:depth<2?(this.data.children.get(id)||[]).map(child=>build(child.nodeId,depth+1)):[],otherCount:'0',otherBytes:'0'});return {revision:1,root:build(scopeId,0),truncated:false};}
   async summary(_scanId:string,ids:string[]){const normalizedIds=normalizeSelection(ids,this.data.nodes);const nodes=normalizedIds.map(id=>this.data.nodes.get(id)!);const root=nodes.some(n=>n.parentId===null);return {nodes,normalizedIds,coveredIds:ids.filter(id=>!normalizedIds.includes(id)),logicalTotalBytes:sumBytes(nodes).toString(),allocatedKnownTotalBytes:sumBytes(nodes).toString(),allocatedUnknownCount:'0',count:String(nodes.length),canOpen:nodes.length===1,canRename:nodes.length===1&&!root,canMove:!!nodes.length&&!root,canTrash:!!nodes.length&&!root};}
+  async viewSnapshot(request:ViewSnapshotRequest):Promise<ViewSnapshot>{
+    const scan={...await this.scan()},nodes=new Map<string,Node>();
+    const get=async(id:string)=>{try{const node=await this.node(scan.scanId,id);if(node)nodes.set(id,node);return node;}catch(error){if((error as {code?:string}).code!=='NODE_NOT_FOUND')throw error;return undefined;}};
+    const root=await get(scan.rootId);if(!root)throw {code:'NODE_NOT_FOUND',message:'扫描根目录不存在'};
+    const requestedScope=await get(request.scopeId),scope=requestedScope?.kind==='directory'?requestedScope:root;
+    const expanded=new Set<string>();if(requestedScope?.kind!=='directory')expanded.add(root.nodeId);
+    for(const node of await this.ancestors(scan.scanId,scope.nodeId))nodes.set(node.nodeId,node);
+    for(const id of request.expandedIds){const node=await get(id);if(node?.kind==='directory')expanded.add(id);}
+    const selectedIds:string[]=[];for(const id of new Set(request.selectedIds))if(await get(id)){selectedIds.push(id);for(const node of await this.ancestors(scan.scanId,id))nodes.set(node.nodeId,node);}
+    const primaryId=selectedIds.includes(request.primaryId||'')?request.primaryId!:selectedIds[0]||null;
+    const pages:ViewSnapshot['pages']=[];
+    for(const parentId of new Set([...expanded,root.nodeId,scope.nodeId])){const anchor=request.pageAnchors?.find(value=>value.parentId===parentId),first=anchor?await get(anchor.firstId):undefined;const page=first?.parentId===parentId?await this.nodePage(scan.scanId,first.nodeId,scan.revision,request.sort):await this.children({scanId:scan.scanId,parentId,revision:scan.revision,sort:request.sort,pageSize:200});pages.push({parentId,page:{...page,revision:scan.revision}});}
+    const chart={...await this.chart(scan.scanId,scope.nodeId),revision:scan.revision},summary=await this.summary(scan.scanId,selectedIds);
+    const details:ViewSnapshot['details']=[];if(primaryId&&nodes.get(primaryId)?.kind==='directory'){const page=await this.children({scanId:scan.scanId,parentId:primaryId,revision:scan.revision,sort:'size_desc',pageSize:5});details.push({nodeId:primaryId,nodes:page.nodes});}
+    return {scan,scopeId:scope.nodeId,primaryId,expandedIds:[...expanded],selectedIds,nodes:[...nodes.values()],pages,chart,summary,details};
+  }
   errors=async()=>({errors:[],nextCursor:null});
   async plan(request:OperationRequest){const summary=await this.summary('fixture',request.nodeIds);return {planId:'fixture-plan',scanId:'fixture',revision:1,kind:request.kind,items:summary.nodes.map(node=>({nodeId:node.nodeId,name:node.name,displayPath:node.displayPath,destination:request.destinationPath||request.newName||null,error:null})),logicalTotalBytes:summary.logicalTotalBytes,expiresAt:'2099-01-01T00:00:00Z',warnings:['视觉测试模式不会操作真实文件']};}
   execute=async()=>{throw {code:'FIXTURE_READONLY',message:'视觉测试数据不执行系统文件操作',retryable:false};};cancelOperation=async()=>{};open=async()=>{};copyPaths=async(_scanId:string,ids:string[])=>ids.map(id=>this.data.nodes.get(id)!.displayPath).join('\r\n');

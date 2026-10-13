@@ -13,6 +13,8 @@ export interface NodePage { revision: number; nodes: Node[]; nextCursor: string|
 export interface ChartNode { node: Node; children: ChartNode[]; otherCount: string; otherBytes: Bytes; }
 export interface ChartData { revision: number; root: ChartNode; truncated: boolean; }
 export interface SelectionSummary { nodes: Node[]; normalizedIds: string[]; coveredIds: string[]; logicalTotalBytes: Bytes; allocatedKnownTotalBytes: Bytes; allocatedUnknownCount: string; count: string; canOpen: boolean; canRename: boolean; canMove: boolean; canTrash: boolean; }
+export interface ViewSnapshotRequest { scanId:string;scopeId:string;expandedIds:string[];selectedIds:string[];primaryId?:string|null;sort?:PageRequest['sort'];pageAnchors?:{parentId:string;firstId:string}[]; }
+export interface ViewSnapshot { scan:Scan;scopeId:string;primaryId:string|null;expandedIds:string[];selectedIds:string[];nodes:Node[];pages:{parentId:string;page:NodePage}[];chart:ChartData;summary:SelectionSummary;details:{nodeId:string;nodes:Node[]}[]; }
 export type OperationKind = 'copy'|'move'|'rename'|'trash';
 export type ConflictPolicy = 'skip'|'keep_both'|'replace';
 export interface OperationRequest { scanId: string; nodeIds: string[]; expectedRevision: number; kind: OperationKind; destinationRef?: string; destinationPath?: string; newName?: string; conflictPolicy?: ConflictPolicy; }
@@ -38,6 +40,7 @@ export interface ScanError { nodeId: string|null; displayPath: string; stage: st
  * get_ancestors({scanId,nodeId,revision}) -> Node[] (root through parent)
  * get_chart_data({scanId,scopeId,revision,depth?:number,nodeBudget?:number}) -> ChartData
  * get_selection_summary({scanId,nodeIds,revision}) -> SelectionSummary
+ * get_view_snapshot({request:ViewSnapshotRequest}) -> ViewSnapshot (one committed read transaction; operation revision checks remain separate)
  * get_scan_errors({scanId,cursor?:string,pageSize?:number}) -> {errors:ScanError[],nextCursor:string|null}
  * plan_operation({request:OperationRequest}) -> OperationPlan
  * execute_operation({planId,onProgress?:Channel<JobEvent>}) -> Job

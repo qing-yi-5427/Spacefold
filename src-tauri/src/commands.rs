@@ -266,6 +266,14 @@ async fn get_selection_summary(
     blocking(move || s.repo.selection(&scan_id, &node_ids, revision)).await
 }
 #[tauri::command]
+async fn get_view_snapshot(
+    state: State<'_, AppState>,
+    request: ViewSnapshotRequest,
+) -> Result<ViewSnapshot> {
+    let s = state.inner().clone();
+    blocking(move || s.repo.view_snapshot(&request)).await
+}
+#[tauri::command]
 async fn get_scan_errors(
     state: State<'_, AppState>,
     scan_id: String,
@@ -473,6 +481,7 @@ pub fn run() {
             get_ancestors,
             get_chart_data,
             get_selection_summary,
+            get_view_snapshot,
             get_scan_errors,
             plan_operation,
             execute_operation,
