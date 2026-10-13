@@ -2,8 +2,7 @@ use crate::{
     model::*,
     platform,
     repository::{
-        aggregate_many, apply_directory_metadata, encode_node, insert_node,
-        DirectoryMetadataUpdate, EncodedNode, NodeInserter, Repository,
+        encode_node, insert_node, DirectoryMetadataUpdate, EncodedNode, NodeInserter, Repository,
     },
     service::{JobRuntime, Service},
 };
@@ -55,6 +54,7 @@ struct ScanProfile {
     pending_insert_ms: f64,
     directory_metadata_apply_ms: f64,
     directory_metadata_updates: usize,
+    directory_write_sql: crate::repository::DirectoryWriteSqlStats,
     max_flush_ms: f64,
     peak_batch_entries: usize,
     peak_batch_path_bytes: usize,
@@ -2053,11 +2053,19 @@ fn flush_batch_with_errors(
         }
         drop(inserter);
         let metadata_started = profile.enabled.then(Instant::now);
+        let mut sql_probe = profile
+            .enabled
+            .then(crate::repository::DirectoryWriteSqlProbe::default);
         if profile.enabled {
             profile.directory_metadata_updates += directory_updates.len();
         }
         for update in directory_updates.drain(..) {
-            apply_directory_metadata(&tx, scan_id, &update)?;
+            crate::repository::apply_directory_metadata_observed(
+                &tx,
+                scan_id,
+                &update,
+                sql_probe.as_mut(),
+            )?;
         }
         writer_pipeline::persist_errors(&tx, scan_id, errors)?;
         if let Some(started) = metadata_started {
@@ -2065,7 +2073,15 @@ fn flush_batch_with_errors(
         }
         profile.insert_ms += milliseconds(insert_started);
         let aggregate_started = Instant::now();
-        let aggregation = aggregate_many(&tx, scan_id, &aggregates)?;
+        let aggregation = crate::repository::aggregate_many_observed(
+            &tx,
+            scan_id,
+            &aggregates,
+            sql_probe.as_mut(),
+        )?;
+        if let Some(probe) = sql_probe {
+            profile.directory_write_sql.merge(probe.finish());
+        }
         profile.aggregate_direct_parents += aggregation.direct_parents;
         profile.aggregate_ancestor_rows += aggregation.ancestor_rows;
         profile.aggregate_fallback_batches += usize::from(!aggregation.coalesced);

@@ -1063,6 +1063,7 @@ fn merge_writer_profile(target: &mut ScanProfile, source: ScanProfile) {
     target.encode_ms += source.encode_ms;
     target.directory_metadata_apply_ms += source.directory_metadata_apply_ms;
     target.directory_metadata_updates += source.directory_metadata_updates;
+    target.directory_write_sql.merge(source.directory_write_sql);
     target.aggregate_ms += source.aggregate_ms;
     target.aggregate_direct_parents += source.aggregate_direct_parents;
     target.aggregate_ancestor_rows += source.aggregate_ancestor_rows;

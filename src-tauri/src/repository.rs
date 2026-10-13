@@ -1898,6 +1898,118 @@ mod directory_metadata_tests {
         (temp, service, scan, child, complete)
     }
     #[test]
+    fn profile_sql_counts_real_overlap_and_keeps_duplicate_and_error_updates_ordered() {
+        for (duplicates, failed) in [(false, false), (true, false), (false, true)] {
+            let (_temp, service, scan, child, complete) = setup();
+            let file = child.join("file");
+            std::fs::write(&file, b"abc").unwrap();
+            let file_metadata = platform::metadata(&file).unwrap();
+            let mut c = service.repo.connect().unwrap();
+            let tx = c.transaction().unwrap();
+            insert_node_shallow(&tx, &scan, 3, Some(2), &file, 2, &file_metadata, None).unwrap();
+            let mut probe = DirectoryWriteSqlProbe::default();
+            let update = DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: if failed {
+                    Err(AppError::new("READ_FAILED", "own fixture"))
+                } else {
+                    Ok(complete)
+                },
+            };
+            let calls = if duplicates { 2 } else { 1 };
+            for _ in 0..calls {
+                apply_directory_metadata_observed(&tx, &scan, &update, Some(&mut probe)).unwrap();
+            }
+            let delta = std::collections::BTreeMap::from([(
+                2,
+                [
+                    3,
+                    file_metadata
+                        .allocated
+                        .map(integer)
+                        .transpose()
+                        .unwrap()
+                        .unwrap_or(0),
+                    i64::from(file_metadata.allocated.is_none()),
+                    1,
+                    0,
+                    1,
+                ],
+            )]);
+            aggregate_many_observed(&tx, &scan, &delta, Some(&mut probe)).unwrap();
+            let stats = probe.finish();
+            assert_eq!(stats.metadata_calls, calls);
+            assert_eq!(stats.metadata_unique_ids, 1);
+            assert_eq!(stats.metadata_duplicate_ids, usize::from(duplicates));
+            assert_eq!(stats.metadata_issue_ids, usize::from(failed));
+            assert_eq!(stats.metadata_select_calls, calls + usize::from(failed));
+            assert_eq!(
+                stats.metadata_payload_update_calls,
+                if failed { 0 } else { calls }
+            );
+            assert_eq!(
+                stats.metadata_error_update_calls,
+                if failed { 2 } else { 0 }
+            );
+            assert_eq!(stats.metadata_marker_delete_calls, calls);
+            assert_eq!(stats.aggregate_node_select_calls, 2);
+            assert_eq!(stats.aggregate_node_update_calls, 2);
+            assert_eq!(stats.aggregate_scan_select_calls, 1);
+            assert_eq!(stats.aggregate_scan_update_calls, 1);
+            assert_eq!(stats.metadata_aggregate_read_intersection, 1);
+            assert_eq!(
+                stats.payload_aggregate_write_intersection,
+                usize::from(!failed)
+            );
+            assert_eq!(
+                stats.candidate_saved_select_calls,
+                usize::from(!duplicates && !failed)
+            );
+            assert_eq!(
+                stats.candidate_saved_update_calls,
+                usize::from(!duplicates && !failed)
+            );
+            tx.commit().unwrap();
+            let saved = service.repo.node(&scan, "2", None).unwrap().node;
+            assert_eq!(saved.children_count, "1");
+            assert_eq!(saved.logical_total_bytes, "3");
+            assert_eq!(
+                service.repo.scan(&scan).unwrap().error_count,
+                if failed { "1" } else { "0" }
+            );
+        }
+    }
+    #[test]
+    fn profile_sql_probe_is_bounded_and_fallback_counts_the_actual_statements() {
+        let mut capped = DirectoryWriteSqlProbe::default();
+        for id in 0..2050 {
+            capped.metadata_call(id);
+        }
+        let capped = capped.finish();
+        assert_eq!(capped.metadata_calls, 2050);
+        assert_eq!(capped.metadata_unique_ids, 2048);
+        assert_eq!(capped.tracking_truncated_batches, 1);
+        assert_eq!(capped.candidate_saved_select_calls, 0);
+        let (_temp, service, scan, _child, _complete) = setup();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        let mut probe = DirectoryWriteSqlProbe::default();
+        let direct = std::collections::BTreeMap::from([(2, [0, 0, 0, 0, 0, 1])]);
+        let result =
+            aggregate_many_with_limit_observed(&tx, &scan, &direct, 1, Some(&mut probe)).unwrap();
+        assert!(!result.coalesced);
+        let stats = probe.finish();
+        // One attempted graph row, then the original zero-logical validation
+        // SELECT and two node UPDATEs plus one scan UPDATE in the fallback.
+        assert_eq!(stats.aggregate_node_select_calls, 2);
+        assert_eq!(stats.aggregate_node_update_calls, 2);
+        assert_eq!(stats.aggregate_scan_select_calls, 0);
+        assert_eq!(stats.aggregate_scan_update_calls, 1);
+        assert_eq!(stats.aggregate_fallback_batches, 1);
+        assert_eq!(stats.candidate_saved_update_calls, 0);
+    }
+    #[test]
     fn equal_timestamp_completion_avoids_secondary_writes_and_changed_timestamp_sorts_exactly() {
         let (_temp, service, scan, child, complete) = setup();
         let mut c = service.repo.connect().unwrap();
@@ -2182,11 +2294,140 @@ mod directory_metadata_tests {
 const DIRECTORY_PAYLOAD_UPDATE: &str = "UPDATE nodes SET payload=?3 WHERE scan_id=?1 AND id=?2";
 const DIRECTORY_TIMED_PAYLOAD_UPDATE: &str =
     "UPDATE nodes SET payload=?3,modified=?4 WHERE scan_id=?1 AND id=?2";
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirectoryWriteSqlStats {
+    metadata_calls: usize,
+    metadata_unique_ids: usize,
+    metadata_duplicate_ids: usize,
+    metadata_issue_ids: usize,
+    metadata_select_calls: usize,
+    metadata_payload_update_calls: usize,
+    metadata_error_update_calls: usize,
+    metadata_marker_delete_calls: usize,
+    aggregate_node_select_calls: usize,
+    aggregate_scan_select_calls: usize,
+    aggregate_node_update_calls: usize,
+    aggregate_scan_update_calls: usize,
+    aggregate_graph_rows: usize,
+    aggregate_fallback_batches: usize,
+    metadata_aggregate_read_intersection: usize,
+    payload_aggregate_write_intersection: usize,
+    candidate_saved_select_calls: usize,
+    candidate_saved_update_calls: usize,
+    candidate_same_mtime_rows: usize,
+    candidate_zero_logical_delta_rows: usize,
+    tracking_truncated_batches: usize,
+    peak_tracked_metadata_ids: usize,
+}
+impl DirectoryWriteSqlStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        macro_rules! sum {
+            ($($field:ident),* $(,)?) => { $(self.$field += other.$field;)* };
+        }
+        sum!(
+            metadata_calls,
+            metadata_unique_ids,
+            metadata_duplicate_ids,
+            metadata_issue_ids,
+            metadata_select_calls,
+            metadata_payload_update_calls,
+            metadata_error_update_calls,
+            metadata_marker_delete_calls,
+            aggregate_node_select_calls,
+            aggregate_scan_select_calls,
+            aggregate_node_update_calls,
+            aggregate_scan_update_calls,
+            aggregate_graph_rows,
+            aggregate_fallback_batches,
+            metadata_aggregate_read_intersection,
+            payload_aggregate_write_intersection,
+            candidate_saved_select_calls,
+            candidate_saved_update_calls,
+            candidate_same_mtime_rows,
+            candidate_zero_logical_delta_rows,
+            tracking_truncated_batches
+        );
+        self.peak_tracked_metadata_ids = self
+            .peak_tracked_metadata_ids
+            .max(other.peak_tracked_metadata_ids);
+    }
+}
+#[derive(Default)]
+struct MetadataSqlEntry {
+    calls: usize,
+    payload_updates: usize,
+    issue: bool,
+    aggregate_read: bool,
+    aggregate_write: bool,
+    same_mtime: bool,
+    zero_logical_delta: bool,
+}
+/// PROFILE-only, transaction-local IDs. No paths, payloads or file identities
+/// are retained, and no extra SQL is issued for these counters.
+#[derive(Default)]
+pub(crate) struct DirectoryWriteSqlProbe {
+    stats: DirectoryWriteSqlStats,
+    metadata: std::collections::HashMap<i64, MetadataSqlEntry>,
+    truncated: bool,
+    fallback: bool,
+}
+impl DirectoryWriteSqlProbe {
+    fn metadata_call(&mut self, id: i64) {
+        self.stats.metadata_calls += 1;
+        if self.metadata.len() == 2048 && !self.metadata.contains_key(&id) {
+            self.truncated = true;
+            return;
+        }
+        self.metadata.entry(id).or_default().calls += 1;
+    }
+    pub(crate) fn finish(mut self) -> DirectoryWriteSqlStats {
+        self.stats.metadata_unique_ids = self.metadata.len();
+        self.stats.peak_tracked_metadata_ids = self.metadata.len();
+        self.stats.tracking_truncated_batches = usize::from(self.truncated);
+        for entry in self.metadata.values() {
+            self.stats.metadata_duplicate_ids += usize::from(entry.calls > 1);
+            self.stats.metadata_issue_ids += usize::from(entry.issue);
+            self.stats.metadata_aggregate_read_intersection += usize::from(entry.aggregate_read);
+            self.stats.payload_aggregate_write_intersection +=
+                usize::from(entry.payload_updates > 0 && entry.aggregate_write);
+            // Duplicates and error-bearing completions retain the original
+            // ordered path. A fallback/truncated batch is not a fusion claim.
+            let candidate = !self.fallback
+                && !self.truncated
+                && entry.calls == 1
+                && entry.payload_updates == 1
+                && !entry.issue;
+            self.stats.candidate_saved_select_calls +=
+                usize::from(candidate && entry.aggregate_read);
+            if candidate && entry.aggregate_write {
+                self.stats.candidate_saved_update_calls += 1;
+                self.stats.candidate_same_mtime_rows += usize::from(entry.same_mtime);
+                self.stats.candidate_zero_logical_delta_rows +=
+                    usize::from(entry.zero_logical_delta);
+            }
+        }
+        self.stats
+    }
+}
+
 pub fn apply_directory_metadata(
     tx: &Transaction<'_>,
     scan_id: &str,
     update: &DirectoryMetadataUpdate,
 ) -> Result<()> {
+    apply_directory_metadata_observed(tx, scan_id, update, None)
+}
+pub(crate) fn apply_directory_metadata_observed(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    update: &DirectoryMetadataUpdate,
+    mut probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<()> {
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.metadata_call(update.id);
+        probe.stats.metadata_select_calls += 1;
+    }
     let mut select =
         tx.prepare_cached("SELECT kind,payload,modified FROM nodes WHERE scan_id=?1 AND id=?2")?;
     let (kind, payload, modified): (String, String, Option<String>) = select
@@ -2200,6 +2441,9 @@ pub fn apply_directory_metadata(
     } else {
         // Public detail measurement can replace the compact payload while this
         // directory is queued. Preserve v1/v2/v3 payload and revision semantics.
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.metadata_select_calls += 1;
+        }
         let old = Repository::node_conn(tx, scan_id, update.id)?;
         (
             old.fingerprint.identity,
@@ -2240,6 +2484,13 @@ pub fn apply_directory_metadata(
             // Directory-own allocation is zero under the existing accounting
             // policy. No aggregate/discovered/direct-child value changes here.
             let payload = serde_json::to_string(&TinyPayload::from_meta(m))?;
+            if let Some(probe) = probe.as_deref_mut() {
+                probe.stats.metadata_payload_update_calls += 1;
+                if let Some(entry) = probe.metadata.get_mut(&update.id) {
+                    entry.payload_updates += 1;
+                    entry.same_mtime = m.modified == modified;
+                }
+            }
             if m.modified == modified {
                 // SQLite maintains indexes for a SET column even if its value
                 // is identical. The unchanged timestamp stays exact without
@@ -2265,6 +2516,14 @@ pub fn apply_directory_metadata(
         }
     }
     if let Some(error) = issue {
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.metadata_select_calls += 1;
+            // error_conn updates scan.error_count and this node's error flag.
+            probe.stats.metadata_error_update_calls += 2;
+            if let Some(entry) = probe.metadata.get_mut(&update.id) {
+                entry.issue = true;
+            }
+        }
         let stored = Repository::node_conn(tx, scan_id, update.id)?;
         Repository::error_conn(
             tx,
@@ -2276,6 +2535,9 @@ pub fn apply_directory_metadata(
                 error,
             },
         )?;
+    }
+    if let Some(probe) = probe {
+        probe.stats.metadata_marker_delete_calls += 1;
     }
     tx.prepare_cached("DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id=?2")?
         .execute(params![scan_id, update.id])?;
@@ -2294,9 +2556,29 @@ pub fn aggregate_batch(
     dirs: i64,
     children: i64,
 ) -> Result<()> {
+    aggregate_batch_observed(
+        tx, scan_id, parent, logical, allocated, unknown, files, dirs, children, None,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Same original fallback, optionally observed.
+fn aggregate_batch_observed(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    parent: i64,
+    logical: i64,
+    allocated: i64,
+    unknown: i64,
+    files: i64,
+    dirs: i64,
+    children: i64,
+    mut probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<()> {
     let sql = if logical == 0 {
         // Omitting an unchanged indexed column must still reject the invalid
         // logical values which the original UPDATE's CHECK constraint rejected.
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.aggregate_node_select_calls += 1;
+        }
         let valid: bool = tx.query_row("WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE scan_id=?1 AND id IN ancestors AND (typeof(logical_total)<>'integer' OR logical_total<0))", params![scan_id,parent], |r|r.get(0))?;
         if !valid {
             return Err(AppError::new(
@@ -2308,11 +2590,20 @@ pub fn aggregate_batch(
     } else {
         "WITH RECURSIVE ancestors(id) AS (SELECT ?2 UNION ALL SELECT n.parent_id FROM ancestors a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET logical_total=logical_total+?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5,file_count=file_count+?6,dir_count=dir_count+?7 WHERE scan_id=?1 AND id IN ancestors"
     };
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.stats.aggregate_node_update_calls += 1;
+    }
     tx.execute(sql,params![scan_id,parent,logical,allocated,unknown,files,dirs]).map_err(|error|if matches!(error,rusqlite::Error::SqliteFailure(ref e,_) if e.extended_code==rusqlite::ffi::SQLITE_CONSTRAINT_CHECK){AppError::new("SIZE_OUT_OF_RANGE","扫描总量超出精确整数支持范围")}else{error.into()})?;
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.stats.aggregate_node_update_calls += 1;
+    }
     tx.execute(
         "UPDATE nodes SET children_count=children_count+?3 WHERE scan_id=?1 AND id=?2",
         params![scan_id, parent, children],
     )?;
+    if let Some(probe) = probe {
+        probe.stats.aggregate_scan_update_calls += 1;
+    }
     tx.execute(
         "UPDATE scans SET discovered=discovered+?2 WHERE id=?1",
         params![scan_id, children],
@@ -2345,11 +2636,28 @@ pub fn aggregate_many(
 ) -> Result<AggregateStats> {
     aggregate_many_with_limit(tx, scan_id, direct, 32_768)
 }
+pub(crate) fn aggregate_many_observed(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<AggregateStats> {
+    aggregate_many_with_limit_observed(tx, scan_id, direct, 32_768, probe)
+}
 fn aggregate_many_with_limit(
     tx: &Transaction<'_>,
     scan_id: &str,
     direct: &std::collections::BTreeMap<i64, [i64; 6]>,
     limit: usize,
+) -> Result<AggregateStats> {
+    aggregate_many_with_limit_observed(tx, scan_id, direct, limit, None)
+}
+fn aggregate_many_with_limit_observed(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    limit: usize,
+    mut probe: Option<&mut DirectoryWriteSqlProbe>,
 ) -> Result<AggregateStats> {
     fn add_delta(a: i64, b: i64) -> Result<i64> {
         a.checked_add(b)
@@ -2373,10 +2681,22 @@ fn aggregate_many_with_limit(
             if rows.len() >= limit {
                 drop(load);
                 drop(rows);
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.fallback = true;
+                    probe.stats.aggregate_fallback_batches += 1;
+                }
                 for (parent, delta) in direct {
-                    aggregate_batch(
-                        tx, scan_id, *parent, delta[0], delta[1], delta[2], delta[3], delta[4],
+                    aggregate_batch_observed(
+                        tx,
+                        scan_id,
+                        *parent,
+                        delta[0],
+                        delta[1],
+                        delta[2],
+                        delta[3],
+                        delta[4],
                         delta[5],
+                        probe.as_deref_mut(),
                     )?;
                 }
                 return Ok(AggregateStats {
@@ -2384,6 +2704,12 @@ fn aggregate_many_with_limit(
                     ancestor_rows: 0,
                     coalesced: false,
                 });
+            }
+            if let Some(probe) = probe.as_deref_mut() {
+                probe.stats.aggregate_node_select_calls += 1;
+                if let Some(entry) = probe.metadata.get_mut(&id) {
+                    entry.aggregate_read = true;
+                }
             }
             let row = load
                 .query_row(params![scan_id, id], |r| {
@@ -2407,6 +2733,9 @@ fn aggregate_many_with_limit(
         }
     }
     drop(load);
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.stats.aggregate_graph_rows += rows.len();
+    }
     let mut discovered_delta = 0i64;
     for (id, delta) in direct {
         rows.get_mut(id).unwrap().delta = *delta;
@@ -2449,6 +2778,9 @@ fn aggregate_many_with_limit(
     if visited != rows.len() {
         return Err(AppError::new("CORRUPT_HIERARCHY", "扫描层级记录损坏"));
     }
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.stats.aggregate_scan_select_calls += 1;
+    }
     let discovered: i64 = tx.query_row(
         "SELECT discovered FROM scans WHERE id=?1",
         [scan_id],
@@ -2473,6 +2805,13 @@ fn aggregate_many_with_limit(
     for (id, row) in &rows {
         if row.delta == [0; 6] {
             continue;
+        }
+        if let Some(probe) = probe.as_deref_mut() {
+            probe.stats.aggregate_node_update_calls += 1;
+            if let Some(entry) = probe.metadata.get_mut(id) {
+                entry.aggregate_write = true;
+                entry.zero_logical_delta = row.delta[0] == 0;
+            }
         }
         if row.delta[0] == 0 {
             // SQLite maintains both size indexes whenever logical_total occurs
@@ -2501,6 +2840,9 @@ fn aggregate_many_with_limit(
     }
     drop(update);
     drop(non_logical);
+    if let Some(probe) = probe {
+        probe.stats.aggregate_scan_update_calls += 1;
+    }
     tx.execute(
         "UPDATE scans SET discovered=?2 WHERE id=?1",
         params![scan_id, discovered],
