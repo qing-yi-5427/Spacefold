@@ -903,13 +903,12 @@ fn read_directories(
                     * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
             }
         }
-        if !entries.is_empty() {
-            if output
+        if !entries.is_empty()
+            && output
                 .send_entries(parent, path, depth, entries, bytes, &budget)
                 .is_err()
-            {
-                break;
-            }
+        {
+            break;
         }
         if output.send(DirectoryMessage::Done(timings)).is_err() {
             break;
