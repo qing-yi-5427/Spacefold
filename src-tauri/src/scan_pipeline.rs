@@ -26,12 +26,37 @@ static TEST_FAULT: std::sync::Mutex<Option<TestFault>> = std::sync::Mutex::new(N
 #[cfg(test)]
 static TEST_FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
-pub(super) fn test_overlapping_root(root: &Path) -> bool {
-    TEST_FAULT
+pub(super) fn test_overlapping_root(root: &Path) -> Option<bool> {
+    let fault_mode = TEST_FAULT
         .lock()
         .unwrap()
         .as_ref()
-        .is_some_and(|fault| fault.root.as_deref() == Some(root))
+        .is_some_and(|fault| fault.root.as_deref() == Some(root));
+    if fault_mode {
+        Some(true)
+    } else {
+        TEST_WRITER_MODES.lock().unwrap().get(root).copied()
+    }
+}
+#[cfg(test)]
+static TEST_WRITER_MODES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, bool>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+pub(super) struct TestWriterMode(PathBuf);
+#[cfg(test)]
+impl Drop for TestWriterMode {
+    fn drop(&mut self) {
+        TEST_WRITER_MODES.lock().unwrap().remove(&self.0);
+    }
+}
+#[cfg(test)]
+pub(super) fn test_writer_mode(root: &Path, overlap: bool) -> TestWriterMode {
+    assert!(TEST_WRITER_MODES
+        .lock()
+        .unwrap()
+        .insert(root.into(), overlap)
+        .is_none());
+    TestWriterMode(root.into())
 }
 #[cfg(test)]
 pub(super) fn test_before_commit(scan_id: &str, data_dir: &Path) {
@@ -479,16 +504,17 @@ impl Collector<'_> {
 }
 
 fn spawn_metadata_workers(
+    root: &Path,
     work_rx: Receiver<(i64, i64, PathBuf, u32)>,
     replies: Sender<MetadataMessage>,
     budget: Arc<ReaderBudget>,
-) -> Vec<std::thread::JoinHandle<()>> {
+) -> (Vec<std::thread::JoinHandle<()>>, Option<AppError>) {
     let mut workers = Vec::with_capacity(4);
-    for _ in 0..4 {
+    for index in 0..4 {
         let receiver = work_rx.clone();
         let output = replies.clone();
         let budget = budget.clone();
-        workers.push(std::thread::spawn(move || {
+        match spawn_worker(root, "metadata", index, move || {
             let accepting = AtomicBool::new(false);
             while let Ok((id, parent, path, depth)) = receiver.recv() {
                 #[allow(unused_mut)]
@@ -540,11 +566,17 @@ fn spawn_metadata_workers(
                     break;
                 }
             }
-        }));
+        }) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => return (workers, Some(thread_start_error(error))),
+        }
     }
-    workers
+    (workers, None)
 }
 
+// The coordinator borrows each independent channel and the per-scan resource
+// limit; keeping these explicit avoids extending channel ownership lifetimes.
+#[allow(clippy::too_many_arguments)]
 fn collect_directories(
     collector: &mut Collector<'_>,
     _root: &Path,
@@ -553,6 +585,7 @@ fn collect_directories(
     requests: &Sender<(i64, PathBuf, u32, Option<String>, bool)>,
     messages: &Receiver<ReaderMessage>,
     metadata_work: &Sender<(i64, i64, PathBuf, u32)>,
+    in_flight_limit: usize,
 ) -> Result<()> {
     let mut next_id = 2i64;
     let mut in_flight = 0usize;
@@ -567,9 +600,9 @@ fn collect_directories(
         }
         collector.harvest()?;
         collector.flush_if_full()?;
-        if refill && in_flight < DIRECTORY_PREFETCH {
+        if refill && in_flight < in_flight_limit {
             let queue_started = collector.profile.enabled.then(Instant::now);
-            let limit = (DIRECTORY_PREFETCH - in_flight)
+            let limit = (in_flight_limit - in_flight)
                 .min(collector.consumed_limit - collector.batch.consumed.len());
             for _ in 0..limit {
                 if collector.queue.needs_refill() {
@@ -1042,12 +1075,15 @@ pub(super) fn scan(
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
+    let plan = ReaderPlan::new(reader_count, consumed_limit)?;
     let enabled = std::env::var_os("SPACEFOLD_PROFILE").is_some();
     let mut profile = ScanProfile {
         enabled,
         reader_wait_probe: enabled.then(|| Arc::new(ReaderWaitProbe::default())),
         consumed_limit,
-        directory_readers: reader_count,
+        directory_readers: plan.readers,
+        directory_in_flight_limit: plan.in_flight,
+        writer_mode: "overlap",
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
             * (std::mem::size_of::<ReaderMessage>()
@@ -1103,7 +1139,16 @@ pub(super) fn scan(
     let result = std::thread::scope(|scope| -> Result<WriterResult> {
         let (commands, input) = crossbeam_channel::bounded(0);
         let (acknowledgements, acknowledgements_rx) = crossbeam_channel::bounded(1);
-        let writer = scope.spawn(move || {
+        // A failed spawn drops its closure. Keep the unopened owner slot here
+        // so setup failures can explicitly close the connection and report it.
+        let owner = Arc::new(std::sync::Mutex::new(Some(c)));
+        let writer_owner = owner.clone();
+        let writer = match spawn_scoped_worker(scope, root, "writer", 0, move || {
+            let c = writer_owner
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one writer connection owner");
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 write_loop(
                     service,
@@ -1116,7 +1161,24 @@ pub(super) fn scan(
                 )
             }))
             .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描写线程异常退出")))
-        });
+        }) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let mut issue = thread_start_error(error);
+                let c = owner
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("unstarted writer connection");
+                for connection in [read, c] {
+                    if let Err((connection, error)) = connection.close() {
+                        drop(connection);
+                        issue = error.into();
+                    }
+                }
+                return Err(issue);
+            }
+        };
         let mut port = WriterPort {
             commands,
             acknowledgements: acknowledgements_rx,
@@ -1125,7 +1187,7 @@ pub(super) fn scan(
             committed_batches: 0,
             unpublished: Vec::with_capacity(BATCH_ENTRIES),
             ledger_count: 0,
-            ledger_limit: 2 * consumed_limit + DIRECTORY_PREFETCH,
+            ledger_limit: plan.ledger_limit,
         };
         let (requests, request_rx) = crossbeam_channel::bounded(DIRECTORY_PREFETCH);
         let (output, messages) = crossbeam_channel::bounded(output_slots);
@@ -1144,15 +1206,22 @@ pub(super) fn scan(
                 ));
             }
         }
-        let mut readers = Vec::with_capacity(reader_count);
-        for _ in 0..reader_count {
+        let mut readers = Vec::new();
+        let mut setup_error = readers
+            .try_reserve_exact(reader_count)
+            .err()
+            .map(|_| AppError::new("RESOURCE_LIMIT", "扫描线程句柄超过内存预算"));
+        for index in 0..reader_count {
+            if setup_error.is_some() {
+                break;
+            }
             let requests = request_rx.clone();
             let sender = output.clone();
             let reader_budget = reader_budget.clone();
             let auxiliary_budget = auxiliary_budget.clone();
             let stop = stop.clone();
             let directory_reader = directory_reader.clone();
-            readers.push(scope.spawn(move || -> Result<()> {
+            match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault = sender.clone();
                 let output = ReaderOutput {
                     sender,
@@ -1184,14 +1253,31 @@ pub(super) fn scan(
                     return Err(error);
                 }
                 Ok(())
-            }));
+            }) {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    setup_error = Some(thread_start_error(error));
+                    break;
+                }
+            }
         }
         drop(request_rx);
         drop(output);
         let (metadata_work, metadata_work_rx) = crossbeam_channel::bounded(2000);
         let (metadata_output, metadata_rx) = crossbeam_channel::bounded(2000);
-        let workers =
-            spawn_metadata_workers(metadata_work_rx, metadata_output, metadata_budget.clone());
+        let (workers, metadata_setup_error) = if setup_error.is_none() {
+            spawn_metadata_workers(
+                root,
+                metadata_work_rx,
+                metadata_output,
+                metadata_budget.clone(),
+            )
+        } else {
+            drop(metadata_work_rx);
+            drop(metadata_output);
+            (Vec::new(), None)
+        };
+        setup_error = setup_error.or(metadata_setup_error);
         // This connection never writes the persistent schema and never keeps a
         // read transaction across a channel receive. Its TEMP ledger is finite.
         let mut collector = Collector {
@@ -1207,18 +1293,23 @@ pub(super) fn scan(
             reserved_metadata: 0,
             consumed_limit,
         };
-        let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            collect_directories(
-                &mut collector,
-                root,
-                job,
-                &stop,
-                &requests,
-                &messages,
-                &metadata_work,
-            )
-        }))
-        .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描协调线程异常退出")));
+        let mut outcome = if let Some(error) = setup_error {
+            Err(error)
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                collect_directories(
+                    &mut collector,
+                    root,
+                    job,
+                    &stop,
+                    &requests,
+                    &messages,
+                    &metadata_work,
+                    plan.in_flight,
+                )
+            }))
+            .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描协调线程异常退出")))
+        };
         // Disconnect before stopping budgets/joining. Both an output sender and
         // a permit waiter must have an unconditional path out of reader shutdown.
         drop(requests);
@@ -1699,7 +1790,8 @@ mod tests {
             limit: METADATA_REPLY_BYTES,
             ..Default::default()
         });
-        let workers = spawn_metadata_workers(input, output, budget.clone());
+        let (workers, error) = spawn_metadata_workers(&root, input, output, budget.clone());
+        assert!(error.is_none());
         let mut accepted_path_bytes = 0;
         for id in 2..34 {
             let mut path = root.join(format!("reply-{id}"));

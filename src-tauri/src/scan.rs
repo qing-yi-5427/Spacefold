@@ -35,6 +35,8 @@ struct ScanProfile {
     directory_queue_peak_cached_bytes: usize,
     consumed_limit: usize,
     directory_readers: usize,
+    directory_in_flight_limit: usize,
+    writer_mode: &'static str,
     output_slots: usize,
     output_slot_storage_upper_bound_bytes: usize,
     auxiliary_message_peak_bytes: usize,
@@ -98,14 +100,180 @@ fn consumed_limit_override(value: Option<&str>) -> usize {
         _ => DEFAULT_CONSUMED_LIMIT,
     }
 }
-fn reader_count_override(value: Option<&str>) -> usize {
+fn reader_count_for(value: Option<&str>, detected: usize) -> usize {
     match value {
         Some("2") => 2,
         Some("4") => 4,
         Some("8") => 8,
         Some("16") => 16,
-        _ => DEFAULT_DIRECTORY_READERS,
+        _ => detected.max(1),
     }
+}
+fn processor_count_from_providers(active: u32, fallback: impl FnOnce() -> usize) -> usize {
+    if active != 0 {
+        active as usize
+    } else {
+        fallback().max(1)
+    }
+}
+fn detected_reader_count() -> usize {
+    // Windows 11 schedules ordinary process threads across processor groups.
+    // This read-only query counts system-active logical processors, rather
+    // than estimating an affinity mask or a Job object's CPU quota.
+    #[cfg(windows)]
+    let active = unsafe {
+        windows::Win32::System::Threading::GetActiveProcessorCount(
+            windows::Win32::System::Threading::ALL_PROCESSOR_GROUPS,
+        )
+    };
+    #[cfg(not(windows))]
+    let active = 0;
+    processor_count_from_providers(active, || {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    })
+}
+fn reader_count_override(value: Option<&str>) -> usize {
+    reader_count_for(value, detected_reader_count())
+}
+fn overlapping_writer(value: Option<&str>) -> bool {
+    value != Some("serial")
+}
+struct ReaderPlan {
+    readers: usize,
+    in_flight: usize,
+    ledger_limit: usize,
+}
+impl ReaderPlan {
+    fn new(readers: usize, consumed_limit: usize) -> Result<Self> {
+        let unsupported = || AppError::new("RESOURCE_LIMIT", "可用核心数超出扫描资源支持范围");
+        if readers == 0 {
+            return Err(unsupported());
+        }
+        let in_flight = DIRECTORY_PREFETCH.max(readers);
+        let ledger_limit = consumed_limit
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(in_flight))
+            .ok_or_else(unsupported)?;
+        // Active requests, construction scratch and thread-handle storage grow
+        // with hardware concurrency; all shared payload budgets remain fixed.
+        let scratch = READER_DATA_BYTES
+            .checked_add(READER_CHUNK_BYTES)
+            .and_then(|n| n.checked_add(64 * 1024))
+            .and_then(|n| {
+                n.checked_add(
+                    READER_CHUNK_ENTRIES
+                        * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>(),
+                )
+            })
+            .ok_or_else(unsupported)?;
+        readers
+            .checked_mul(scratch)
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or_else(unsupported)?;
+        in_flight
+            .checked_mul(std::mem::size_of::<(i64, PathBuf, u32, Option<String>, bool)>())
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or_else(unsupported)?;
+        Ok(Self {
+            readers,
+            in_flight,
+            ledger_limit,
+        })
+    }
+}
+#[cfg(test)]
+struct StartFault {
+    root: PathBuf,
+    role: &'static str,
+    index: usize,
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+#[cfg(test)]
+static START_FAULT: std::sync::Mutex<Option<StartFault>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+struct ActiveWorker(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(test)]
+impl Drop for ActiveWorker {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+#[cfg(test)]
+fn start_probe(
+    root: &Path,
+    role: &str,
+    index: usize,
+) -> std::io::Result<
+    Option<(
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )>,
+> {
+    let fault = START_FAULT.lock().unwrap();
+    if let Some(fault) = fault.as_ref().filter(|f| f.root == root) {
+        if fault.role == role && fault.index == index {
+            return Err(std::io::Error::other("injected thread creation failure"));
+        }
+        return Ok(Some((fault.active.clone(), fault.started.clone())));
+    }
+    Ok(None)
+}
+fn spawn_scoped_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    root: &Path,
+    role: &'static str,
+    index: usize,
+    work: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    let active = start_probe(root, role, index)?;
+    #[cfg(not(test))]
+    let _ = root;
+    std::thread::Builder::new()
+        .name(format!("spacefold-{role}-{index}"))
+        .spawn_scoped(scope, move || {
+            #[cfg(test)]
+            let _active = active.map(|(counter, started)| {
+                started.fetch_add(1, Ordering::AcqRel);
+                counter.fetch_add(1, Ordering::AcqRel);
+                ActiveWorker(counter)
+            });
+            work()
+        })
+}
+fn spawn_worker<F, T>(
+    root: &Path,
+    role: &'static str,
+    index: usize,
+    work: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(test)]
+    let active = start_probe(root, role, index)?;
+    #[cfg(not(test))]
+    let _ = root;
+    std::thread::Builder::new()
+        .name(format!("spacefold-{role}-{index}"))
+        .spawn(move || {
+            #[cfg(test)]
+            let _active = active.map(|(counter, started)| {
+                started.fetch_add(1, Ordering::AcqRel);
+                counter.fetch_add(1, Ordering::AcqRel);
+                ActiveWorker(counter)
+            });
+            work()
+        })
+}
+fn thread_start_error(error: std::io::Error) -> AppError {
+    AppError::new("WORKER_START_FAILED", format!("无法启动扫描线程：{error}"))
 }
 fn output_slots_override(value: Option<&str>) -> usize {
     match value {
@@ -115,7 +283,6 @@ fn output_slots_override(value: Option<&str>) -> usize {
         _ => READER_QUEUE_CHUNKS,
     }
 }
-const DEFAULT_DIRECTORY_READERS: usize = 4;
 
 #[derive(Default)]
 struct DirectoryQueueCursor {
@@ -640,6 +807,15 @@ type DeferredDirectoryHook = (
 #[cfg(test)]
 static DEFERRED_DIRECTORY_HOOK: std::sync::Mutex<Option<DeferredDirectoryHook>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+#[derive(Clone)]
+struct ParallelWorkHook {
+    root: PathBuf,
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+#[cfg(test)]
+static PARALLEL_WORK_HOOK: std::sync::Mutex<Option<ParallelWorkHook>> = std::sync::Mutex::new(None);
 
 /// Directory readers overlap enumeration/encoding with the sole SQLite writer. Only
 /// already-persisted directory IDs are requested. Bounded chunks provide
@@ -656,6 +832,19 @@ fn read_directories(
     while let Ok((parent, path, depth, expected_identity, deferred)) = requests.recv() {
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             break;
+        }
+        #[cfg(test)]
+        {
+            let hook = PARALLEL_WORK_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|hook| path.parent() == Some(hook.root.as_path()))
+                .cloned();
+            if let Some(hook) = hook {
+                hook.entered.send(()).unwrap();
+                hook.release.recv().unwrap();
+            }
         }
         if deferred && expected_identity.is_none() {
             let _ = output.send(DirectoryMessage::Fatal(AppError::new(
@@ -936,6 +1125,13 @@ fn scan_sync_with_mode(
 ) -> Result<Scan> {
     let readers =
         reader_count_override(std::env::var("SPACEFOLD_DIRECTORY_READERS").ok().as_deref());
+    #[cfg(test)]
+    let readers = START_FAULT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|fault| fault.root == root)
+        .map_or(readers, |_| 4);
     scan_sync_with_options(service, scan_id, root, job, fast, readers)
 }
 fn scan_sync_with_options(
@@ -960,10 +1156,12 @@ fn scan_sync_with_queue_capacity(
     output_slots: usize,
 ) -> Result<Scan> {
     #[cfg(test)]
-    if writer_pipeline::test_overlapping_root(root) {
-        return writer_pipeline::scan(service, scan_id, root, job, fast, readers, output_slots);
-    }
-    if std::env::var("SPACEFOLD_WRITER_MODE").ok().as_deref() == Some("overlap") {
+    let overlap = writer_pipeline::test_overlapping_root(root).unwrap_or_else(|| {
+        overlapping_writer(std::env::var("SPACEFOLD_WRITER_MODE").ok().as_deref())
+    });
+    #[cfg(not(test))]
+    let overlap = overlapping_writer(std::env::var("SPACEFOLD_WRITER_MODE").ok().as_deref());
+    if overlap {
         writer_pipeline::scan(service, scan_id, root, job, fast, readers, output_slots)
     } else {
         scan_sync_serial_with_queue_capacity(
@@ -986,17 +1184,19 @@ fn scan_sync_serial_with_queue_capacity(
     readers: usize,
     output_slots: usize,
 ) -> Result<Scan> {
-    assert!(matches!(readers, 2 | 4 | 8 | 16));
     assert!(matches!(output_slots, 32 | 64 | 128));
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
+    let plan = ReaderPlan::new(readers, consumed_limit)?;
     let profile_enabled = std::env::var_os("SPACEFOLD_PROFILE").is_some();
     let mut profile = ScanProfile {
         enabled: profile_enabled,
         reader_wait_probe: profile_enabled.then(|| std::sync::Arc::new(ReaderWaitProbe::default())),
         consumed_limit,
         directory_readers: readers,
+        directory_in_flight_limit: plan.in_flight,
+        writer_mode: "serial",
         output_slots,
         // crossbeam's bounded slot holds one atomic stamp and the message,
         // with at most one message alignment unit of padding per slot.
@@ -1036,10 +1236,11 @@ fn scan_sync_serial_with_queue_capacity(
     let (work_tx, work_rx) = crossbeam_channel::bounded::<(i64, i64, PathBuf, u32)>(2000);
     let (result_tx, result_rx) = crossbeam_channel::bounded::<MetadataResult>(2000);
     let mut handles = vec![];
-    for _ in 0..4 {
+    let mut metadata_setup_error = None;
+    for index in 0..4 {
         let receiver = work_rx.clone();
         let sender = result_tx.clone();
-        handles.push(std::thread::spawn(move || {
+        match spawn_worker(root, "metadata", index, move || {
             while let Ok((id, parent, path, depth)) = receiver.recv() {
                 let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     #[cfg(test)]
@@ -1061,10 +1262,28 @@ fn scan_sync_serial_with_queue_capacity(
                     break;
                 }
             }
-        }));
+        }) {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                metadata_setup_error = Some(thread_start_error(error));
+                break;
+            }
+        }
     }
     drop(work_rx);
     drop(result_tx);
+    if let Some(error) = metadata_setup_error {
+        drop(work_tx);
+        drop(result_rx);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        if let Err((connection, issue)) = c.close() {
+            drop(connection);
+            return Err(issue.into());
+        }
+        return Err(error);
+    }
     let mut next_id = 2i64;
     let mut last_emit = Instant::now();
     let mut failed: Option<AppError> = None;
@@ -1087,15 +1306,22 @@ fn scan_sync_serial_with_queue_capacity(
             ..Default::default()
         });
         let reader_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut readers = Vec::with_capacity(profile.directory_readers);
-        for _ in 0..profile.directory_readers {
+        let mut readers = Vec::new();
+        let mut setup_error = readers
+            .try_reserve_exact(profile.directory_readers)
+            .err()
+            .map(|_| AppError::new("RESOURCE_LIMIT", "扫描线程句柄超过内存预算"));
+        for index in 0..profile.directory_readers {
+            if setup_error.is_some() {
+                break;
+            }
             let requests = request_rx.clone();
             let output = directory_tx.clone();
             let reader_budget = budget.clone();
             let auxiliary_budget = auxiliary_budget.clone();
             let stop = reader_stop.clone();
             let directory_reader = directory_reader.clone();
-            readers.push(scope.spawn(move || -> Result<()> {
+            match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault_output = output.clone();
                 let output = ReaderOutput {
                     sender: output,
@@ -1126,151 +1352,37 @@ fn scan_sync_serial_with_queue_capacity(
                     return Err(error);
                 }
                 Ok(())
-            }));
+            }) {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    setup_error = Some(thread_start_error(error));
+                    break;
+                }
+            }
         }
         drop(request_rx);
         drop(directory_tx);
-        let result = (|| -> Result<()> {
-            let mut in_flight = 0usize;
-            let mut refill = true;
-            let mut queue_cursor = DirectoryQueueCursor::default();
-            'directories: loop {
-                if job.cancel.load(Ordering::Acquire) {
-                    break;
-                }
-                if reader_stop.load(Ordering::Acquire) {
-                    return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
-                }
-                if consumed >= consumed_limit
-                    || consumed > 0 && batch_started.elapsed() >= Duration::from_millis(100)
-                {
-                    if profile.enabled {
-                        profile.flush_consumed_limit += usize::from(consumed >= consumed_limit);
-                        profile.flush_time_limit +=
-                            usize::from(batch_started.elapsed() >= Duration::from_millis(100));
+        let result = if let Some(error) = setup_error {
+            Err(error)
+        } else {
+            (|| -> Result<()> {
+                let mut in_flight = 0usize;
+                let mut refill = true;
+                let mut queue_cursor = DirectoryQueueCursor::default();
+                'directories: loop {
+                    if job.cancel.load(Ordering::Acquire) {
+                        break;
                     }
-                    flush_batch(
-                        service,
-                        &mut c,
-                        scan_id,
-                        pending,
-                        &result_rx,
-                        &mut results,
-                        &mut directory_updates,
-                        &mut profile,
-                    )?;
-                    pending = 0;
-                    batch_path_bytes = 0;
-                    consumed = 0;
-                    queue_cursor.reset_after_flush();
-                    batch_started = Instant::now();
-                    refill = true;
-                }
-                if refill && in_flight < DIRECTORY_PREFETCH {
-                    let started = Instant::now();
-                    let limit = (DIRECTORY_PREFETCH - in_flight).min(consumed_limit - consumed);
-                    let mark_started = profile.enabled.then(Instant::now);
-                    let mut mark_consumed =
-                        c.prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")?;
-                    if let Some(mark_started) = mark_started {
-                        profile.directory_queue_mark_ms += milliseconds(mark_started);
+                    if reader_stop.load(Ordering::Acquire) {
+                        return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                     }
-                    for _ in 0..limit {
-                        if queue_cursor.needs_refill() {
-                            let read_started = profile.enabled.then(Instant::now);
-                            let read = queue_cursor.refill(&c, scan_id)?;
-                            if let Some(read_started) = read_started {
-                                profile.directory_queue_read_ms += milliseconds(read_started);
-                                profile.directory_queue_queries += 1;
-                                profile.directory_queue_read_rows += read;
-                                profile.directory_queue_peak_cached_entries = profile
-                                    .directory_queue_peak_cached_entries
-                                    .max(queue_cursor.cache.len());
-                                profile.directory_queue_peak_cached_bytes = profile
-                                    .directory_queue_peak_cached_bytes
-                                    .max(queue_cursor.owned_bytes());
-                            }
-                        }
-                        if queue_cursor.cache.is_empty() {
-                            break;
-                        }
-                        #[cfg(test)]
-                        {
-                            let hook = DISPATCH_TEST_HOOK
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .filter(|h| h.0 == root)
-                                .cloned();
-                            if let Some((_, entered, release)) = hook {
-                                entered.send(()).unwrap();
-                                release.recv().unwrap();
-                            }
-                        }
-                        if job.cancel.load(Ordering::Acquire) {
-                            break 'directories;
-                        }
-                        if reader_stop.load(Ordering::Acquire) {
-                            return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
-                        }
-                        let mark_started = profile.enabled.then(Instant::now);
-                        let (parent, path, depth, expected_identity, metadata_deferred) =
-                            queue_cursor.consume(&mut mark_consumed)?;
-                        if let Some(mark_started) = mark_started {
-                            profile.directory_queue_mark_ms += milliseconds(mark_started);
-                        }
-                        let decode_started = profile.enabled.then(Instant::now);
-                        let path = platform::decode_path(path);
-                        if let Some(decode_started) = decode_started {
-                            profile.directory_queue_decode_ms += milliseconds(decode_started);
-                        }
-                        consumed += 1;
-                        if depth >= 4096 {
-                            let error_started = profile.enabled.then(Instant::now);
-                            record_error(
-                                service,
-                                &c,
-                                scan_id,
-                                parent,
-                                &path,
-                                "enumerate",
-                                AppError::new("DEPTH_LIMIT", "目录深度达到 4096，未继续读取"),
-                            )?;
-                            if let Some(error_started) = error_started {
-                                profile.directory_queue_error_ms += milliseconds(error_started);
-                            }
-                        } else {
-                            let send_started = profile.enabled.then(Instant::now);
-                            let sent = request_tx.send((
-                                parent,
-                                path,
-                                depth,
-                                expected_identity,
-                                metadata_deferred,
-                            ));
-                            if let Some(send_started) = send_started {
-                                profile.directory_queue_send_ms += milliseconds(send_started);
-                            }
-                            if sent.is_err() {
-                                if job.cancel.load(Ordering::Acquire) {
-                                    break 'directories;
-                                }
-                                return Err(AppError::new("WORKER_FAILED", "枚举线程已退出"));
-                            }
-                            in_flight += 1;
-                        }
-                    }
-                    profile.directory_queue_ms += milliseconds(started);
-                    refill = false;
-                }
-                if in_flight == 0 {
-                    if pending > 0
-                        || !results.is_empty()
-                        || consumed > 0
-                        || !directory_updates.is_empty()
+                    if consumed >= consumed_limit
+                        || consumed > 0 && batch_started.elapsed() >= Duration::from_millis(100)
                     {
                         if profile.enabled {
-                            profile.flush_drain += 1;
+                            profile.flush_consumed_limit += usize::from(consumed >= consumed_limit);
+                            profile.flush_time_limit +=
+                                usize::from(batch_started.elapsed() >= Duration::from_millis(100));
                         }
                         flush_batch(
                             service,
@@ -1288,64 +1400,112 @@ fn scan_sync_serial_with_queue_capacity(
                         queue_cursor.reset_after_flush();
                         batch_started = Instant::now();
                         refill = true;
-                        continue;
                     }
-                    break;
-                }
-                let wait_started = Instant::now();
-                #[cfg(test)]
-                {
-                    let hook = READER_TEST_HOOK
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .filter(|h| h.path == root)
-                        .cloned();
-                    if let Some(hook) = hook {
-                        hook.waiting.send(()).unwrap();
+                    if refill && in_flight < plan.in_flight {
+                        let started = Instant::now();
+                        let limit = (plan.in_flight - in_flight).min(consumed_limit - consumed);
+                        let mark_started = profile.enabled.then(Instant::now);
+                        let mut mark_consumed =
+                            c.prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")?;
+                        if let Some(mark_started) = mark_started {
+                            profile.directory_queue_mark_ms += milliseconds(mark_started);
+                        }
+                        for _ in 0..limit {
+                            if queue_cursor.needs_refill() {
+                                let read_started = profile.enabled.then(Instant::now);
+                                let read = queue_cursor.refill(&c, scan_id)?;
+                                if let Some(read_started) = read_started {
+                                    profile.directory_queue_read_ms += milliseconds(read_started);
+                                    profile.directory_queue_queries += 1;
+                                    profile.directory_queue_read_rows += read;
+                                    profile.directory_queue_peak_cached_entries = profile
+                                        .directory_queue_peak_cached_entries
+                                        .max(queue_cursor.cache.len());
+                                    profile.directory_queue_peak_cached_bytes = profile
+                                        .directory_queue_peak_cached_bytes
+                                        .max(queue_cursor.owned_bytes());
+                                }
+                            }
+                            if queue_cursor.cache.is_empty() {
+                                break;
+                            }
+                            #[cfg(test)]
+                            {
+                                let hook = DISPATCH_TEST_HOOK
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .filter(|h| h.0 == root)
+                                    .cloned();
+                                if let Some((_, entered, release)) = hook {
+                                    entered.send(()).unwrap();
+                                    release.recv().unwrap();
+                                }
+                            }
+                            if job.cancel.load(Ordering::Acquire) {
+                                break 'directories;
+                            }
+                            if reader_stop.load(Ordering::Acquire) {
+                                return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
+                            }
+                            let mark_started = profile.enabled.then(Instant::now);
+                            let (parent, path, depth, expected_identity, metadata_deferred) =
+                                queue_cursor.consume(&mut mark_consumed)?;
+                            if let Some(mark_started) = mark_started {
+                                profile.directory_queue_mark_ms += milliseconds(mark_started);
+                            }
+                            let decode_started = profile.enabled.then(Instant::now);
+                            let path = platform::decode_path(path);
+                            if let Some(decode_started) = decode_started {
+                                profile.directory_queue_decode_ms += milliseconds(decode_started);
+                            }
+                            consumed += 1;
+                            if depth >= 4096 {
+                                let error_started = profile.enabled.then(Instant::now);
+                                record_error(
+                                    service,
+                                    &c,
+                                    scan_id,
+                                    parent,
+                                    &path,
+                                    "enumerate",
+                                    AppError::new("DEPTH_LIMIT", "目录深度达到 4096，未继续读取"),
+                                )?;
+                                if let Some(error_started) = error_started {
+                                    profile.directory_queue_error_ms += milliseconds(error_started);
+                                }
+                            } else {
+                                let send_started = profile.enabled.then(Instant::now);
+                                let sent = request_tx.send((
+                                    parent,
+                                    path,
+                                    depth,
+                                    expected_identity,
+                                    metadata_deferred,
+                                ));
+                                if let Some(send_started) = send_started {
+                                    profile.directory_queue_send_ms += milliseconds(send_started);
+                                }
+                                if sent.is_err() {
+                                    if job.cancel.load(Ordering::Acquire) {
+                                        break 'directories;
+                                    }
+                                    return Err(AppError::new("WORKER_FAILED", "枚举线程已退出"));
+                                }
+                                in_flight += 1;
+                            }
+                        }
+                        profile.directory_queue_ms += milliseconds(started);
+                        refill = false;
                     }
-                }
-                let received = directory_rx.recv_timeout(Duration::from_millis(50));
-                profile.reader_wait_ms += milliseconds(wait_started);
-                let message = match received {
-                    Ok(message) => message,
-                    Err(_) if job.cancel.load(Ordering::Acquire) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout)
-                        if reader_stop.load(Ordering::Acquire) =>
-                    {
-                        return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"))
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        return Err(AppError::new("WORKER_FAILED", "枚举线程中断"))
-                    }
-                };
-                let ReaderMessage {
-                    message,
-                    mut auxiliary_permit,
-                } = message;
-                match message {
-                    DirectoryMessage::Metadata(update) => {
-                        batch_path_bytes +=
-                            update.bytes() + std::mem::size_of::<DirectoryMetadataUpdate>();
-                        profile.peak_batch_path_bytes =
-                            profile.peak_batch_path_bytes.max(batch_path_bytes);
-                        directory_updates.push(update);
-                        drop(auxiliary_permit.take());
-                        // Existing collection time and owned-byte limits also
-                        // bound the independently completed directory metadata.
-                        if batch_path_bytes >= BATCH_PATH_BYTES
-                            || directory_updates.len() >= 2048
-                            || batch_started.elapsed() >= Duration::from_millis(100)
+                    if in_flight == 0 {
+                        if pending > 0
+                            || !results.is_empty()
+                            || consumed > 0
+                            || !directory_updates.is_empty()
                         {
                             if profile.enabled {
-                                profile.flush_path_limit +=
-                                    usize::from(batch_path_bytes >= BATCH_PATH_BYTES);
-                                profile.flush_metadata_limit +=
-                                    usize::from(directory_updates.len() >= 2048);
-                                profile.flush_time_limit += usize::from(
-                                    batch_started.elapsed() >= Duration::from_millis(100),
-                                );
+                                profile.flush_drain += 1;
                             }
                             flush_batch(
                                 service,
@@ -1363,57 +1523,61 @@ fn scan_sync_serial_with_queue_capacity(
                             queue_cursor.reset_after_flush();
                             batch_started = Instant::now();
                             refill = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    let wait_started = Instant::now();
+                    #[cfg(test)]
+                    {
+                        let hook = READER_TEST_HOOK
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .filter(|h| h.path == root)
+                            .cloned();
+                        if let Some(hook) = hook {
+                            hook.waiting.send(()).unwrap();
                         }
                     }
-                    DirectoryMessage::Entries {
-                        parent,
-                        path,
-                        depth,
-                        entries,
-                        permit,
-                    } => {
-                        drop(path);
-                        drop(auxiliary_permit.take());
-                        for (entry, encoded) in entries {
-                            if job.cancel.load(Ordering::Acquire) {
-                                break 'directories;
-                            }
-                            let ordinary_file = entry
-                                .scan_file_metadata()
-                                .or_else(|| entry.scan_directory_metadata())
-                                .is_some();
-                            let p = entry.path;
-                            if p.starts_with(&service.repo.data_dir) || service.is_work_file(&p) {
-                                continue;
-                            }
-                            let id = next_id;
-                            next_id = next_id.checked_add(1).ok_or_else(|| {
-                                AppError::new("SIZE_OUT_OF_RANGE", "节点数量超出上限")
-                            })?;
-                            batch_path_bytes += p.capacity()
-                                + metadata_owned_bytes(entry.hint.as_ref())
-                                + encoded.as_ref().map_or(0, EncodedNode::bytes);
+                    let received = directory_rx.recv_timeout(Duration::from_millis(50));
+                    profile.reader_wait_ms += milliseconds(wait_started);
+                    let message = match received {
+                        Ok(message) => message,
+                        Err(_) if job.cancel.load(Ordering::Acquire) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                            if reader_stop.load(Ordering::Acquire) =>
+                        {
+                            return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"))
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            return Err(AppError::new("WORKER_FAILED", "枚举线程中断"))
+                        }
+                    };
+                    let ReaderMessage {
+                        message,
+                        mut auxiliary_permit,
+                    } = message;
+                    match message {
+                        DirectoryMessage::Metadata(update) => {
+                            batch_path_bytes +=
+                                update.bytes() + std::mem::size_of::<DirectoryMetadataUpdate>();
                             profile.peak_batch_path_bytes =
                                 profile.peak_batch_path_bytes.max(batch_path_bytes);
-                            if let Some(metadata) = entry.hint.filter(|_| ordinary_file) {
-                                results.push((id, parent, p, depth + 1, Ok(metadata), encoded));
-                            } else {
-                                work_tx.send((id, parent, p, depth + 1)).map_err(|_| {
-                                    AppError::new("WORKER_FAILED", "元数据工作线程已退出")
-                                })?;
-                                pending += 1;
-                            }
-                            if results.len() + pending >= BATCH_ENTRIES
-                                || pending >= 2000
-                                || batch_path_bytes >= BATCH_PATH_BYTES
+                            directory_updates.push(update);
+                            drop(auxiliary_permit.take());
+                            // Existing collection time and owned-byte limits also
+                            // bound the independently completed directory metadata.
+                            if batch_path_bytes >= BATCH_PATH_BYTES
+                                || directory_updates.len() >= 2048
                                 || batch_started.elapsed() >= Duration::from_millis(100)
                             {
                                 if profile.enabled {
-                                    profile.flush_entries_limit +=
-                                        usize::from(results.len() + pending >= BATCH_ENTRIES);
-                                    profile.flush_metadata_limit += usize::from(pending >= 2000);
                                     profile.flush_path_limit +=
                                         usize::from(batch_path_bytes >= BATCH_PATH_BYTES);
+                                    profile.flush_metadata_limit +=
+                                        usize::from(directory_updates.len() >= 2048);
                                     profile.flush_time_limit += usize::from(
                                         batch_started.elapsed() >= Duration::from_millis(100),
                                     );
@@ -1436,34 +1600,108 @@ fn scan_sync_serial_with_queue_capacity(
                                 refill = true;
                             }
                         }
-                        drop(permit);
+                        DirectoryMessage::Entries {
+                            parent,
+                            path,
+                            depth,
+                            entries,
+                            permit,
+                        } => {
+                            drop(path);
+                            drop(auxiliary_permit.take());
+                            for (entry, encoded) in entries {
+                                if job.cancel.load(Ordering::Acquire) {
+                                    break 'directories;
+                                }
+                                let ordinary_file = entry
+                                    .scan_file_metadata()
+                                    .or_else(|| entry.scan_directory_metadata())
+                                    .is_some();
+                                let p = entry.path;
+                                if p.starts_with(&service.repo.data_dir) || service.is_work_file(&p)
+                                {
+                                    continue;
+                                }
+                                let id = next_id;
+                                next_id = next_id.checked_add(1).ok_or_else(|| {
+                                    AppError::new("SIZE_OUT_OF_RANGE", "节点数量超出上限")
+                                })?;
+                                batch_path_bytes += p.capacity()
+                                    + metadata_owned_bytes(entry.hint.as_ref())
+                                    + encoded.as_ref().map_or(0, EncodedNode::bytes);
+                                profile.peak_batch_path_bytes =
+                                    profile.peak_batch_path_bytes.max(batch_path_bytes);
+                                if let Some(metadata) = entry.hint.filter(|_| ordinary_file) {
+                                    results.push((id, parent, p, depth + 1, Ok(metadata), encoded));
+                                } else {
+                                    work_tx.send((id, parent, p, depth + 1)).map_err(|_| {
+                                        AppError::new("WORKER_FAILED", "元数据工作线程已退出")
+                                    })?;
+                                    pending += 1;
+                                }
+                                if results.len() + pending >= BATCH_ENTRIES
+                                    || pending >= 2000
+                                    || batch_path_bytes >= BATCH_PATH_BYTES
+                                    || batch_started.elapsed() >= Duration::from_millis(100)
+                                {
+                                    if profile.enabled {
+                                        profile.flush_entries_limit +=
+                                            usize::from(results.len() + pending >= BATCH_ENTRIES);
+                                        profile.flush_metadata_limit +=
+                                            usize::from(pending >= 2000);
+                                        profile.flush_path_limit +=
+                                            usize::from(batch_path_bytes >= BATCH_PATH_BYTES);
+                                        profile.flush_time_limit += usize::from(
+                                            batch_started.elapsed() >= Duration::from_millis(100),
+                                        );
+                                    }
+                                    flush_batch(
+                                        service,
+                                        &mut c,
+                                        scan_id,
+                                        pending,
+                                        &result_rx,
+                                        &mut results,
+                                        &mut directory_updates,
+                                        &mut profile,
+                                    )?;
+                                    pending = 0;
+                                    batch_path_bytes = 0;
+                                    consumed = 0;
+                                    queue_cursor.reset_after_flush();
+                                    batch_started = Instant::now();
+                                    refill = true;
+                                }
+                            }
+                            drop(permit);
+                        }
+                        DirectoryMessage::Error {
+                            parent,
+                            path,
+                            stage,
+                            error,
+                        } => record_error(service, &c, scan_id, parent, &path, stage, error)?,
+                        DirectoryMessage::Done(timings) => {
+                            in_flight -= 1;
+                            profile.enumerate_ms += timings.enumerate_ms;
+                            profile.directory_check_ms += timings.directory_check_ms;
+                            profile.encode_ms += timings.encode_ms;
+                            refill = true;
+                        }
+                        DirectoryMessage::Fatal(error) => return Err(error),
                     }
-                    DirectoryMessage::Error {
-                        parent,
-                        path,
-                        stage,
-                        error,
-                    } => record_error(service, &c, scan_id, parent, &path, stage, error)?,
-                    DirectoryMessage::Done(timings) => {
-                        in_flight -= 1;
-                        profile.enumerate_ms += timings.enumerate_ms;
-                        profile.directory_check_ms += timings.directory_check_ms;
-                        profile.encode_ms += timings.encode_ms;
-                        refill = true;
+                    // Metadata/entries now belong to the existing bounded writer
+                    // batch, or the error has been saved. Transfer their ownership
+                    // before returning this separate queue-only auxiliary charge.
+                    drop(auxiliary_permit);
+                    if last_emit.elapsed() >= Duration::from_millis(100) {
+                        emit_scan(service, scan_id, job, "running", "读取目录与元数据")?;
+                        last_emit = Instant::now();
                     }
-                    DirectoryMessage::Fatal(error) => return Err(error),
                 }
-                // Metadata/entries now belong to the existing bounded writer
-                // batch, or the error has been saved. Transfer their ownership
-                // before returning this separate queue-only auxiliary charge.
-                drop(auxiliary_permit);
-                if last_emit.elapsed() >= Duration::from_millis(100) {
-                    emit_scan(service, scan_id, job, "running", "读取目录与元数据")?;
-                    last_emit = Instant::now();
-                }
-            }
-            Ok(())
-        })();
+                Ok(())
+            })()
+        };
         // Dropping both channels wakes a reader blocked by backpressure, on
         // cancellation and on errors. Join it before flushing/finalizing state.
         drop(request_tx);
@@ -1531,6 +1769,10 @@ fn scan_sync_serial_with_queue_capacity(
         }
     }
     if let Some(error) = failed {
+        if let Err((connection, issue)) = c.close() {
+            drop(connection);
+            return Err(issue.into());
+        }
         return Err(error);
     }
     let scan = service.repo.scan(scan_id)?;
@@ -1962,14 +2204,136 @@ mod tests {
     // hooks. Serialize only their instrumentation, not production scan access.
     static READER_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
+    fn dynamic_reader_plan_gives_sixty_four_readers_committed_work() {
+        let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        for index in 0..64 {
+            let directory = source.join(format!("child-{index}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("file"), b"abc").unwrap();
+        }
+        let root = platform::absolute(&source).unwrap();
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(64);
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        *PARALLEL_WORK_HOOK.lock().unwrap() = Some(ParallelWorkHook {
+            root: root.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *PARALLEL_WORK_HOOK.lock().unwrap() = None;
+            }
+        }
+        let _clear = Clear;
+        std::thread::scope(|scope| {
+            let scan =
+                scope.spawn(|| writer_pipeline::scan(&service, &id, &root, &job, true, 64, 32));
+            let all_entered = (0..64)
+                .try_for_each(|_| entered_rx.recv_timeout(Duration::from_secs(5)).map(|_| ()));
+            let committed = service.repo.scan(&id).unwrap();
+            // Release even after a failed barrier so a test assertion cannot
+            // strand readers during the scope's mandatory joins.
+            for _ in 0..64 {
+                release_tx.send(()).unwrap();
+            }
+            let completed = scan.join().unwrap().unwrap();
+            all_entered.unwrap();
+            assert_eq!(committed.discovered_count, "65");
+            assert_eq!(completed.discovered_count, "129");
+            assert_eq!(completed.logical_total_bytes, "192");
+            assert_eq!(completed.status, "completed");
+            assert!(job.terminal());
+            let c = service.repo.connect().unwrap();
+            crate::repository::check_directory_metadata_complete(&c, &id).unwrap();
+        });
+    }
+
+    #[test]
+    fn partial_thread_start_failures_join_workers_close_and_allow_another_scan() {
+        let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
+        for (role, index, overlap, expected_started) in [
+            ("writer", 0, true, 0),
+            ("reader", 3, true, 4),
+            ("metadata", 2, true, 7),
+            ("reader", 3, false, 7),
+            ("metadata", 2, false, 2),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("preserved"), b"own data").unwrap();
+            let root = platform::absolute(&source).unwrap();
+            let service = Service::new(&fixture.path().join("data")).unwrap();
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            *START_FAULT.lock().unwrap() = Some(StartFault {
+                root: root.clone(),
+                role,
+                index,
+                active: active.clone(),
+                started: started.clone(),
+            });
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    *START_FAULT.lock().unwrap() = None;
+                }
+            }
+            let _clear = Clear;
+            let _mode = writer_pipeline::test_writer_mode(&root, overlap);
+            let scan = service.start_scan(root.clone(), None).unwrap();
+            let event = terminal(&service, &scan.scan_id);
+            assert_eq!(event.status, "failed", "{role}/{overlap}: {event:?}");
+            assert_eq!(event.error.unwrap().code, "WORKER_START_FAILED");
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            assert_eq!(started.load(Ordering::Acquire), expected_started);
+            assert_eq!(service.repo.scan(&scan.scan_id).unwrap().status, "failed");
+            assert_eq!(fs::read(source.join("preserved")).unwrap(), b"own data");
+            assert_eq!(
+                fs::metadata(service.repo.path.with_extension("sqlite3-wal"))
+                    .map_or(0, |m| m.len()),
+                0
+            );
+            *START_FAULT.lock().unwrap() = None;
+            let recovered = service.start_scan(root.clone(), None).unwrap();
+            assert_eq!(terminal(&service, &recovered.scan_id).status, "completed");
+            assert_eq!(
+                service
+                    .repo
+                    .scan(&recovered.scan_id)
+                    .unwrap()
+                    .logical_total_bytes,
+                "8"
+            );
+        }
+    }
+    #[test]
     fn parallel_readers_cancel_with_idle_peers_and_join_after_a_panic() {
         let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
-        for (readers, overlap) in [(4, false), (8, false), (8, true), (16, false), (16, true)] {
+        for (readers, overlap) in [
+            (4, false),
+            (8, false),
+            (8, true),
+            (16, false),
+            (16, true),
+            (1, true),
+            (3, true),
+            (24, true),
+            (64, true),
+        ] {
             let fixture = tempfile::tempdir().unwrap();
             let source = fixture.path().join("parallel-reader-source");
             fs::create_dir(&source).unwrap();
             fs::write(source.join("unread.txt"), b"abc").unwrap();
             let root = platform::absolute(&source).unwrap();
+            let _mode = writer_pipeline::test_writer_mode(&root, overlap);
             let service = Service::new(&fixture.path().join("data")).unwrap();
             let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
             let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
@@ -2201,6 +2565,11 @@ mod tests {
             (16, 32),
             (16, 64),
             (16, 128),
+            (1, 32),
+            (3, 32),
+            (12, 32),
+            (24, 32),
+            (64, 32),
         ] {
             for overlap in [false, true] {
                 let (parallel_scan, parallel) = run(true, readers, slots, overlap);
@@ -2491,6 +2860,7 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("live.txt"), b"abc").unwrap();
         let root = platform::absolute(&source).unwrap();
+        let _mode = writer_pipeline::test_writer_mode(&root, false);
         let service = Service::new(&fixture.path().join("data")).unwrap();
         let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
         let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
@@ -2854,6 +3224,7 @@ mod tests {
         let source = fixture.path().join("source");
         fs::create_dir(&source).unwrap();
         let root = platform::absolute(&source).unwrap();
+        let _mode = writer_pipeline::test_writer_mode(&root, false);
         let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         *DISPATCH_TEST_HOOK.lock().unwrap() = Some((root.clone(), entered_tx, release_rx));
@@ -3156,24 +3527,39 @@ mod directory_queue_tests {
         }
     }
     #[test]
-    fn reader_override_only_accepts_bounded_values_without_changing_default() {
-        assert_eq!(reader_count_override(Some("2")), 2);
-        assert_eq!(reader_count_override(Some("8")), 8);
-        assert_eq!(reader_count_override(Some("16")), 16);
-        for value in [
-            None,
-            Some("0"),
-            Some("1"),
-            Some("3"),
-            Some("32"),
-            Some("4 "),
-            Some("8 "),
-            Some("16 "),
-            Some("invalid"),
-        ] {
-            assert_eq!(reader_count_override(value), 4);
+    fn reader_defaults_use_detected_parallelism_and_checked_dynamic_limits() {
+        for detected in [1, 3, 12, 24, 64] {
+            for (value, expected) in [("2", 2), ("4", 4), ("8", 8), ("16", 16)] {
+                assert_eq!(reader_count_for(Some(value), detected), expected);
+            }
+            for value in [
+                None,
+                Some("0"),
+                Some("1"),
+                Some("3"),
+                Some("32"),
+                Some("4 "),
+                Some("8 "),
+                Some("16 "),
+                Some("invalid"),
+            ] {
+                assert_eq!(reader_count_for(value, detected), detected);
+            }
+            let plan = ReaderPlan::new(detected, DEFAULT_CONSUMED_LIMIT).unwrap();
+            assert_eq!(plan.readers, detected);
+            assert_eq!(plan.in_flight, detected.max(32));
+            assert_eq!(plan.ledger_limit, 2048 + detected.max(32));
         }
-        assert_eq!(reader_count_override(Some("4")), 4);
+        assert_eq!(reader_count_for(None, 0), 1);
+        for (readers, consumed) in [(0, 1024), (usize::MAX, 1024), (64, usize::MAX)] {
+            assert_eq!(
+                ReaderPlan::new(readers, consumed).err().unwrap().code,
+                "RESOURCE_LIMIT"
+            );
+        }
+        assert!(overlapping_writer(None));
+        assert!(overlapping_writer(Some("unknown")));
+        assert!(!overlapping_writer(Some("serial")));
         eprintln!(
             "reader owned layout: Metadata={}, DirectoryEntry={}, EncodedNode={}, chunk slot={}",
             std::mem::size_of::<platform::Metadata>(),
@@ -3181,6 +3567,23 @@ mod directory_queue_tests {
             std::mem::size_of::<EncodedNode>(),
             std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>()
         );
+    }
+
+    #[test]
+    fn system_processor_provider_uses_all_groups_and_falls_back_only_on_failure() {
+        assert_eq!(
+            processor_count_from_providers(128, || panic!("unexpected fallback")),
+            128
+        );
+        assert_eq!(
+            processor_count_from_providers(1, || panic!("unexpected fallback")),
+            1
+        );
+        assert_eq!(processor_count_from_providers(0, || 24), 24);
+        assert_eq!(processor_count_from_providers(0, || 0), 1);
+        let plan = ReaderPlan::new(processor_count_from_providers(128, || 16), 1024).unwrap();
+        assert_eq!(plan.in_flight, 128);
+        assert_eq!(plan.ledger_limit, 2176);
     }
 
     #[test]
