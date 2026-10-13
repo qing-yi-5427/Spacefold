@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
@@ -247,12 +247,24 @@ impl Repository {
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS nodes_parent_name_v2 ON nodes(scan_id,parent_id,name COLLATE NOCASE,id);
-    CREATE TABLE IF NOT EXISTS pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id));
+    CREATE TABLE IF NOT EXISTS pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS scan_errors(id INTEGER PRIMARY KEY AUTOINCREMENT,scan_id TEXT NOT NULL,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,scan_id TEXT NOT NULL,kind TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scan_sequence(next_id INTEGER NOT NULL CHECK(typeof(next_id)='integer' AND next_id>0));INSERT INTO scan_sequence SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM scan_sequence);
     UPDATE scans SET status='interrupted',finished=strftime('%Y-%m-%dT%H:%M:%fZ','now'),stale=1 WHERE status IN('running','queued','cancelling');
     DELETE FROM pending_dirs;")?;
+        let pending_without_rowid: bool = c.query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='pending_dirs'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !pending_without_rowid {
+            // Pending work is already discarded when active jobs become interrupted.
+            // Rebuild only that empty queue; saved nodes and scans stay in place.
+            let tx = c.unchecked_transaction()?;
+            tx.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
+            tx.commit()?;
+        }
         let version: i64 = c.query_row("SELECT version FROM schema_info", [], |r| r.get(0))?;
         if version != 1 {
             return Err(AppError::new(
@@ -268,7 +280,7 @@ impl Repository {
         if !has_sort_size {
             c.execute_batch("ALTER TABLE nodes ADD COLUMN sort_size INTEGER GENERATED ALWAYS AS (-logical_total) VIRTUAL;")?;
         }
-        c.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_parent_size_asc_v2; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
+        c.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_errors ON nodes(scan_id,id) WHERE error_code IS NOT NULL; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_parent_size_asc_v2; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
         let has_search_path: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('nodes') WHERE name='search_path')",
             [],
@@ -1191,21 +1203,51 @@ impl Repository {
         Ok(())
     }
     pub fn finish(&self, scan_id: &str, status: &str) -> Result<Scan> {
+        let started = Instant::now();
         let connection = self.connect()?;
         let c = connection.unchecked_transaction()?;
+        let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
         c.execute(
             "UPDATE scans SET status=?2,finished=?3,revision=revision+1 WHERE id=?1",
             params![scan_id, status, now()],
         )?;
+        let status_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut clear_incomplete_ms = 0.0;
+        let mut error_ancestors_ms = 0.0;
         if matches!(status, "completed" | "completed_with_errors") {
+            let started = Instant::now();
             c.execute("UPDATE nodes INDEXED BY nodes_incomplete SET incomplete=CASE WHEN error_code IS NULL THEN 0 ELSE 1 END WHERE scan_id=?1 AND incomplete=1",[scan_id])?;
+            clear_incomplete_ms = started.elapsed().as_secs_f64() * 1000.0;
             if status == "completed_with_errors" {
-                c.execute("WITH RECURSIVE affected(id) AS (SELECT id FROM nodes WHERE scan_id=?1 AND error_code IS NOT NULL UNION SELECT n.parent_id FROM affected a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET incomplete=1 WHERE scan_id=?1 AND id IN affected",[scan_id])?;
+                let started = Instant::now();
+                c.execute("WITH RECURSIVE affected(id) AS (SELECT id FROM nodes INDEXED BY nodes_errors WHERE scan_id=?1 AND error_code IS NOT NULL UNION SELECT n.parent_id FROM affected a CROSS JOIN nodes n ON n.scan_id=?1 AND n.id=a.id WHERE n.parent_id IS NOT NULL) UPDATE nodes SET incomplete=1 WHERE scan_id=?1 AND id IN affected",[scan_id])?;
+                error_ancestors_ms = started.elapsed().as_secs_f64() * 1000.0;
             }
         }
+        let started = Instant::now();
         c.execute("DELETE FROM pending_dirs WHERE scan_id=?1", [scan_id])?;
+        let delete_queue_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
         let result = Self::scan_conn(&c, scan_id)?;
+        let scan_read_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
         c.commit()?;
+        let commit_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        drop(connection);
+        let close_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var_os("SPACEFOLD_PROFILE").is_some() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"finishProfile": {
+                    "scanId": scan_id, "status": status, "connectMs": connect_ms,
+                    "statusMs": status_ms, "clearIncompleteMs": clear_incomplete_ms,
+                    "errorAncestorsMs": error_ancestors_ms, "deleteQueueMs": delete_queue_ms,
+                    "scanReadMs": scan_read_ms, "commitMs": commit_ms, "closeMs": close_ms
+                }})
+            );
+        }
         Ok(result)
     }
     pub fn mark_stale(&self, scan_id: &str) -> Result<u32> {
@@ -1850,6 +1892,199 @@ fn chart_node(
         *truncated = true;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod scan_storage_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Repository, PathBuf, String) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        std::fs::create_dir_all(root.join("bad")).unwrap();
+        std::fs::create_dir_all(root.join("good")).unwrap();
+        std::fs::write(root.join("bad/file.bin"), [1u8; 7]).unwrap();
+        std::fs::write(root.join("good/file.bin"), [2u8; 11]).unwrap();
+        let root = platform::absolute(&root).unwrap();
+        let repo = Repository::new(&fixture.path().join("db")).unwrap();
+        let scan_id = repo.new_scan_id().unwrap();
+        repo.insert_scan(&scan_id, &root, false).unwrap();
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        for (id, parent, name, depth) in [
+            (1, None, "", 0),
+            (2, Some(1), "bad", 1),
+            (3, Some(2), "bad/file.bin", 2),
+            (4, Some(1), "good", 1),
+            (5, Some(4), "good/file.bin", 2),
+        ] {
+            let path = root.join(name);
+            insert_node(
+                &tx,
+                &scan_id,
+                id,
+                parent,
+                &path,
+                depth,
+                &platform::metadata(&path).unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        (fixture, repo, root, scan_id)
+    }
+
+    #[test]
+    fn rowid_queue_upgrade_preserves_saved_nodes_and_interrupts_active_work() {
+        let (fixture, repo, root, saved_id) = fixture();
+        let saved = repo.finish(&saved_id, "completed").unwrap();
+        let saved_node = repo.node(&saved_id, "2", None).unwrap().node;
+        let active_id = repo.new_scan_id().unwrap();
+        repo.insert_scan(&active_id, &root, false).unwrap();
+        let c = repo.connect().unwrap();
+        c.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id));").unwrap();
+        c.execute(
+            "INSERT INTO pending_dirs VALUES(?1,1,?2,0)",
+            params![active_id, platform::encode_path(&root)],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE scans SET status='running' WHERE id=?1",
+            [&active_id],
+        )
+        .unwrap();
+        drop(c);
+        drop(repo);
+
+        let repo = Repository::new(&fixture.path().join("db")).unwrap();
+        assert_eq!(
+            serde_json::to_value(repo.scan(&saved_id).unwrap()).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(repo.node(&saved_id, "2", None).unwrap().node).unwrap(),
+            serde_json::to_value(saved_node).unwrap()
+        );
+        let recovered = repo.scan(&active_id).unwrap();
+        assert_eq!(recovered.status, "interrupted");
+        assert!(recovered.stale && recovered.incomplete);
+        let c = repo.connect().unwrap();
+        assert!(c
+            .query_row::<bool, _, _>(
+                "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='pending_dirs'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap());
+        assert_eq!(
+            c.query_row::<i64, _, _>("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
+                .unwrap(),
+            0
+        );
+        assert!(c.prepare("SELECT rowid FROM pending_dirs").is_err());
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY); INSERT INTO consumed_dirs VALUES(3);").unwrap();
+        for (scan_id, id) in [
+            (&active_id, 1),
+            (&active_id, 2),
+            (&active_id, 3),
+            (&active_id, 4),
+            (&saved_id, 7),
+        ] {
+            c.execute(
+                "INSERT INTO pending_dirs VALUES(?1,?2,?3,?2)",
+                params![scan_id, id, platform::encode_path(&root)],
+            )
+            .unwrap();
+        }
+        let mut stmt = c.prepare("SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2").unwrap();
+        let result = stmt
+            .query_map(params![active_id, 2], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(result.iter().map(|row| row.0).collect::<Vec<_>>(), [4, 2]);
+        assert!(result
+            .iter()
+            .all(|row| platform::decode_path(row.1.clone()) == root && row.2 == row.0 as u32));
+    }
+
+    #[test]
+    fn sparse_error_seed_preserves_only_error_branches_on_completion() {
+        let (_fixture, repo, root, scan_id) = fixture();
+        let other_id = repo.new_scan_id().unwrap();
+        repo.insert_scan(&other_id, &root, false).unwrap();
+        let mut c = repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        insert_node(
+            &tx,
+            &other_id,
+            1,
+            None,
+            &root,
+            0,
+            &platform::metadata(&root).unwrap(),
+            None,
+        )
+        .unwrap();
+        Repository::error_conn(
+            &tx,
+            &scan_id,
+            ScanError {
+                node_id: Some("3".into()),
+                display_path: platform::display(&root.join("bad/file.bin")),
+                stage: "enumerate".into(),
+                error: AppError::new("ACCESS_DENIED", "fixture"),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let mut plan = c.prepare("EXPLAIN QUERY PLAN SELECT id FROM nodes INDEXED BY nodes_errors WHERE scan_id=?1 AND error_code IS NOT NULL").unwrap();
+        let details = plan
+            .query_map([&scan_id], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| detail.contains("nodes_errors")),
+            "{details:?}"
+        );
+        let before = repo.scan(&scan_id).unwrap().revision;
+        let finished = repo.finish(&scan_id, "completed_with_errors").unwrap();
+        assert_eq!(finished.revision, before + 1);
+        assert_eq!(finished.error_count, "1");
+        for id in ["1", "2", "3"] {
+            assert!(repo.node(&scan_id, id, None).unwrap().node.incomplete);
+        }
+        for id in ["4", "5"] {
+            assert!(!repo.node(&scan_id, id, None).unwrap().node.incomplete);
+        }
+        assert!(repo.node(&other_id, "1", None).unwrap().node.incomplete);
+        assert_eq!(
+            c.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1",
+                [&scan_id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1",
+                [&other_id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
