@@ -18,6 +18,13 @@ struct ScanProfile {
     enabled: bool,
     enumerate_ms: f64,
     directory_queue_ms: f64,
+    directory_queue_read_ms: f64,
+    directory_queue_decode_ms: f64,
+    directory_queue_mark_ms: f64,
+    directory_queue_send_ms: f64,
+    directory_queue_error_ms: f64,
+    directory_queue_queries: usize,
+    directory_queue_read_rows: usize,
     reader_wait_ms: f64,
     directory_check_ms: f64,
     encode_ms: f64,
@@ -47,6 +54,46 @@ struct ScanProfile {
 }
 fn milliseconds(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
+}
+type QueuedDirectory = (i64, Vec<u8>, u32);
+const FIRST_PENDING_DIRECTORIES: &str = "SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
+const NEXT_PENDING_DIRECTORIES: &str = "SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id<?3 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
+
+#[derive(Default)]
+struct DirectoryQueueCursor {
+    before_id: Option<i64>,
+}
+impl DirectoryQueueCursor {
+    fn read(
+        &self,
+        c: &rusqlite::Connection,
+        scan_id: &str,
+        limit: usize,
+    ) -> Result<Vec<QueuedDirectory>> {
+        let mut statement = c.prepare_cached(if self.before_id.is_some() {
+            NEXT_PENDING_DIRECTORIES
+        } else {
+            FIRST_PENDING_DIRECTORIES
+        })?;
+        fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedDirectory> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        }
+        let found = if let Some(before_id) = self.before_id {
+            statement.query_map(params![scan_id, limit as i64, before_id], row)?
+        } else {
+            statement.query_map(params![scan_id, limit as i64], row)?
+        };
+        Ok(found.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    fn consume(&mut self, statement: &mut rusqlite::CachedStatement<'_>, id: i64) -> Result<()> {
+        statement.execute([id])?;
+        self.before_id = Some(id);
+        Ok(())
+    }
+    fn reset_after_flush(&mut self) {
+        // A committed batch can add newer directory IDs above the old watermark.
+        self.before_id = None;
+    }
 }
 type MetadataResult = (
     i64,
@@ -490,6 +537,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
         let result = (|| -> Result<()> {
             let mut in_flight = 0usize;
             let mut refill = true;
+            let mut queue_cursor = DirectoryQueueCursor::default();
             'directories: loop {
                 if job.cancel.load(Ordering::Acquire) {
                     break;
@@ -512,27 +560,26 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                     pending = 0;
                     batch_path_bytes = 0;
                     consumed = 0;
+                    queue_cursor.reset_after_flush();
                     batch_started = Instant::now();
                     refill = true;
                 }
                 if refill && in_flight < DIRECTORY_PREFETCH {
                     let started = Instant::now();
                     let limit = (DIRECTORY_PREFETCH - in_flight).min(256 - consumed);
-                    let directories = {
-                        let mut statement = c.prepare_cached("SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2")?;
-                        let found = statement
-                            .query_map(params![scan_id, limit as i64], |r| {
-                                Ok((
-                                    r.get::<_, i64>(0)?,
-                                    r.get::<_, Vec<u8>>(1)?,
-                                    r.get::<_, u32>(2)?,
-                                ))
-                            })?
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        found
-                    };
+                    let read_started = profile.enabled.then(Instant::now);
+                    let directories = queue_cursor.read(&c, scan_id, limit)?;
+                    if let Some(read_started) = read_started {
+                        profile.directory_queue_read_ms += milliseconds(read_started);
+                        profile.directory_queue_queries += 1;
+                        profile.directory_queue_read_rows += directories.len();
+                    }
+                    let mark_started = profile.enabled.then(Instant::now);
                     let mut mark_consumed =
                         c.prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")?;
+                    if let Some(mark_started) = mark_started {
+                        profile.directory_queue_mark_ms += milliseconds(mark_started);
+                    }
                     for (parent, path, depth) in directories {
                         #[cfg(test)]
                         {
@@ -553,10 +600,19 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         if reader_stop.load(Ordering::Acquire) {
                             return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                         }
+                        let decode_started = profile.enabled.then(Instant::now);
                         let path = platform::decode_path(path);
-                        mark_consumed.execute([parent])?;
+                        if let Some(decode_started) = decode_started {
+                            profile.directory_queue_decode_ms += milliseconds(decode_started);
+                        }
+                        let mark_started = profile.enabled.then(Instant::now);
+                        queue_cursor.consume(&mut mark_consumed, parent)?;
+                        if let Some(mark_started) = mark_started {
+                            profile.directory_queue_mark_ms += milliseconds(mark_started);
+                        }
                         consumed += 1;
                         if depth >= 4096 {
+                            let error_started = profile.enabled.then(Instant::now);
                             record_error(
                                 service,
                                 &c,
@@ -566,8 +622,16 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                                 "enumerate",
                                 AppError::new("DEPTH_LIMIT", "目录深度达到 4096，未继续读取"),
                             )?;
+                            if let Some(error_started) = error_started {
+                                profile.directory_queue_error_ms += milliseconds(error_started);
+                            }
                         } else {
-                            if request_tx.send((parent, path, depth)).is_err() {
+                            let send_started = profile.enabled.then(Instant::now);
+                            let sent = request_tx.send((parent, path, depth));
+                            if let Some(send_started) = send_started {
+                                profile.directory_queue_send_ms += milliseconds(send_started);
+                            }
+                            if sent.is_err() {
                                 if job.cancel.load(Ordering::Acquire) {
                                     break 'directories;
                                 }
@@ -593,6 +657,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                         pending = 0;
                         batch_path_bytes = 0;
                         consumed = 0;
+                        queue_cursor.reset_after_flush();
                         batch_started = Instant::now();
                         refill = true;
                         continue;
@@ -677,6 +742,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
                                 pending = 0;
                                 batch_path_bytes = 0;
                                 consumed = 0;
+                                queue_cursor.reset_after_flush();
                                 batch_started = Instant::now();
                                 refill = true;
                             }
@@ -1313,5 +1379,128 @@ mod tests {
         assert_eq!(committed.discovered_count, "1");
         assert_eq!(event.revision, committed.revision);
         assert_eq!(event.discovered_count, committed.discovered_count);
+    }
+}
+
+#[cfg(test)]
+mod directory_queue_tests {
+    use super::*;
+
+    fn connection(count: i64) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID; CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);").unwrap();
+        for id in 1..=count {
+            c.execute(
+                "INSERT INTO pending_dirs VALUES('s',?1,?2,?1)",
+                params![id, id.to_le_bytes().as_slice()],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO pending_dirs VALUES('other',?1,?2,0)",
+            params![count + 2, b"other".as_slice()],
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn one_directory_refills_match_legacy_order_across_flush_and_new_ids() {
+        let c = connection(400);
+        let mut cursor = DirectoryQueueCursor::default();
+        let mut seen = Vec::new();
+        loop {
+            let found = cursor.read(&c, "s", 1).unwrap();
+            let legacy = DirectoryQueueCursor::default().read(&c, "s", 1).unwrap();
+            assert_eq!(found, legacy);
+            let Some((id, path, depth)) = found.first() else {
+                break;
+            };
+            assert_eq!(*depth, *id as u32);
+            assert_eq!(path, &id.to_le_bytes());
+            let mut mark = c
+                .prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")
+                .unwrap();
+            cursor.consume(&mut mark, *id).unwrap();
+            drop(mark);
+            seen.push(*id);
+            if seen.len() == 256 {
+                let tx = c.unchecked_transaction().unwrap();
+                tx.execute(
+                    "DELETE FROM pending_dirs WHERE scan_id='s' AND id IN consumed_dirs",
+                    [],
+                )
+                .unwrap();
+                tx.execute("DELETE FROM consumed_dirs", []).unwrap();
+                for id in [1000i64, 1001] {
+                    tx.execute(
+                        "INSERT INTO pending_dirs VALUES('s',?1,?2,?1)",
+                        params![id, id.to_le_bytes().as_slice()],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+                cursor.reset_after_flush();
+            }
+        }
+        let expected = (145..=400)
+            .rev()
+            .chain([1001, 1000])
+            .chain((1..=144).rev())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            402
+        );
+    }
+
+    #[test]
+    fn unread_or_failed_dispatch_does_not_advance_past_queued_directories() {
+        let c = connection(40);
+        let mut cursor = DirectoryQueueCursor::default();
+        let first = cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap();
+        assert_eq!(cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap(), first);
+        let mut mark = c
+            .prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")
+            .unwrap();
+        for (id, _, _) in first.iter().take(5) {
+            cursor.consume(&mut mark, *id).unwrap();
+        }
+        let remainder = cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap();
+        assert_eq!(remainder.first().unwrap().0, 35);
+        c.execute_batch("CREATE TEMP TRIGGER reject_consumed BEFORE INSERT ON consumed_dirs WHEN NEW.id=35 BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        assert!(cursor.consume(&mut mark, 35).is_err());
+        assert_eq!(cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap(), remainder);
+        c.execute_batch("DROP TRIGGER reject_consumed;").unwrap();
+        let mut seen = first.iter().take(5).map(|row| row.0).collect::<Vec<_>>();
+        while let Some((id, _, _)) = cursor.read(&c, "s", 1).unwrap().first() {
+            cursor.consume(&mut mark, *id).unwrap();
+            seen.push(*id);
+        }
+        assert_eq!(seen, (1..=40).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn descending_watermark_uses_the_scan_and_id_primary_key_range() {
+        let c = connection(40);
+        let mut statement = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {NEXT_PENDING_DIRECTORIES}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params!["s", 1, 35], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("PRIMARY KEY")
+                    && detail.contains("scan_id=? AND id<?")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 }
