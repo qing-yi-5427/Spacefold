@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "scan_pipeline.rs"]
+mod writer_pipeline;
+
 #[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanProfile {
@@ -939,6 +942,33 @@ fn scan_sync_with_queue_capacity(
     readers: usize,
     output_slots: usize,
 ) -> Result<Scan> {
+    #[cfg(test)]
+    if writer_pipeline::test_overlapping_root(root) {
+        return writer_pipeline::scan(service, scan_id, root, job, fast, readers, output_slots);
+    }
+    if std::env::var("SPACEFOLD_WRITER_MODE").ok().as_deref() == Some("overlap") {
+        writer_pipeline::scan(service, scan_id, root, job, fast, readers, output_slots)
+    } else {
+        scan_sync_serial_with_queue_capacity(
+            service,
+            scan_id,
+            root,
+            job,
+            fast,
+            readers,
+            output_slots,
+        )
+    }
+}
+fn scan_sync_serial_with_queue_capacity(
+    service: &Service,
+    scan_id: &str,
+    root: &Path,
+    job: &JobRuntime,
+    fast: bool,
+    readers: usize,
+    output_slots: usize,
+) -> Result<Scan> {
     assert!(matches!(readers, 2 | 4));
     assert!(matches!(output_slots, 32 | 64 | 128));
     let started = Instant::now();
@@ -1607,6 +1637,30 @@ fn flush_batch(
     directory_updates: &mut Vec<DirectoryMetadataUpdate>,
     profile: &mut ScanProfile,
 ) -> Result<()> {
+    flush_batch_with_errors(
+        service,
+        c,
+        scan_id,
+        count,
+        receiver,
+        results,
+        directory_updates,
+        &mut Vec::new(),
+        profile,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Both packet buffers and errors share one revision transaction.
+fn flush_batch_with_errors(
+    service: &Service,
+    c: &mut rusqlite::Connection,
+    scan_id: &str,
+    count: usize,
+    receiver: &crossbeam_channel::Receiver<MetadataResult>,
+    results: &mut Vec<MetadataResult>,
+    directory_updates: &mut Vec<DirectoryMetadataUpdate>,
+    errors: &mut Vec<writer_pipeline::PendingScanError>,
+    profile: &mut ScanProfile,
+) -> Result<()> {
     let flush_started = Instant::now();
     let metadata_started = Instant::now();
     for _ in 0..count {
@@ -1625,144 +1679,166 @@ fn flush_batch(
     let wait_started = Instant::now();
     let _writer = service.writer.lock().unwrap();
     profile.writer_wait_ms += milliseconds(wait_started);
-    let tx = c.transaction()?;
-    let insert_started = Instant::now();
-    let mut inserter = NodeInserter::new(&tx, profile.enabled)?;
-    let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
-    // Enumeration assigns increasing stable IDs. Sort the exceptional worker
-    // results back into that order so primary/index inserts remain sequential.
-    results.sort_unstable_by_key(|entry| entry.0);
-    for (id, parent, path, depth, result, encoded) in results.drain(..) {
-        let totals = aggregates.entry(parent).or_default();
-        totals[5] += 1;
-        match result {
-            Ok(m) => {
-                totals[0] = crate::repository::checked_add(totals[0], integer(m.logical)?)?;
-                totals[1] = crate::repository::checked_add(
-                    totals[1],
-                    m.allocated.map(integer).transpose()?.unwrap_or(0),
-                )?;
-                totals[2] += i64::from(m.allocated.is_none());
-                totals[3] += i64::from(m.kind == "file");
-                totals[4] += i64::from(m.kind == "directory");
-                let cloud_skip = m.kind == "directory" && !m.recurse && m.cloud_state.is_some();
-                let error = cloud_skip.then(|| {
-                    AppError::new(
-                        "CLOUD_DIRECTORY_SKIPPED",
-                        "云目录可能需要召回；未枚举其内容",
-                    )
-                });
-                if let Some(encoded) = encoded {
-                    inserter.insert_encoded(
-                        scan_id,
-                        id,
-                        Some(parent),
-                        depth,
-                        &m,
-                        error.as_ref(),
-                        &encoded,
+    // The guard stays outside the unwind boundary. A panic rolls back the
+    // transaction before the lock is normally released, without poisoning the
+    // job's failure-finalization path.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let tx = c.transaction()?;
+        let insert_started = Instant::now();
+        let mut inserter = NodeInserter::new(&tx, profile.enabled)?;
+        let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
+        // Enumeration assigns increasing stable IDs. Sort the exceptional worker
+        // results back into that order so primary/index inserts remain sequential.
+        results.sort_unstable_by_key(|entry| entry.0);
+        for (id, parent, path, depth, result, encoded) in results.drain(..) {
+            let totals = aggregates.entry(parent).or_default();
+            totals[5] += 1;
+            match result {
+                Ok(m) => {
+                    totals[0] = crate::repository::checked_add(totals[0], integer(m.logical)?)?;
+                    totals[1] = crate::repository::checked_add(
+                        totals[1],
+                        m.allocated.map(integer).transpose()?.unwrap_or(0),
                     )?;
-                } else {
-                    inserter.insert(scan_id, id, Some(parent), &path, depth, &m, error.as_ref())?;
+                    totals[2] += i64::from(m.allocated.is_none());
+                    totals[3] += i64::from(m.kind == "file");
+                    totals[4] += i64::from(m.kind == "directory");
+                    let cloud_skip = m.kind == "directory" && !m.recurse && m.cloud_state.is_some();
+                    let error = cloud_skip.then(|| {
+                        AppError::new(
+                            "CLOUD_DIRECTORY_SKIPPED",
+                            "云目录可能需要召回；未枚举其内容",
+                        )
+                    });
+                    if let Some(encoded) = encoded {
+                        inserter.insert_encoded(
+                            scan_id,
+                            id,
+                            Some(parent),
+                            depth,
+                            &m,
+                            error.as_ref(),
+                            &encoded,
+                        )?;
+                    } else {
+                        inserter.insert(
+                            scan_id,
+                            id,
+                            Some(parent),
+                            &path,
+                            depth,
+                            &m,
+                            error.as_ref(),
+                        )?;
+                    }
+                    if let Some(error) = error {
+                        Repository::error_conn(
+                            &tx,
+                            scan_id,
+                            ScanError {
+                                node_id: Some(id.to_string()),
+                                display_path: platform::display(&path),
+                                stage: "cloud_local_only".into(),
+                                error,
+                            },
+                        )?;
+                    }
                 }
-                if let Some(error) = error {
+                Err(error) => {
+                    if error.code == "WORKER_FAILED" {
+                        return Err(error);
+                    }
+                    totals[2] += 1;
+                    let m = platform::Metadata {
+                        kind: "other".into(),
+                        logical: 0,
+                        allocated: None,
+                        modified: None,
+                        identity: None,
+                        links: None,
+                        attributes: 0,
+                        reparse_tag: 0,
+                        link_type: None,
+                        link_target: None,
+                        cloud_state: None,
+                        allocation_method: None,
+                        recurse: false,
+                    };
+                    inserter.insert(scan_id, id, Some(parent), &path, depth, &m, Some(&error))?;
                     Repository::error_conn(
                         &tx,
                         scan_id,
                         ScanError {
                             node_id: Some(id.to_string()),
                             display_path: platform::display(&path),
-                            stage: "cloud_local_only".into(),
+                            stage: "metadata".into(),
                             error,
                         },
                     )?;
                 }
             }
-            Err(error) => {
-                if error.code == "WORKER_FAILED" {
-                    return Err(error);
-                }
-                totals[2] += 1;
-                let m = platform::Metadata {
-                    kind: "other".into(),
-                    logical: 0,
-                    allocated: None,
-                    modified: None,
-                    identity: None,
-                    links: None,
-                    attributes: 0,
-                    reparse_tag: 0,
-                    link_type: None,
-                    link_target: None,
-                    cloud_state: None,
-                    allocation_method: None,
-                    recurse: false,
-                };
-                inserter.insert(scan_id, id, Some(parent), &path, depth, &m, Some(&error))?;
-                Repository::error_conn(
-                    &tx,
-                    scan_id,
-                    ScanError {
-                        node_id: Some(id.to_string()),
-                        display_path: platform::display(&path),
-                        stage: "metadata".into(),
-                        error,
-                    },
-                )?;
-            }
         }
-    }
-    if let Some(timings) = &inserter.timings {
-        profile.encode_ms += timings.encode_ms;
-        profile.sql_insert_ms += timings.sql_ms;
-        profile.pending_insert_ms += timings.pending_ms;
-    }
-    drop(inserter);
-    let metadata_started = profile.enabled.then(Instant::now);
-    if profile.enabled {
-        profile.directory_metadata_updates += directory_updates.len();
-    }
-    for update in directory_updates.drain(..) {
-        apply_directory_metadata(&tx, scan_id, &update)?;
-    }
-    if let Some(started) = metadata_started {
-        profile.directory_metadata_apply_ms += milliseconds(started);
-    }
-    profile.insert_ms += milliseconds(insert_started);
-    let aggregate_started = Instant::now();
-    let aggregation = aggregate_many(&tx, scan_id, &aggregates)?;
-    profile.aggregate_direct_parents += aggregation.direct_parents;
-    profile.aggregate_ancestor_rows += aggregation.ancestor_rows;
-    profile.aggregate_fallback_batches += usize::from(!aggregation.coalesced);
-    tx.execute(
-        "UPDATE scans SET revision=revision+1 WHERE id=?1",
-        [scan_id],
-    )?;
-    tx.execute(
-        "DELETE FROM pending_dirs WHERE scan_id=?1 AND id IN consumed_dirs",
-        [scan_id],
-    )?;
-    tx.execute("DELETE FROM consumed_dirs", [])?;
-    profile.aggregate_ms += milliseconds(aggregate_started);
-    let commit_started = Instant::now();
-    let commit_window = profile
-        .reader_wait_probe
-        .as_ref()
-        .map(|probe| probe.begin(ReaderWaitRole::Commit));
-    tx.commit()?;
-    drop(commit_window);
-    drop(flush_window);
-    let commit_ms = milliseconds(commit_started);
-    profile.commit_ms += commit_ms;
-    if profile.enabled {
-        profile.writer_observation.on_commit(c, scan_id, commit_ms);
-    }
-    profile.batches += 1;
-    profile.max_flush_ms = profile.max_flush_ms.max(milliseconds(flush_started));
-    if profile.first_commit_ms.is_none() && profile.peak_batch_entries > 0 {
-        profile.first_commit_ms = profile.started.map(milliseconds);
-    }
-    Ok(())
+        if let Some(timings) = &inserter.timings {
+            profile.encode_ms += timings.encode_ms;
+            profile.sql_insert_ms += timings.sql_ms;
+            profile.pending_insert_ms += timings.pending_ms;
+        }
+        drop(inserter);
+        let metadata_started = profile.enabled.then(Instant::now);
+        if profile.enabled {
+            profile.directory_metadata_updates += directory_updates.len();
+        }
+        for update in directory_updates.drain(..) {
+            apply_directory_metadata(&tx, scan_id, &update)?;
+        }
+        writer_pipeline::persist_errors(&tx, scan_id, errors)?;
+        if let Some(started) = metadata_started {
+            profile.directory_metadata_apply_ms += milliseconds(started);
+        }
+        profile.insert_ms += milliseconds(insert_started);
+        let aggregate_started = Instant::now();
+        let aggregation = aggregate_many(&tx, scan_id, &aggregates)?;
+        profile.aggregate_direct_parents += aggregation.direct_parents;
+        profile.aggregate_ancestor_rows += aggregation.ancestor_rows;
+        profile.aggregate_fallback_batches += usize::from(!aggregation.coalesced);
+        tx.execute(
+            "UPDATE scans SET revision=revision+1 WHERE id=?1",
+            [scan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_dirs WHERE scan_id=?1 AND id IN consumed_dirs",
+            [scan_id],
+        )?;
+        tx.execute("DELETE FROM consumed_dirs", [])?;
+        #[cfg(test)]
+        writer_pipeline::test_before_commit(scan_id, &service.repo.data_dir);
+        profile.aggregate_ms += milliseconds(aggregate_started);
+        let commit_started = Instant::now();
+        let commit_window = profile
+            .reader_wait_probe
+            .as_ref()
+            .map(|probe| probe.begin(ReaderWaitRole::Commit));
+        tx.commit()?;
+        drop(commit_window);
+        drop(flush_window);
+        let commit_ms = milliseconds(commit_started);
+        profile.commit_ms += commit_ms;
+        if profile.enabled {
+            profile.writer_observation.on_commit(c, scan_id, commit_ms);
+        }
+        profile.batches += 1;
+        profile.max_flush_ms = profile.max_flush_ms.max(milliseconds(flush_started));
+        if profile.first_commit_ms.is_none() && profile.peak_batch_entries > 0 {
+            profile.first_commit_ms = profile.started.map(milliseconds);
+        }
+        Ok(())
+    }))
+    .unwrap_or_else(|_| {
+        Err(AppError::new(
+            "WORKER_FAILED",
+            "扫描写入事务异常，已回滚当前批次",
+        ))
+    })
 }
 pub fn emit_scan(
     service: &Service,
@@ -2038,13 +2114,18 @@ mod tests {
         fs::write(root.join("empty.bin"), b"").unwrap();
         let root = platform::absolute(&root).unwrap();
         let service = Service::new(&fixture.path().join("data")).unwrap();
-        let run = |fast, readers, slots| {
+        let run = |fast, readers, slots, overlap| {
             let id = service.repo.new_scan_id().unwrap();
             service.repo.insert_scan(&id, &root, false).unwrap();
             let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
-            let scan =
-                scan_sync_with_queue_capacity(&service, &id, &root, &job, fast, readers, slots)
-                    .unwrap();
+            let scan = if overlap {
+                writer_pipeline::scan(&service, &id, &root, &job, fast, readers, slots)
+            } else {
+                scan_sync_serial_with_queue_capacity(
+                    &service, &id, &root, &job, fast, readers, slots,
+                )
+            }
+            .unwrap();
             assert!(job.terminal());
             assert_eq!(scan.status, "completed");
             let connection = service.repo.connect().unwrap();
@@ -2063,41 +2144,44 @@ mod tests {
                 .collect::<std::collections::BTreeMap<_, _>>();
             (scan, nodes)
         };
-        let (old, legacy) = run(false, 2, 32);
-        let (new, bulk) = run(true, 2, 32);
+        let (old, legacy) = run(false, 2, 32, false);
+        let (new, bulk) = run(true, 2, 32, false);
         for slots in [32, 64, 128] {
-            let (parallel_scan, parallel) = run(true, 4, slots);
-            assert_eq!(new.discovered_count, parallel_scan.discovered_count);
-            assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
-            assert_eq!(new.error_count, parallel_scan.error_count);
-            assert!(bulk.keys().eq(parallel.keys()));
-            for (path, node) in &bulk {
-                let parent_path = |nodes: &std::collections::BTreeMap<Vec<u8>, StoredNode>,
-                                   parent: &Option<String>| {
-                    parent.as_ref().map(|id| {
-                        nodes
-                            .values()
-                            .find(|n| &n.node.node_id == id)
-                            .map(|n| platform::encode_path(&n.path))
-                            .unwrap()
-                    })
-                };
-                assert_eq!(
-                    parent_path(&bulk, &node.node.parent_id),
-                    parent_path(&parallel, &parallel[path].node.parent_id)
-                );
-                let mut two = node.node.clone();
-                let mut four = parallel[path].node.clone();
-                // Discovery IDs and revisions are scheduling details. Every saved
-                // path, own metadata and aggregate remains identical.
-                two.node_id.clear();
-                four.node_id.clear();
-                two.parent_id = None;
-                four.parent_id = None;
-                assert_eq!(
-                    serde_json::to_value(two).unwrap(),
-                    serde_json::to_value(four).unwrap()
-                );
+            for overlap in [false, true] {
+                let (parallel_scan, parallel) = run(true, 4, slots, overlap);
+                assert_eq!(new.discovered_count, parallel_scan.discovered_count);
+                assert_eq!(new.logical_total_bytes, parallel_scan.logical_total_bytes);
+                assert_eq!(new.error_count, parallel_scan.error_count);
+                assert!(bulk.keys().eq(parallel.keys()));
+                for (path, node) in &bulk {
+                    let parent_path =
+                        |nodes: &std::collections::BTreeMap<Vec<u8>, StoredNode>,
+                         parent: &Option<String>| {
+                            parent.as_ref().map(|id| {
+                                nodes
+                                    .values()
+                                    .find(|n| &n.node.node_id == id)
+                                    .map(|n| platform::encode_path(&n.path))
+                                    .unwrap()
+                            })
+                        };
+                    assert_eq!(
+                        parent_path(&bulk, &node.node.parent_id),
+                        parent_path(&parallel, &parallel[path].node.parent_id)
+                    );
+                    let mut two = node.node.clone();
+                    let mut four = parallel[path].node.clone();
+                    // Discovery IDs and revisions are scheduling details. Every saved
+                    // path, own metadata and aggregate remains identical.
+                    two.node_id.clear();
+                    four.node_id.clear();
+                    two.parent_id = None;
+                    four.parent_id = None;
+                    assert_eq!(
+                        serde_json::to_value(two).unwrap(),
+                        serde_json::to_value(four).unwrap()
+                    );
+                }
             }
         }
         assert_eq!(old.discovered_count, new.discovered_count);
