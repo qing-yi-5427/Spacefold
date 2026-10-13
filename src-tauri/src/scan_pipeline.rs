@@ -864,22 +864,32 @@ fn collect_directories(
     Ok(())
 }
 
+// The sole writer owns its connection and channel endpoints. Keep the
+// checkpoint policy explicit without sharing that ownership with the helper.
+#[allow(clippy::too_many_arguments)]
 fn write_loop(
     service: &Service,
     scan_id: &str,
+    root: &Path,
     job: &JobRuntime,
     mut c: rusqlite::Connection,
     commands: Receiver<WriteCommand>,
     acknowledgements: Sender<Result<CommitAck>>,
     mut profile: ScanProfile,
+    checkpoint_mode: checkpoint::Mode,
 ) -> Result<WriterResult> {
-    let outcome = (|| -> Result<Scan> {
+    let mut helper =
+        checkpoint::CheckpointHelper::start(&service.repo, root, checkpoint_mode, profile.enabled);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Scan> {
+        let helper = helper.as_mut().map_err(|error| error.clone())?;
         for command in commands {
             match command {
                 WriteCommand::Batch {
                     sequence,
                     mut batch,
                 } => {
+                    helper.before_batch(&c, &job.cancel)?;
+                    let previous_commit_ms = profile.commit_ms;
                     let (_, empty) = crossbeam_channel::bounded(0);
                     let result = (|| -> Result<()> {
                         {
@@ -928,8 +938,19 @@ fn write_loop(
                             consumed: batch.consumed,
                         }))
                         .map_err(|_| AppError::new("WORKER_FAILED", "扫描协调线程已退出"))?;
+                    // Publish the committed parents before any checkpoint observation
+                    // or pressure gate. The gate applies only to the next transaction.
+                    if profile.enabled {
+                        profile.writer_observation.on_commit(
+                            &c,
+                            scan_id,
+                            profile.commit_ms - previous_commit_ms,
+                        );
+                    }
+                    helper.after_commit(&c)?;
                 }
                 WriteCommand::Finish => {
+                    profile.checkpoint_helper = helper.shutdown()?;
                     if !job.cancel.load(Ordering::Acquire) {
                         crate::repository::check_directory_metadata_complete(&c, scan_id)?;
                     }
@@ -958,7 +979,16 @@ fn write_loop(
             }
         }
         Err(AppError::new("WORKER_FAILED", "扫描协调线程中断"))
-    })();
+    }))
+    .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描写入与检查点协调异常")));
+    // Abort/error paths must also release and join the helper before the writer's
+    // explicit close. Shutdown is idempotent after Finish or cancellation.
+    let checkpoint_close = match helper.as_mut() {
+        Ok(helper) => helper
+            .shutdown()
+            .map(|stats| profile.checkpoint_helper = stats),
+        Err(_) => Ok(()),
+    };
     let statistics = (|| -> Result<()> {
         if profile.enabled {
             for (operation, value) in [
@@ -998,7 +1028,17 @@ fn write_loop(
         AppError::from(error)
     });
     profile.close_ms = milliseconds(close_started);
+    if outcome
+        .as_ref()
+        .is_err_and(|error| error.code == "SCAN_ABORTED")
+    {
+        checkpoint_close?;
+        statistics?;
+        close?;
+        return outcome.map(|scan| WriterResult { scan, profile });
+    }
     let scan = outcome?;
+    checkpoint_close?;
     statistics?;
     close?;
     #[cfg(test)]
@@ -1014,6 +1054,7 @@ fn write_loop(
 }
 
 fn merge_writer_profile(target: &mut ScanProfile, source: ScanProfile) {
+    target.checkpoint_helper = source.checkpoint_helper;
     target.metadata_wait_ms += source.metadata_wait_ms;
     target.writer_wait_ms += source.writer_wait_ms;
     target.insert_ms += source.insert_ms;
@@ -1075,6 +1116,8 @@ pub(super) fn scan(
     let started = Instant::now();
     let consumed_limit =
         consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
+    let checkpoint_mode =
+        checkpoint::Mode::from_override(std::env::var("SPACEFOLD_CHECKPOINT_MODE").ok().as_deref());
     let plan = ReaderPlan::new(reader_count, consumed_limit)?;
     let enabled = std::env::var_os("SPACEFOLD_PROFILE").is_some();
     let mut profile = ScanProfile {
@@ -1084,6 +1127,7 @@ pub(super) fn scan(
         directory_readers: plan.readers,
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "overlap",
+        checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
             * (std::mem::size_of::<ReaderMessage>()
@@ -1132,6 +1176,7 @@ pub(super) fn scan(
     let stop = Arc::new(AtomicBool::new(false));
     let writer_profile = ScanProfile {
         enabled,
+        defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
         ..Default::default()
@@ -1153,11 +1198,13 @@ pub(super) fn scan(
                 write_loop(
                     service,
                     scan_id,
+                    root,
                     job,
                     c,
                     input,
                     acknowledgements,
                     writer_profile,
+                    checkpoint_mode,
                 )
             }))
             .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描写线程异常退出")))
@@ -1371,6 +1418,11 @@ pub(super) fn scan(
         let written = writer
             .join()
             .unwrap_or_else(|_| Err(AppError::new("WORKER_FAILED", "扫描写线程异常退出")));
+        if let Err(error) = &written {
+            if error.code != "SCAN_ABORTED" {
+                return Err(error.clone());
+            }
+        }
         outcome?;
         sent.map_err(|_| AppError::new("WORKER_FAILED", "扫描写线程已退出"))?;
         written
@@ -1521,6 +1573,261 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_failures_finish_the_service_job_and_allow_a_new_scan() {
+        let _control = fault_control();
+        let _start_control = START_FAULT_TEST_LOCK.lock().unwrap();
+        for (fault, spawn_failure, expected) in [
+            (checkpoint::Fault::None, true, "WORKER_START_FAILED"),
+            (checkpoint::Fault::StartSql, false, "DATABASE_ERROR"),
+            (checkpoint::Fault::NoopSql, false, "DATABASE_ERROR"),
+            (checkpoint::Fault::Sql, false, "DATABASE_ERROR"),
+            (checkpoint::Fault::Panic, false, "CHECKPOINT_WORKER_FAILED"),
+            (checkpoint::Fault::Close, false, "DATABASE_CLOSE"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir_all(source.join("child")).unwrap();
+            fs::write(source.join("child/file"), b"abc").unwrap();
+            let root = platform::absolute(&source).unwrap();
+            let service = Service::new(&temp.path().join("data")).unwrap();
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            *START_FAULT.lock().unwrap() = Some(StartFault {
+                root: root.clone(),
+                role: if spawn_failure {
+                    "checkpoint"
+                } else {
+                    "observe"
+                },
+                index: 0,
+                active: active.clone(),
+                started: started.clone(),
+            });
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    *START_FAULT.lock().unwrap() = None;
+                }
+            }
+            let _clear = Clear;
+            let settings = checkpoint::TestGuard::install(
+                &root,
+                checkpoint::TestSettings {
+                    force_passive: true,
+                    trigger_bytes: Some(1),
+                    fault,
+                    // Force a genuine helper operation before admitting a package.
+                    // This makes the worker SQL/panic fault independent of scheduling.
+                    unknown_observation: matches!(
+                        fault,
+                        checkpoint::Fault::Sql | checkpoint::Fault::Panic
+                    ),
+                    ..Default::default()
+                },
+            );
+            let scan = service.start_scan(root.clone(), None).unwrap();
+            let event = terminal(&service, &scan.scan_id);
+            assert_eq!(
+                event.status, "failed",
+                "{fault:?}/{spawn_failure}: {event:?}"
+            );
+            assert_eq!(event.error.unwrap().code, expected);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            assert!(started.load(Ordering::Acquire) >= 1);
+            let saved = service.repo.scan(&scan.scan_id).unwrap();
+            assert_eq!(saved.status, "failed");
+            assert!(parse_bytes(&saved.discovered_count).unwrap() >= 1);
+            assert_eq!(fs::read(source.join("child/file")).unwrap(), b"abc");
+            assert_eq!(
+                fs::metadata(service.repo.path.with_extension("sqlite3-wal"))
+                    .map_or(0, |m| m.len()),
+                0
+            );
+            drop(settings);
+            *START_FAULT.lock().unwrap() = None;
+            let recovered = service.start_scan(root.clone(), None).unwrap();
+            assert_eq!(terminal(&service, &recovered.scan_id).status, "completed");
+            assert_eq!(
+                service
+                    .repo
+                    .scan(&recovered.scan_id)
+                    .unwrap()
+                    .logical_total_bytes,
+                "3"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_ack_precedes_pressure_and_cancel_commits_the_accepted_next_packet() {
+        let _control = fault_control();
+        let (_temp, service, root, id) = setup();
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        c.query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        let (entered, entered_rx) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::unbounded();
+        let _settings = checkpoint::TestGuard::install(
+            &root,
+            checkpoint::TestSettings {
+                force_passive: true,
+                trigger_bytes: Some(1),
+                pressure_bytes: Some(1),
+                entered: Some(entered),
+                release: Some(release_rx),
+                ..Default::default()
+            },
+        );
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        std::thread::scope(|scope| {
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, acknowledgements) = crossbeam_channel::bounded(1);
+            let worker = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile::default(),
+                    checkpoint::Mode::Passive,
+                )
+            });
+            struct Unblock(crossbeam_channel::Sender<()>);
+            impl Drop for Unblock {
+                fn drop(&mut self) {
+                    for _ in 0..16 {
+                        let _ = self.0.send(());
+                    }
+                }
+            }
+            let _unblock = Unblock(release.clone());
+            let mut first = WriteBatch::new(1024);
+            first.rows.push(row(2, &root, "first"));
+            commands
+                .send(WriteCommand::Batch {
+                    sequence: 1,
+                    batch: first,
+                })
+                .unwrap();
+            let committed = acknowledgements
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.sequence, 1);
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            drop(entered_rx);
+            let mut next = WriteBatch::new(1024);
+            next.rows.push(row(3, &root, "accepted-next"));
+            commands
+                .send(WriteCommand::Batch {
+                    sequence: 2,
+                    batch: next,
+                })
+                .unwrap();
+            let was_blocked = acknowledgements
+                .recv_timeout(Duration::from_millis(50))
+                .is_err();
+            let remained_unwritten = service.repo.node(&id, "3", None).is_err();
+            job.cancel.store(true, Ordering::Release);
+            // Always release before asserting, including a failed pressure gate.
+            release.send(()).unwrap();
+            drop(release);
+            drop(_unblock);
+            let second = acknowledgements
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(second.sequence, 2);
+            commands.send(WriteCommand::Finish).unwrap();
+            drop(commands);
+            let saved = worker.join().unwrap().unwrap().scan;
+            assert!(was_blocked && remained_unwritten);
+            assert_eq!(saved.status, "cancelled");
+            assert_eq!(saved.discovered_count, "3");
+            assert_eq!(
+                service
+                    .repo
+                    .node(&id, "1", None)
+                    .unwrap()
+                    .node
+                    .children_count,
+                "2"
+            );
+            assert_eq!(
+                fs::metadata(service.repo.path.with_extension("sqlite3-wal"))
+                    .map_or(0, |m| m.len()),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_helper_must_exit_before_the_service_success_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        for i in 0..64 {
+            fs::create_dir_all(source.join(format!("child-{i}"))).unwrap();
+            fs::write(source.join(format!("child-{i}/file")), b"abc").unwrap();
+        }
+        let root = platform::absolute(&source).unwrap();
+        let service = Service::new(&temp.path().join("data")).unwrap();
+        let (entered, entered_rx) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::unbounded();
+        let _settings = checkpoint::TestGuard::install(
+            &root,
+            checkpoint::TestSettings {
+                force_passive: true,
+                trigger_bytes: Some(1),
+                entered: Some(entered),
+                release: Some(release_rx),
+                ..Default::default()
+            },
+        );
+        let scan = service.start_scan(root, None).unwrap();
+        let arrived = entered_rx.recv_timeout(Duration::from_secs(3));
+        drop(entered_rx);
+        let deadline = Instant::now();
+        let ready = loop {
+            let saved = service.repo.scan(&scan.scan_id).unwrap();
+            let c = service.repo.connect().unwrap();
+            let pending: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM directory_metadata_pending WHERE scan_id=?1",
+                    [&scan.scan_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if saved.discovered_count == "129" && pending == 0 {
+                break true;
+            }
+            if deadline.elapsed() >= Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let premature = service.job(&scan.scan_id).unwrap().terminal();
+        release.send(()).unwrap();
+        drop(release);
+        let event = terminal(&service, &scan.scan_id);
+        arrived.unwrap();
+        assert!(ready && !premature);
+        assert_eq!(event.status, "completed");
+        assert_eq!(event.discovered_count, "129");
+        assert_eq!(event.logical_total_bytes, "192");
+        assert_eq!(
+            fs::metadata(service.repo.path.with_extension("sqlite3-wal")).map_or(0, |m| m.len()),
+            0
+        );
+    }
+
+    #[test]
     fn exact_publication_excludes_low_id_after_commit_until_its_acknowledgement() {
         let _control = fault_control();
         let (_temp, service, root, id) = setup();
@@ -1534,8 +1841,19 @@ mod tests {
         std::thread::scope(|scope| {
             let (commands, input) = crossbeam_channel::bounded(0);
             let (ack, output) = crossbeam_channel::bounded(1);
-            let writer = scope
-                .spawn(|| write_loop(&service, &id, &job, c, input, ack, ScanProfile::default()));
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile::default(),
+                    checkpoint::Mode::Off,
+                )
+            });
             let mut port = port(commands, output);
             let mut batch = WriteBatch::new(DEFAULT_CONSUMED_LIMIT);
             batch.rows.push(row(1000, &root, "high"));

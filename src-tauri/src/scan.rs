@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "scan_checkpoint.rs"]
+mod checkpoint;
 #[path = "scan_pipeline.rs"]
 mod writer_pipeline;
 
@@ -22,6 +24,8 @@ mod writer_pipeline;
 struct ScanProfile {
     #[serde(skip)]
     enabled: bool,
+    #[serde(skip)]
+    defer_commit_observation: bool,
     enumerate_ms: f64,
     directory_queue_ms: f64,
     directory_queue_read_ms: f64,
@@ -37,6 +41,8 @@ struct ScanProfile {
     directory_readers: usize,
     directory_in_flight_limit: usize,
     writer_mode: &'static str,
+    checkpoint_mode: &'static str,
+    checkpoint_helper: checkpoint::Stats,
     output_slots: usize,
     output_slot_storage_upper_bound_bytes: usize,
     auxiliary_message_peak_bytes: usize,
@@ -191,6 +197,8 @@ struct StartFault {
 }
 #[cfg(test)]
 static START_FAULT: std::sync::Mutex<Option<StartFault>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static START_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 struct ActiveWorker(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 #[cfg(test)]
@@ -1197,6 +1205,7 @@ fn scan_sync_serial_with_queue_capacity(
         directory_readers: readers,
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "serial",
+        checkpoint_mode: "off",
         output_slots,
         // crossbeam's bounded slot holds one atomic stamp and the message,
         // with at most one message alignment unit of padding per slot.
@@ -2082,7 +2091,7 @@ fn flush_batch_with_errors(
         drop(flush_window);
         let commit_ms = milliseconds(commit_started);
         profile.commit_ms += commit_ms;
-        if profile.enabled {
+        if profile.enabled && !profile.defer_commit_observation {
             profile.writer_observation.on_commit(c, scan_id, commit_ms);
         }
         profile.batches += 1;
@@ -2258,6 +2267,7 @@ mod tests {
     #[test]
     fn partial_thread_start_failures_join_workers_close_and_allow_another_scan() {
         let _control = READER_CONTROL_TEST_LOCK.lock().unwrap();
+        let _start_control = START_FAULT_TEST_LOCK.lock().unwrap();
         for (role, index, overlap, expected_started) in [
             ("writer", 0, true, 0),
             ("reader", 3, true, 4),
