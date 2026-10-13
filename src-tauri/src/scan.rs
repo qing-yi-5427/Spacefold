@@ -545,6 +545,40 @@ struct ReaderOutput<'a> {
     cancel: &'a std::sync::atomic::AtomicBool,
 }
 impl ReaderOutput<'_> {
+    fn send_entries(
+        &self,
+        parent: i64,
+        path: PathBuf,
+        depth: u32,
+        entries: Vec<(platform::DirectoryEntry, Option<EncodedNode>)>,
+        bytes: usize,
+        budget: &std::sync::Arc<ReaderBudget>,
+    ) -> std::result::Result<(), ()> {
+        if bytes > budget.limit {
+            // Release the rejected owned chunk before waiting to report failure.
+            // Otherwise a normal exit without Done leaves this request in flight.
+            drop(entries);
+            drop(path);
+            if !self.cancel.load(Ordering::Acquire) {
+                let _ = self.send_message(ReaderMessage {
+                    message: DirectoryMessage::Fatal(AppError::new(
+                        "READER_PAYLOAD_BUDGET",
+                        "目录条目超过内存预算，已保留此前提交的扫描结果",
+                    )),
+                    auxiliary_permit: None,
+                });
+            }
+            return Err(());
+        }
+        let permit = budget.acquire(bytes, self.cancel).ok_or(())?;
+        self.send(DirectoryMessage::Entries {
+            parent,
+            path,
+            depth,
+            entries,
+            permit,
+        })
+    }
     fn send(&self, message: DirectoryMessage) -> std::result::Result<(), ()> {
         let bytes = message.auxiliary_bytes();
         if bytes > self.auxiliary_budget.limit {
@@ -858,17 +892,8 @@ fn read_directories(
                 }
             }
             if entries.len() >= READER_CHUNK_ENTRIES || bytes >= READER_CHUNK_BYTES {
-                let Some(permit) = budget.acquire(bytes, cancel) else {
-                    return;
-                };
                 if output
-                    .send(DirectoryMessage::Entries {
-                        parent,
-                        path: path.clone(),
-                        depth,
-                        entries,
-                        permit,
-                    })
+                    .send_entries(parent, path.clone(), depth, entries, bytes, &budget)
                     .is_err()
                 {
                     return;
@@ -879,17 +904,8 @@ fn read_directories(
             }
         }
         if !entries.is_empty() {
-            let Some(permit) = budget.acquire(bytes, cancel) else {
-                return;
-            };
             if output
-                .send(DirectoryMessage::Entries {
-                    parent,
-                    path,
-                    depth,
-                    entries,
-                    permit,
-                })
+                .send_entries(parent, path, depth, entries, bytes, &budget)
                 .is_err()
             {
                 break;
@@ -2529,6 +2545,66 @@ mod tests {
         assert!(reader.join().unwrap());
         drop(permit);
         assert_eq!(budget.state.lock().unwrap().0, 0);
+    }
+
+    #[test]
+    fn oversized_entry_chunks_report_fatal_and_join_without_leaking_permits() {
+        // Lower only the fixture's entry budget to exercise both chunk send
+        // sites with ordinary files, without claiming Windows emitted 8 MiB.
+        for count in [1, READER_CHUNK_ENTRIES] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            fs::create_dir(&source).unwrap();
+            for i in 0..count {
+                fs::write(source.join(format!("file-{i:04}")), b"own fixture").unwrap();
+            }
+            let root = platform::absolute(&source).unwrap();
+            let budget = Arc::new(ReaderBudget {
+                limit: 64,
+                ..ReaderBudget::default()
+            });
+            let auxiliary = Arc::new(ReaderBudget {
+                limit: AUXILIARY_MESSAGE_BYTES,
+                ..ReaderBudget::default()
+            });
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let (requests_tx, requests_rx) = crossbeam_channel::bounded(32);
+            let (output_tx, output_rx) = crossbeam_channel::bounded(32);
+            requests_tx.send((1, root.clone(), 0, None, false)).unwrap();
+            std::thread::scope(|scope| {
+                let mut readers = Vec::new();
+                for _ in 0..2 {
+                    let requests = requests_rx.clone();
+                    let budget = budget.clone();
+                    let output = ReaderOutput {
+                        sender: output_tx.clone(),
+                        observation: None,
+                        auxiliary_budget: auxiliary.clone(),
+                        cancel: &cancel,
+                    };
+                    let reader = platform::ScanDirectoryReader::new(&root, true);
+                    readers.push(scope.spawn(|| {
+                        read_directories(requests, output, &cancel, &stop, false, budget, reader)
+                    }));
+                }
+                let message = output_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                let DirectoryMessage::Fatal(error) = message.message else {
+                    panic!("oversized entry chunk did not explicitly fail the request");
+                };
+                assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+                drop(requests_tx);
+                drop(output_rx);
+                budget.stop();
+                auxiliary.stop();
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+            });
+            assert_eq!(budget.state.lock().unwrap().0, 0);
+            assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+            assert_eq!(fs::read_dir(&source).unwrap().count(), count);
+        }
     }
 
     #[test]
