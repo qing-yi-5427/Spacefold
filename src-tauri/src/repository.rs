@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
+// 0/1 retain their persisted meaning. State 2 is an ordinary directory whose
+// completeness follows the scan's terminal state without a final bulk rewrite.
+pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,CASE WHEN incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=nodes.scan_id) ELSE incomplete END,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
 struct ViewBudget {
     bytes: usize,
     nodes: usize,
@@ -246,8 +248,9 @@ impl Repository {
     CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS directory_metadata_pending(scan_id TEXT NOT NULL,id INTEGER NOT NULL,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id,id) REFERENCES nodes(scan_id,id) ON DELETE CASCADE) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS nodes_parent_name_v2 ON nodes(scan_id,parent_id,name COLLATE NOCASE,id);
-    CREATE TABLE IF NOT EXISTS pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,expected_identity TEXT,metadata_deferred INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS scan_errors(id INTEGER PRIMARY KEY AUTOINCREMENT,scan_id TEXT NOT NULL,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,scan_id TEXT NOT NULL,kind TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scan_sequence(next_id INTEGER NOT NULL CHECK(typeof(next_id)='integer' AND next_id>0));INSERT INTO scan_sequence SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM scan_sequence);
@@ -262,8 +265,26 @@ impl Repository {
             // Pending work is already discarded when active jobs become interrupted.
             // Rebuild only that empty queue; saved nodes and scans stay in place.
             let tx = c.unchecked_transaction()?;
-            tx.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
+            tx.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,expected_identity TEXT,metadata_deferred INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
             tx.commit()?;
+        }
+        for (name, definition) in [
+            ("expected_identity", "expected_identity TEXT"),
+            (
+                "metadata_deferred",
+                "metadata_deferred INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            let exists: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pending_dirs') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                c.execute_batch(&format!(
+                    "ALTER TABLE pending_dirs ADD COLUMN {definition};"
+                ))?;
+            }
         }
         let version: i64 = c.query_row("SELECT version FROM schema_info", [], |r| r.get(0))?;
         if version != 1 {
@@ -352,7 +373,7 @@ impl Repository {
         let notes = vec![
             "默认统计文件主数据流的逻辑长度；硬链接按路径重复计数。",
             "未统计备用数据流、目录索引及文件系统元数据。",
-            "普通文件已分配大小与身份按详情/操作计划查询；未取得值为未知，已知占用只表示已测部分。",
+            "NTFS 文件的已分配大小与身份尽量在扫描时取得；缺失信息与链接数可在详情或操作前补测，兼容扫描仍可能保留未知值。",
             "目录跳转链接不跟随；云占位仅查询元数据，需要召回的云目录跳过。",
             "扫描不是文件系统原子快照；本应用工作目录已排除。",
             "磁盘 total/free/available 由系统分别返回，包含调用者配额语义。",
@@ -1514,13 +1535,15 @@ pub fn encode_node(path: &Path, m: &platform::Metadata) -> Result<EncodedNode> {
 pub struct NodeInserter<'a> {
     insert: rusqlite::CachedStatement<'a>,
     pending: rusqlite::CachedStatement<'a>,
+    metadata_pending: rusqlite::CachedStatement<'a>,
     pub timings: Option<InsertTimings>,
 }
 impl<'a> NodeInserter<'a> {
     pub fn new(tx: &'a Transaction<'_>, profile: bool) -> Result<Self> {
         Ok(Self {
             insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,?15,?16,?17)")?,
-            pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES(?1,?2,?3,?4)")?,
+            pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth,expected_identity,metadata_deferred) VALUES(?1,?2,?3,?4,?5,?6)")?,
+            metadata_pending: tx.prepare_cached("INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,?2)")?,
             timings: profile.then(InsertTimings::default),
         })
     }
@@ -1574,15 +1597,30 @@ impl<'a> NodeInserter<'a> {
             isfile,
             error.map(|e| &e.code),
             encoded.display_path,
-            m.recurse || error.is_some()
+            if error.is_some() {
+                1i64
+            } else if m.recurse {
+                2
+            } else {
+                0
+            }
         ])?;
         if let (Some(timings), Some(started)) = (&mut self.timings, started) {
             timings.sql_ms += started.elapsed().as_secs_f64() * 1000.0;
         }
         if m.recurse {
             let started = self.timings.as_ref().map(|_| std::time::Instant::now());
-            self.pending
-                .execute(params![scan_id, id, encoded.raw_path, depth])?;
+            self.pending.execute(params![
+                scan_id,
+                id,
+                encoded.raw_path,
+                depth,
+                m.identity,
+                m.defer_directory_metadata()
+            ])?;
+            if m.defer_directory_metadata() {
+                self.metadata_pending.execute(params![scan_id, id])?;
+            }
             if let (Some(timings), Some(started)) = (&mut self.timings, started) {
                 timings.pending_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
@@ -1590,6 +1628,340 @@ impl<'a> NodeInserter<'a> {
         Ok(())
     }
 }
+pub struct DirectoryMetadataUpdate {
+    pub id: i64,
+    pub expected_identity: String,
+    pub result: Result<platform::Metadata>,
+}
+impl DirectoryMetadataUpdate {
+    pub fn bytes(&self) -> usize {
+        self.expected_identity.capacity()
+            + self.result.as_ref().map_or_else(
+                |e| {
+                    e.code.capacity()
+                        + e.message.capacity()
+                        + e.node_id.as_ref().map_or(0, String::capacity)
+                },
+                |m| {
+                    m.kind.capacity()
+                        + [
+                            &m.modified,
+                            &m.identity,
+                            &m.link_type,
+                            &m.link_target,
+                            &m.cloud_state,
+                            &m.allocation_method,
+                        ]
+                        .into_iter()
+                        .map(|s| s.as_ref().map_or(0, String::capacity))
+                        .sum::<usize>()
+                },
+            )
+    }
+}
+pub fn check_directory_metadata_complete(c: &Connection, scan_id: &str) -> Result<()> {
+    let pending: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM directory_metadata_pending WHERE scan_id=?1)",
+        [scan_id],
+        |r| r.get(0),
+    )?;
+    if pending {
+        Err(AppError::new(
+            "METADATA_INCOMPLETE",
+            "扫描读取已结束，但目录元数据尚未完整回写；未标记完成",
+        ))
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod directory_metadata_tests {
+    use super::*;
+    use crate::service::Service;
+    fn setup() -> (
+        tempfile::TempDir,
+        std::sync::Arc<Service>,
+        String,
+        PathBuf,
+        platform::Metadata,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let root = platform::absolute(&root).unwrap();
+        let child = root.join("child");
+        let service = Service::new(&temp.path().join("data")).unwrap();
+        let scan = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&scan, &root, false).unwrap();
+        let complete = platform::metadata(&child).unwrap();
+        let mut partial = complete.clone();
+        partial.links = None;
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        insert_node(
+            &tx,
+            &scan,
+            1,
+            None,
+            &root,
+            0,
+            &platform::metadata(&root).unwrap(),
+            None,
+        )
+        .unwrap();
+        insert_node(&tx, &scan, 2, Some(1), &child, 1, &partial, None).unwrap();
+        tx.commit().unwrap();
+        (temp, service, scan, child, complete)
+    }
+    #[test]
+    fn saved_and_handle_identity_checks_precede_atomic_metadata_completion() {
+        let (_temp, service, scan, _child, complete) = setup();
+        let mut c = service.repo.connect().unwrap();
+        let expected = complete.identity.clone().unwrap();
+        assert_eq!(
+            check_directory_metadata_complete(&c, &scan)
+                .unwrap_err()
+                .code,
+            "METADATA_INCOMPLETE"
+        );
+        let before = service.repo.scan(&scan).unwrap();
+        let tx = c.transaction().unwrap();
+        let mut replacement = complete.clone();
+        replacement.identity = Some("replacement".into());
+        assert_eq!(
+            apply_directory_metadata(
+                &tx,
+                &scan,
+                &DirectoryMetadataUpdate {
+                    id: 2,
+                    expected_identity: expected.clone(),
+                    result: Ok(replacement)
+                }
+            )
+            .unwrap_err()
+            .code,
+            "SOURCE_CHANGED"
+        );
+        assert!(Repository::node_conn(&tx, &scan, 2)
+            .unwrap()
+            .node
+            .link_count
+            .is_none());
+        apply_directory_metadata(
+            &tx,
+            &scan,
+            &DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: expected.clone(),
+                result: Ok(complete.clone()),
+            },
+        )
+        .unwrap();
+        tx.execute("UPDATE scans SET revision=revision+1 WHERE id=?1", [&scan])
+            .unwrap();
+        assert_eq!(
+            Repository::node_conn(&tx, &scan, 2)
+                .unwrap()
+                .node
+                .link_count,
+            complete.links.map(|v| v.to_string())
+        );
+        assert!(service
+            .repo
+            .node(&scan, "2", None)
+            .unwrap()
+            .node
+            .link_count
+            .is_none());
+        assert_eq!(service.repo.scan(&scan).unwrap().revision, before.revision);
+        tx.commit().unwrap();
+        check_directory_metadata_complete(&c, &scan).unwrap();
+        let after = service.repo.scan(&scan).unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.discovered_count, before.discovered_count);
+        assert_eq!(after.logical_total_bytes, before.logical_total_bytes);
+        let tx = c.transaction().unwrap();
+        tx.execute("UPDATE nodes SET payload=json_set(payload,'$.i','new-row-identity') WHERE scan_id=?1 AND id=2",[&scan]).unwrap();
+        assert_eq!(
+            apply_directory_metadata(
+                &tx,
+                &scan,
+                &DirectoryMetadataUpdate {
+                    id: 2,
+                    expected_identity: expected,
+                    result: Ok(complete)
+                }
+            )
+            .unwrap_err()
+            .code,
+            "SOURCE_CHANGED"
+        );
+        assert_eq!(
+            Repository::node_conn(&tx, &scan, 2)
+                .unwrap()
+                .node
+                .identity
+                .as_deref(),
+            Some("new-row-identity")
+        );
+        tx.rollback().unwrap();
+    }
+    #[test]
+    fn public_detail_payload_is_compatible_with_later_same_handle_completion() {
+        let (_temp, service, scan, child, _complete) = setup();
+        let revision = service.repo.scan(&scan).unwrap().revision;
+        let (measured, next) = service.measure_node(&scan, "2", revision).unwrap();
+        assert!(next > revision);
+        assert!(measured.link_count.is_some());
+        let fresh = platform::ScanDirectoryReader::new(child.parent().unwrap(), true)
+            .prepare(&child)
+            .unwrap()
+            .directory_metadata()
+            .unwrap();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        apply_directory_metadata(
+            &tx,
+            &scan,
+            &DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: fresh.identity.clone().unwrap(),
+                result: Ok(fresh.clone()),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        check_directory_metadata_complete(&c, &scan).unwrap();
+        let saved = service.repo.node(&scan, "2", Some(next)).unwrap();
+        assert_eq!(saved.node.link_count, fresh.links.map(|v| v.to_string()));
+        assert_eq!(saved.node.identity, fresh.identity);
+        assert_eq!(service.repo.scan(&scan).unwrap().revision, next);
+    }
+    #[test]
+    fn failed_completion_keeps_known_observations_and_marks_unknown_partial() {
+        let (_temp, service, scan, _child, complete) = setup();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        apply_directory_metadata(
+            &tx,
+            &scan,
+            &DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: Err(AppError::new("ACCESS_DENIED", "fixture denied")),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        check_directory_metadata_complete(&c, &scan).unwrap();
+        let saved = service.repo.node(&scan, "2", None).unwrap();
+        assert_eq!(saved.node.identity, complete.identity);
+        assert_eq!(saved.node.kind, "directory");
+        assert_eq!(saved.node.allocated_bytes, Some("0".into()));
+        assert!(saved.node.link_count.is_none());
+        assert_eq!(saved.node.error_code.as_deref(), Some("ACCESS_DENIED"));
+        assert!(saved.node.incomplete);
+        assert_eq!(service.repo.scan(&scan).unwrap().error_count, "1");
+    }
+}
+/// Applies only metadata captured on the directory's validated handle. This
+/// function shares the caller's discovery/aggregation/revision transaction.
+pub fn apply_directory_metadata(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    update: &DirectoryMetadataUpdate,
+) -> Result<()> {
+    let mut select =
+        tx.prepare_cached("SELECT kind,payload FROM nodes WHERE scan_id=?1 AND id=?2")?;
+    let (kind, payload): (String, String) =
+        select.query_row(params![scan_id, update.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    drop(select);
+    let (identity, logical, allocated) = if payload.starts_with("{\"v\":3") {
+        let old: TinyPayload = serde_json::from_str(&payload)?;
+        (old.i, old.b, old.a)
+    } else {
+        // Public detail measurement can replace the compact payload while this
+        // directory is queued. Preserve v1/v2/v3 payload and revision semantics.
+        let old = Repository::node_conn(tx, scan_id, update.id)?;
+        (
+            old.fingerprint.identity,
+            old.fingerprint.logical,
+            old.node
+                .allocated_bytes
+                .as_deref()
+                .map(parse_bytes)
+                .transpose()?
+                .map(|v| v as u64),
+        )
+    };
+    if kind != "directory"
+        || identity.as_deref() != Some(&update.expected_identity)
+        || logical != 0
+        || allocated != Some(0)
+    {
+        return Err(AppError::new(
+            "SOURCE_CHANGED",
+            "待补目录记录的原身份或统计语义已改变，未覆盖元数据",
+        ));
+    }
+    let mut issue = None;
+    match &update.result {
+        Ok(m)
+            if m.kind == "directory"
+                && m.recurse
+                && m.identity.as_deref() == Some(&update.expected_identity)
+                && m.logical == 0
+                && m.allocated == Some(0) =>
+        {
+            if m.links.is_none() {
+                issue = Some(AppError::new(
+                    "METADATA_UNAVAILABLE",
+                    "目录链接数未能可靠读取，保留未知值",
+                ));
+            }
+            // Directory-own allocation is zero under the existing accounting
+            // policy. No aggregate/discovered/direct-child value changes here.
+            tx.prepare_cached(
+                "UPDATE nodes SET payload=?3,modified=?4 WHERE scan_id=?1 AND id=?2",
+            )?
+            .execute(params![
+                scan_id,
+                update.id,
+                serde_json::to_string(&TinyPayload::from_meta(m))?,
+                m.modified
+            ])?;
+        }
+        Ok(_) => {
+            return Err(AppError::new(
+                "SOURCE_CHANGED",
+                "目录句柄身份与原记录不同，未覆盖元数据",
+            ))
+        }
+        Err(error) => {
+            // The parent enumeration already proved this directory's identity,
+            // attributes and accounting type. Failed completion preserves those
+            // known observations and the explicitly unknown link count.
+            issue = Some(error.clone());
+        }
+    }
+    if let Some(error) = issue {
+        let stored = Repository::node_conn(tx, scan_id, update.id)?;
+        Repository::error_conn(
+            tx,
+            scan_id,
+            ScanError {
+                node_id: Some(update.id.to_string()),
+                display_path: platform::display(&stored.path),
+                stage: "metadata".into(),
+                error,
+            },
+        )?;
+    }
+    tx.prepare_cached("DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id=?2")?
+        .execute(params![scan_id, update.id])?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Independently checked integer aggregates.
 pub fn aggregate_batch(
     tx: &Transaction<'_>,
@@ -1936,83 +2308,86 @@ mod scan_storage_tests {
     }
 
     #[test]
-    fn rowid_queue_upgrade_preserves_saved_nodes_and_interrupts_active_work() {
-        let (fixture, repo, root, saved_id) = fixture();
-        let saved = repo.finish(&saved_id, "completed").unwrap();
-        let saved_node = repo.node(&saved_id, "2", None).unwrap().node;
-        let active_id = repo.new_scan_id().unwrap();
-        repo.insert_scan(&active_id, &root, false).unwrap();
-        let c = repo.connect().unwrap();
-        c.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id));").unwrap();
-        c.execute(
-            "INSERT INTO pending_dirs VALUES(?1,1,?2,0)",
-            params![active_id, platform::encode_path(&root)],
-        )
-        .unwrap();
-        c.execute(
-            "UPDATE scans SET status='running' WHERE id=?1",
-            [&active_id],
-        )
-        .unwrap();
-        drop(c);
-        drop(repo);
-
-        let repo = Repository::new(&fixture.path().join("db")).unwrap();
-        assert_eq!(
-            serde_json::to_value(repo.scan(&saved_id).unwrap()).unwrap(),
-            serde_json::to_value(saved).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(repo.node(&saved_id, "2", None).unwrap().node).unwrap(),
-            serde_json::to_value(saved_node).unwrap()
-        );
-        let recovered = repo.scan(&active_id).unwrap();
-        assert_eq!(recovered.status, "interrupted");
-        assert!(recovered.stale && recovered.incomplete);
-        let c = repo.connect().unwrap();
-        assert!(c
-            .query_row::<bool, _, _>(
-                "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='pending_dirs'",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap());
-        assert_eq!(
-            c.query_row::<i64, _, _>("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
-                .unwrap(),
-            0
-        );
-        assert!(c.prepare("SELECT rowid FROM pending_dirs").is_err());
-        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY); INSERT INTO consumed_dirs VALUES(3);").unwrap();
-        for (scan_id, id) in [
-            (&active_id, 1),
-            (&active_id, 2),
-            (&active_id, 3),
-            (&active_id, 4),
-            (&saved_id, 7),
-        ] {
+    fn queue_upgrade_preserves_saved_nodes_and_interrupts_active_work() {
+        for suffix in ["", " WITHOUT ROWID"] {
+            let (fixture, repo, root, saved_id) = fixture();
+            let saved = repo.finish(&saved_id, "completed").unwrap();
+            let saved_node = repo.node(&saved_id, "2", None).unwrap().node;
+            let active_id = repo.new_scan_id().unwrap();
+            repo.insert_scan(&active_id, &root, false).unwrap();
+            let c = repo.connect().unwrap();
+            c.execute_batch(&format!("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)){suffix};")).unwrap();
             c.execute(
-                "INSERT INTO pending_dirs VALUES(?1,?2,?3,?2)",
-                params![scan_id, id, platform::encode_path(&root)],
+                "INSERT INTO pending_dirs VALUES(?1,1,?2,0)",
+                params![active_id, platform::encode_path(&root)],
             )
             .unwrap();
-        }
-        let mut stmt = c.prepare("SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2").unwrap();
-        let result = stmt
-            .query_map(params![active_id, 2], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
+            c.execute(
+                "UPDATE scans SET status='running' WHERE id=?1",
+                [&active_id],
+            )
             .unwrap();
-        assert_eq!(result.iter().map(|row| row.0).collect::<Vec<_>>(), [4, 2]);
-        assert!(result
-            .iter()
-            .all(|row| platform::decode_path(row.1.clone()) == root && row.2 == row.0 as u32));
+            drop(c);
+            drop(repo);
+
+            let repo = Repository::new(&fixture.path().join("db")).unwrap();
+            assert_eq!(
+                serde_json::to_value(repo.scan(&saved_id).unwrap()).unwrap(),
+                serde_json::to_value(saved).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(repo.node(&saved_id, "2", None).unwrap().node).unwrap(),
+                serde_json::to_value(saved_node).unwrap()
+            );
+            let recovered = repo.scan(&active_id).unwrap();
+            assert_eq!(recovered.status, "interrupted");
+            assert!(recovered.stale && recovered.incomplete);
+            let c = repo.connect().unwrap();
+            assert!(c
+                .query_row::<bool, _, _>(
+                    "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='pending_dirs'",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap());
+            assert_eq!(
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
+                    .unwrap(),
+                0
+            );
+            assert!(c.prepare("SELECT rowid FROM pending_dirs").is_err());
+            c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY); INSERT INTO consumed_dirs VALUES(3);").unwrap();
+            for (scan_id, id) in [
+                (&active_id, 1),
+                (&active_id, 2),
+                (&active_id, 3),
+                (&active_id, 4),
+                (&saved_id, 7),
+            ] {
+                c.execute(
+                    "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES(?1,?2,?3,?2)",
+                    params![scan_id, id, platform::encode_path(&root)],
+                )
+                .unwrap();
+            }
+            let mut stmt = c.prepare("SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2").unwrap();
+            let result = stmt
+                .query_map(params![active_id, 2], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(result.iter().map(|row| row.0).collect::<Vec<_>>(), [4, 2]);
+            assert!(result
+                .iter()
+                .all(|row| platform::decode_path(row.1.clone()) == root && row.2 == row.0 as u32));
+            assert_eq!(c.query_row::<i64,_,_>("SELECT COUNT(*) FROM pending_dirs WHERE expected_identity IS NULL AND metadata_deferred=0", [], |r|r.get(0)).unwrap(),5);
+        }
     }
 
     #[test]

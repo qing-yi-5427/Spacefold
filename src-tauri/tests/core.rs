@@ -1494,9 +1494,50 @@ fn repaired_acl_error_directory_can_refresh_and_updates_kind_and_ancestor_counts
         .unwrap();
     let scan = wait_scan(&service, &started.scan_id);
     let node = find(&service, &scan, "denied");
-    assert_eq!(node.kind, "other");
+    // A supported parent-directory enumeration proves the accounting type and
+    // identity even when opening the child to complete metadata is denied.
+    // The legacy route instead retains an explicitly unknown entry type.
+    let directory_known = node.kind == "directory";
+    assert!(directory_known || node.kind == "other", "{node:?}");
+    assert_eq!(scan.status, "completed_with_errors");
+    assert_eq!(scan.discovered_count, "2");
+    assert_eq!(scan.error_count, "1");
     assert_eq!(node.error_code.as_deref(), Some("ACCESS_DENIED"));
+    assert!(node.incomplete);
+    assert!(node.link_count.is_none());
+    assert_eq!(node.logical_bytes, "0");
+    assert_eq!(node.logical_total_bytes, "0");
+    assert_eq!(node.allocated_known_total_bytes, "0");
+    assert_eq!(node.file_count, "0");
+    assert_eq!(node.directory_count, "0");
+    assert_eq!(node.children_count, "0");
+    let expected_unknown = if directory_known { "0" } else { "1" };
+    assert_eq!(node.allocated_unknown_count, expected_unknown);
+    if directory_known {
+        assert!(node.identity.is_some());
+        assert_eq!(node.allocated_bytes.as_deref(), Some("0"));
+    } else {
+        assert!(node.identity.is_none());
+        assert!(node.allocated_bytes.is_none());
+    }
+    let before = service.repo.node(&scan.scan_id, "1", None).unwrap().node;
+    assert_eq!(before.logical_total_bytes, "0");
+    assert_eq!(before.allocated_known_total_bytes, "0");
+    assert_eq!(before.allocated_unknown_count, expected_unknown);
+    assert_eq!(before.file_count, "0");
+    assert_eq!(
+        before.directory_count,
+        if directory_known { "1" } else { "0" }
+    );
+    assert_eq!(before.children_count, "1");
+    assert!(before.incomplete);
+    let conn = service.repo.connect().unwrap();
+    spacefold_lib::repository::check_directory_metadata_complete(&conn, &scan.scan_id).unwrap();
+    drop(conn);
     drop(restore);
+    let measured_folder = platform::metadata(&platform::absolute(&denied).unwrap()).unwrap();
+    let measured_child =
+        platform::metadata(&platform::absolute(&denied.join("child")).unwrap()).unwrap();
     let refresh = service
         .refresh(scan.scan_id.clone(), node.node_id.clone(), None)
         .unwrap();
@@ -1513,6 +1554,15 @@ fn repaired_acl_error_directory_can_refresh_and_updates_kind_and_ancestor_counts
         .node;
     assert_eq!(folder.kind, "directory");
     assert!(!folder.incomplete);
+    assert_eq!(folder.error_code, None);
+    assert_eq!(folder.identity, measured_folder.identity);
+    assert_eq!(
+        folder.link_count,
+        measured_folder.links.map(|n| n.to_string())
+    );
+    if directory_known {
+        assert_eq!(folder.identity, node.identity);
+    }
     assert_eq!(folder.children_count, "1");
     let root = service
         .repo
@@ -1521,7 +1571,16 @@ fn repaired_acl_error_directory_can_refresh_and_updates_kind_and_ancestor_counts
         .node;
     assert_eq!(root.directory_count, "1");
     assert_eq!(root.file_count, "1");
+    assert_eq!(root.children_count, "1");
+    assert_eq!(root.logical_total_bytes, "3");
+    assert_eq!(root.allocated_unknown_count, "0");
+    assert_eq!(
+        root.allocated_known_total_bytes,
+        measured_child.allocated.unwrap().to_string()
+    );
     assert!(!root.incomplete);
+    let conn = service.repo.connect().unwrap();
+    spacefold_lib::repository::check_directory_metadata_complete(&conn, &scan.scan_id).unwrap();
 }
 
 #[cfg(windows)]

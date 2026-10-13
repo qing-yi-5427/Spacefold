@@ -57,6 +57,9 @@ impl DirectoryEntry {
         }
         Some(m)
     }
+    pub fn scan_directory_metadata(&self) -> Option<&Metadata> {
+        self.hint.as_ref().filter(|m| m.defer_directory_metadata())
+    }
 }
 #[cfg(not(windows))]
 #[derive(Clone, Default)]
@@ -75,6 +78,9 @@ impl ScanDirectoryReader {
 }
 #[cfg(not(windows))]
 impl PreparedScanDirectory {
+    pub fn directory_metadata(&self) -> Result<Metadata> {
+        metadata(&self.0)
+    }
     pub fn entries(self) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>>>> {
         read_dir(&self.0)
     }
@@ -102,6 +108,17 @@ pub fn read_dir(path: &Path) -> Result<Box<dyn Iterator<Item = Result<DirectoryE
     })))
 }
 impl Metadata {
+    pub fn defer_directory_metadata(&self) -> bool {
+        self.kind == "directory"
+            && self.recurse
+            && self.identity.is_some()
+            && self.links.is_none()
+            && self.allocated == Some(0)
+            && self.link_type.is_none()
+            && self.cloud_state.is_none()
+            && self.reparse_tag == 0
+            && self.attributes & (0x400 | 0x1000 | 0x40000 | 0x400000) == 0
+    }
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint {
             identity: self.identity.clone(),
@@ -737,6 +754,9 @@ mod win {
                     handle,
                     root: path.to_owned(),
                     volume,
+                    directory_identity: format_identity(volume, &id.unwrap().FileId.Identifier),
+                    directory_attributes: attributes,
+                    directory_tag: if reparse { tag.ReparseTag } else { 0 },
                     buffer: vec![0u64; DIRECTORY_BUFFER_BYTES / 8],
                     offset: None,
                     done: false,
@@ -748,6 +768,12 @@ mod win {
         }
     }
     impl PreparedScanDirectory {
+        pub fn directory_metadata(&self) -> Result<Metadata> {
+            match &self.fast {
+                Some(fast) => fast.directory_metadata(),
+                None => metadata(&self.path),
+            }
+        }
         pub fn entries(self) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>>>> {
             let Some(mut fast) = self.fast else {
                 return read_dir(&self.path);
@@ -762,8 +788,18 @@ mod win {
                     // Only the initial unsupported query may select fallback.
                     // Once any entry was returned, errors stay errors; restarting
                     // the directory would duplicate already persisted entries.
+                    let expected = fast.directory_identity.clone();
                     drop(fast);
-                    validate_scan_directory(&self.path)?;
+                    let current = metadata(&self.path)?;
+                    if current.kind != "directory"
+                        || !current.recurse
+                        || current.identity.as_deref() != Some(&expected)
+                    {
+                        return Err(AppError::new(
+                            "DIRECTORY_CHANGED",
+                            "目录在选择兼容枚举路径前身份已改变，未继续读取",
+                        ));
+                    }
                     read_dir(&self.path)
                 }
                 Err(error) => Err(error),
@@ -829,6 +865,9 @@ mod win {
         handle: OwnedHandle,
         root: PathBuf,
         volume: u64,
+        directory_identity: String,
+        directory_attributes: u32,
+        directory_tag: u32,
         // u64 alignment also satisfies FILE_ID_EXTD_DIR_INFO alignment.
         buffer: Vec<u64>,
         offset: Option<usize>,
@@ -838,6 +877,29 @@ mod win {
         query_fault: Option<u32>,
     }
     impl BulkDirectoryIterator {
+        fn directory_metadata(&self) -> Result<Metadata> {
+            let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(self.handle.0, &mut legacy) }.map_err(win_error)?;
+            let ticks = ((legacy.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | legacy.ftLastWriteTime.dwLowDateTime as u64;
+            Ok(Metadata {
+                kind: "directory".into(),
+                logical: 0,
+                allocated: Some(0),
+                modified: directory_time(ticks as i64),
+                identity: Some(self.directory_identity.clone()),
+                links: Some(legacy.nNumberOfLinks as u64),
+                attributes: self.directory_attributes,
+                reparse_tag: self.directory_tag,
+                link_type: None,
+                link_target: None,
+                cloud_state: None,
+                // Directory entry space is excluded by the existing accounting
+                // policy; zero is not inferred from the on-disk index allocation.
+                allocation_method: Some("directory_entry_not_counted".into()),
+                recurse: true,
+            })
+        }
         fn refill(&mut self) -> Result<()> {
             self.offset = None;
             #[cfg(test)]
@@ -885,6 +947,24 @@ mod win {
             };
             decode_directory_record(bytes, offset, self.volume)
         }
+    }
+    fn directory_time(ticks: i64) -> Option<String> {
+        let unix_ms = ticks as i128 / 10_000 - 11_644_473_600_000i128;
+        i64::try_from(unix_ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+    fn format_identity(volume: u64, id: &[u8]) -> String {
+        use std::fmt::Write;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut identity = String::with_capacity(49);
+        write!(&mut identity, "{volume:016x}:").unwrap();
+        for byte in id {
+            identity.push(HEX[(byte >> 4) as usize] as char);
+            identity.push(HEX[(byte & 15) as usize] as char);
+        }
+        identity
     }
     fn decode_directory_record(
         bytes: &[u8],
@@ -970,26 +1050,13 @@ mod win {
             Some(allocation as u64)
         };
         let ticks = i64_at(std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, LastWriteTime));
-        let unix_ms = ticks as i128 / 10_000 - 11_644_473_600_000i128;
-        let modified = i64::try_from(unix_ms)
-            .ok()
-            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let modified = directory_time(ticks);
         let id_at = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileId);
         let id = &data[id_at..id_at + 16];
-        let identity = id.iter().any(|v| *v != 0).then(|| {
-            // One bounded string, rather than sixteen temporary hex strings per
-            // entry. Format is exactly the existing FILE_ID_INFO identity.
-            use std::fmt::Write;
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut identity = String::with_capacity(49);
-            write!(&mut identity, "{volume:016x}:").unwrap();
-            for byte in id {
-                identity.push(HEX[(byte >> 4) as usize] as char);
-                identity.push(HEX[(byte & 15) as usize] as char);
-            }
-            identity
-        });
+        let identity = id
+            .iter()
+            .any(|v| *v != 0)
+            .then(|| format_identity(volume, id));
         Ok((
             if step == 0 { None } else { Some(offset + step) },
             name,

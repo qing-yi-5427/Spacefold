@@ -1,7 +1,10 @@
 use crate::{
     model::*,
     platform,
-    repository::{aggregate_many, encode_node, insert_node, EncodedNode, NodeInserter, Repository},
+    repository::{
+        aggregate_many, apply_directory_metadata, encode_node, insert_node,
+        DirectoryMetadataUpdate, EncodedNode, NodeInserter, Repository,
+    },
     service::{JobRuntime, Service},
 };
 use rusqlite::params;
@@ -25,6 +28,9 @@ struct ScanProfile {
     directory_queue_error_ms: f64,
     directory_queue_queries: usize,
     directory_queue_read_rows: usize,
+    directory_queue_peak_cached_entries: usize,
+    directory_queue_peak_cached_bytes: usize,
+    consumed_limit: usize,
     reader_wait_ms: f64,
     directory_check_ms: f64,
     encode_ms: f64,
@@ -51,48 +57,126 @@ struct ScanProfile {
     finish_ms: f64,
     close_ms: f64,
     batches: usize,
+    flush_consumed_limit: usize,
+    flush_time_limit: usize,
+    flush_entries_limit: usize,
+    flush_metadata_limit: usize,
+    flush_path_limit: usize,
+    flush_drain: usize,
+    flush_final: usize,
 }
 fn milliseconds(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
-type QueuedDirectory = (i64, Vec<u8>, u32);
-const FIRST_PENDING_DIRECTORIES: &str = "SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
-const NEXT_PENDING_DIRECTORIES: &str = "SELECT id,path,depth FROM pending_dirs WHERE scan_id=?1 AND id<?3 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
+type QueuedDirectory = (i64, Vec<u8>, u32, Option<String>, bool);
+const FIRST_PENDING_DIRECTORIES: &str = "SELECT id,path,depth,expected_identity,metadata_deferred FROM pending_dirs WHERE scan_id=?1 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
+const NEXT_PENDING_DIRECTORIES: &str = "SELECT id,path,depth,expected_identity,metadata_deferred FROM pending_dirs WHERE scan_id=?1 AND id<?3 AND id NOT IN consumed_dirs ORDER BY id DESC LIMIT ?2";
+const DIRECTORY_CACHE_BYTES: usize = 256 * 1024;
+const DEFAULT_CONSUMED_LIMIT: usize = 256;
+fn consumed_limit_override(value: Option<&str>) -> usize {
+    match value {
+        Some("256") => 256,
+        Some("1024") => 1024,
+        Some("2048") => 2048,
+        _ => DEFAULT_CONSUMED_LIMIT,
+    }
+}
 
 #[derive(Default)]
 struct DirectoryQueueCursor {
     before_id: Option<i64>,
+    cache: std::collections::VecDeque<QueuedDirectory>,
+    payload_bytes: usize,
+    exhausted: bool,
 }
 impl DirectoryQueueCursor {
-    fn read(
-        &self,
-        c: &rusqlite::Connection,
-        scan_id: &str,
-        limit: usize,
-    ) -> Result<Vec<QueuedDirectory>> {
+    fn needs_refill(&self) -> bool {
+        self.cache.is_empty() && !self.exhausted
+    }
+    fn owned_bytes(&self) -> usize {
+        self.cache.capacity() * std::mem::size_of::<QueuedDirectory>() + self.payload_bytes
+    }
+    fn refill(&mut self, c: &rusqlite::Connection, scan_id: &str) -> Result<usize> {
+        debug_assert!(self.needs_refill());
+        self.cache.reserve(DIRECTORY_PREFETCH);
         let mut statement = c.prepare_cached(if self.before_id.is_some() {
             NEXT_PENDING_DIRECTORIES
         } else {
             FIRST_PENDING_DIRECTORIES
         })?;
-        fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedDirectory> {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        }
-        let found = if let Some(before_id) = self.before_id {
-            statement.query_map(params![scan_id, limit as i64, before_id], row)?
+        let mut rows = if let Some(before_id) = self.before_id {
+            statement.query(params![scan_id, DIRECTORY_PREFETCH as i64, before_id])?
         } else {
-            statement.query_map(params![scan_id, limit as i64], row)?
+            statement.query(params![scan_id, DIRECTORY_PREFETCH as i64])?
         };
-        Ok(found.collect::<std::result::Result<Vec<_>, _>>()?)
+        let mut read = 0;
+        self.exhausted = true;
+        while let Some(row) = rows.next()? {
+            read += 1;
+            let raw = row
+                .get_ref(1)?
+                .as_blob()
+                .map_err(|error| AppError::new("DATABASE_ERROR", error.to_string()))?;
+            let expected = row.get_ref(3)?;
+            let expected = match expected {
+                rusqlite::types::ValueRef::Null => None,
+                value => Some(
+                    value
+                        .as_str()
+                        .map_err(|error| AppError::new("DATABASE_ERROR", error.to_string()))?,
+                ),
+            };
+            let payload_bytes = raw.len().saturating_add(expected.map_or(0, str::len));
+            if self.cache.capacity() * std::mem::size_of::<QueuedDirectory>() + payload_bytes
+                > BATCH_PATH_BYTES
+            {
+                return Err(AppError::new("PATH_LIMIT", "目录队列路径超出读取预算"));
+            }
+            if !self.cache.is_empty() && self.owned_bytes() + payload_bytes > DIRECTORY_CACHE_BYTES
+            {
+                self.exhausted = false;
+                break;
+            }
+            let item = (
+                row.get(0)?,
+                raw.to_vec(),
+                row.get(2)?,
+                expected.map(str::to_owned),
+                row.get(4)?,
+            );
+            self.payload_bytes += item.1.capacity() + item.3.as_ref().map_or(0, String::capacity);
+            self.cache.push_back(item);
+            if self.cache.len() == DIRECTORY_PREFETCH || self.owned_bytes() > DIRECTORY_CACHE_BYTES
+            {
+                // A single unusually long path is still dispatched; it cannot
+                // make the cache's byte threshold stop forward progress.
+                self.exhausted = false;
+                break;
+            }
+        }
+        Ok(read)
     }
-    fn consume(&mut self, statement: &mut rusqlite::CachedStatement<'_>, id: i64) -> Result<()> {
+    fn consume(
+        &mut self,
+        statement: &mut rusqlite::CachedStatement<'_>,
+    ) -> Result<QueuedDirectory> {
+        let id = self
+            .cache
+            .front()
+            .ok_or_else(|| AppError::new("QUEUE_EMPTY", "目录队列为空"))?
+            .0;
         statement.execute([id])?;
         self.before_id = Some(id);
-        Ok(())
+        let item = self.cache.pop_front().unwrap();
+        self.payload_bytes -= item.1.capacity() + item.3.as_ref().map_or(0, String::capacity);
+        Ok(item)
     }
     fn reset_after_flush(&mut self) {
         // A committed batch can add newer directory IDs above the old watermark.
         self.before_id = None;
+        self.cache.clear();
+        self.payload_bytes = 0;
+        self.exhausted = false;
     }
 }
 type MetadataResult = (
@@ -208,6 +292,7 @@ fn metadata_owned_bytes(m: Option<&platform::Metadata>) -> usize {
     })
 }
 enum DirectoryMessage {
+    Metadata(DirectoryMetadataUpdate),
     Entries {
         parent: i64,
         path: PathBuf,
@@ -224,12 +309,25 @@ enum DirectoryMessage {
     Done(ReaderTimings),
     Fatal(AppError),
 }
+fn matches_directory_metadata(m: &platform::Metadata, expected: &Option<String>) -> bool {
+    m.kind == "directory" && m.recurse && m.identity.as_ref() == expected.as_ref()
+}
+#[cfg(test)]
+type DeferredDirectoryHook = (
+    PathBuf,
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+);
+#[cfg(test)]
+static DEFERRED_DIRECTORY_HOOK: std::sync::Mutex<Option<DeferredDirectoryHook>> =
+    std::sync::Mutex::new(None);
 
 /// Two readers overlap enumeration/encoding with the sole SQLite writer. Only
 /// already-persisted directory IDs are requested. Bounded chunks provide
 /// backpressure, and no iterator/file handle crosses its owning thread.
 fn read_directories(
-    requests: crossbeam_channel::Receiver<(i64, PathBuf, u32)>,
+    requests: crossbeam_channel::Receiver<(i64, PathBuf, u32, Option<String>, bool)>,
     output: crossbeam_channel::Sender<DirectoryMessage>,
     cancel: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
@@ -237,9 +335,16 @@ fn read_directories(
     budget: std::sync::Arc<ReaderBudget>,
     directory_reader: platform::ScanDirectoryReader,
 ) {
-    while let Ok((parent, path, depth)) = requests.recv() {
+    while let Ok((parent, path, depth, expected_identity, deferred)) = requests.recv() {
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             break;
+        }
+        if deferred && expected_identity.is_none() {
+            let _ = output.send(DirectoryMessage::Fatal(AppError::new(
+                "METADATA_STATE_INVALID",
+                "待补目录缺少原文件身份",
+            )));
+            return;
         }
         #[cfg(test)]
         {
@@ -274,6 +379,31 @@ fn read_directories(
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                if deferred {
+                    let measured = platform::metadata(&path);
+                    let changed = measured
+                        .as_ref()
+                        .is_ok_and(|m| !matches_directory_metadata(m, &expected_identity));
+                    if !changed {
+                        let failed = measured.is_err();
+                        if output
+                            .send(DirectoryMessage::Metadata(DirectoryMetadataUpdate {
+                                id: parent,
+                                expected_identity: expected_identity.clone().unwrap(),
+                                result: measured,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if failed {
+                            if output.send(DirectoryMessage::Done(timings)).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if output
                     .send(DirectoryMessage::Error {
                         parent,
@@ -291,6 +421,71 @@ fn read_directories(
                 continue;
             }
         };
+        if deferred {
+            #[cfg(test)]
+            {
+                let hook = DEFERRED_DIRECTORY_HOOK
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|h| h.0 == path)
+                    .cloned();
+                if let Some((_, entered, release, _)) = hook {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+            let started = profile.then(Instant::now);
+            let mut measured = prepared.directory_metadata();
+            // Only a rare failed complete query uses the old metadata fallback;
+            // the common directory stays on this one validated handle.
+            if measured.is_err() {
+                measured = platform::metadata(&path);
+            }
+            if let Some(started) = started {
+                timings.directory_check_ms += milliseconds(started);
+            }
+            let changed = measured
+                .as_ref()
+                .is_ok_and(|m| !matches_directory_metadata(m, &expected_identity));
+            if changed {
+                if output
+                    .send(DirectoryMessage::Error {
+                        parent,
+                        path,
+                        stage: "directory_revalidate",
+                        error: AppError::new(
+                            "DIRECTORY_CHANGED",
+                            "目录的原文件身份已改变，未覆盖或枚举替代目录",
+                        ),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                    break;
+                }
+                continue;
+            }
+            let failed = measured.is_err();
+            if output
+                .send(DirectoryMessage::Metadata(DirectoryMetadataUpdate {
+                    id: parent,
+                    expected_identity: expected_identity.unwrap(),
+                    result: measured,
+                }))
+                .is_err()
+            {
+                break;
+            }
+            if failed {
+                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let started = profile.then(Instant::now);
         let iterator = prepared.entries();
         if let Some(started) = started {
@@ -336,6 +531,7 @@ fn read_directories(
                     let started = profile.then(Instant::now);
                     let encoded = entry
                         .scan_file_metadata()
+                        .or_else(|| entry.scan_directory_metadata())
                         .map(|m| encode_node(&entry.path, m))
                         .transpose();
                     if let Some(started) = started {
@@ -440,13 +636,16 @@ fn scan_sync_with_mode(
     fast: bool,
 ) -> Result<Scan> {
     let started = Instant::now();
+    let consumed_limit =
+        consumed_limit_override(std::env::var("SPACEFOLD_CONSUMED_LIMIT").ok().as_deref());
     let mut profile = ScanProfile {
         enabled: std::env::var_os("SPACEFOLD_PROFILE").is_some(),
+        consumed_limit,
         started: Some(started),
         ..Default::default()
     };
     let mut c = service.repo.connect()?;
-    // This connection's only TEMP table is a bounded set of <=256 consumed IDs;
+    // This connection's only TEMP table is a bounded set of <=2048 consumed IDs;
     // durable nodes/work queues retain the repository's WAL/NORMAL policy.
     c.execute_batch(
         "PRAGMA temp_store=MEMORY;CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);",
@@ -507,6 +706,7 @@ fn scan_sync_with_mode(
     let mut failed: Option<AppError> = None;
     let mut pending = 0usize;
     let mut results = Vec::<MetadataResult>::with_capacity(BATCH_ENTRIES);
+    let mut directory_updates = Vec::<DirectoryMetadataUpdate>::with_capacity(256);
     let mut batch_path_bytes = 0usize;
     let mut consumed = 0usize;
     let mut batch_started = Instant::now();
@@ -559,9 +759,14 @@ fn scan_sync_with_mode(
                 if reader_stop.load(Ordering::Acquire) {
                     return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                 }
-                if consumed >= 256
+                if consumed >= consumed_limit
                     || consumed > 0 && batch_started.elapsed() >= Duration::from_millis(100)
                 {
+                    if profile.enabled {
+                        profile.flush_consumed_limit += usize::from(consumed >= consumed_limit);
+                        profile.flush_time_limit +=
+                            usize::from(batch_started.elapsed() >= Duration::from_millis(100));
+                    }
                     flush_batch(
                         service,
                         &mut c,
@@ -569,6 +774,7 @@ fn scan_sync_with_mode(
                         pending,
                         &result_rx,
                         &mut results,
+                        &mut directory_updates,
                         &mut profile,
                     )?;
                     pending = 0;
@@ -580,21 +786,32 @@ fn scan_sync_with_mode(
                 }
                 if refill && in_flight < DIRECTORY_PREFETCH {
                     let started = Instant::now();
-                    let limit = (DIRECTORY_PREFETCH - in_flight).min(256 - consumed);
-                    let read_started = profile.enabled.then(Instant::now);
-                    let directories = queue_cursor.read(&c, scan_id, limit)?;
-                    if let Some(read_started) = read_started {
-                        profile.directory_queue_read_ms += milliseconds(read_started);
-                        profile.directory_queue_queries += 1;
-                        profile.directory_queue_read_rows += directories.len();
-                    }
+                    let limit = (DIRECTORY_PREFETCH - in_flight).min(consumed_limit - consumed);
                     let mark_started = profile.enabled.then(Instant::now);
                     let mut mark_consumed =
                         c.prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")?;
                     if let Some(mark_started) = mark_started {
                         profile.directory_queue_mark_ms += milliseconds(mark_started);
                     }
-                    for (parent, path, depth) in directories {
+                    for _ in 0..limit {
+                        if queue_cursor.needs_refill() {
+                            let read_started = profile.enabled.then(Instant::now);
+                            let read = queue_cursor.refill(&c, scan_id)?;
+                            if let Some(read_started) = read_started {
+                                profile.directory_queue_read_ms += milliseconds(read_started);
+                                profile.directory_queue_queries += 1;
+                                profile.directory_queue_read_rows += read;
+                                profile.directory_queue_peak_cached_entries = profile
+                                    .directory_queue_peak_cached_entries
+                                    .max(queue_cursor.cache.len());
+                                profile.directory_queue_peak_cached_bytes = profile
+                                    .directory_queue_peak_cached_bytes
+                                    .max(queue_cursor.owned_bytes());
+                            }
+                        }
+                        if queue_cursor.cache.is_empty() {
+                            break;
+                        }
                         #[cfg(test)]
                         {
                             let hook = DISPATCH_TEST_HOOK
@@ -614,15 +831,16 @@ fn scan_sync_with_mode(
                         if reader_stop.load(Ordering::Acquire) {
                             return Err(AppError::new("WORKER_FAILED", "枚举线程异常退出"));
                         }
+                        let mark_started = profile.enabled.then(Instant::now);
+                        let (parent, path, depth, expected_identity, metadata_deferred) =
+                            queue_cursor.consume(&mut mark_consumed)?;
+                        if let Some(mark_started) = mark_started {
+                            profile.directory_queue_mark_ms += milliseconds(mark_started);
+                        }
                         let decode_started = profile.enabled.then(Instant::now);
                         let path = platform::decode_path(path);
                         if let Some(decode_started) = decode_started {
                             profile.directory_queue_decode_ms += milliseconds(decode_started);
-                        }
-                        let mark_started = profile.enabled.then(Instant::now);
-                        queue_cursor.consume(&mut mark_consumed, parent)?;
-                        if let Some(mark_started) = mark_started {
-                            profile.directory_queue_mark_ms += milliseconds(mark_started);
                         }
                         consumed += 1;
                         if depth >= 4096 {
@@ -641,7 +859,13 @@ fn scan_sync_with_mode(
                             }
                         } else {
                             let send_started = profile.enabled.then(Instant::now);
-                            let sent = request_tx.send((parent, path, depth));
+                            let sent = request_tx.send((
+                                parent,
+                                path,
+                                depth,
+                                expected_identity,
+                                metadata_deferred,
+                            ));
                             if let Some(send_started) = send_started {
                                 profile.directory_queue_send_ms += milliseconds(send_started);
                             }
@@ -658,7 +882,14 @@ fn scan_sync_with_mode(
                     refill = false;
                 }
                 if in_flight == 0 {
-                    if pending > 0 || !results.is_empty() || consumed > 0 {
+                    if pending > 0
+                        || !results.is_empty()
+                        || consumed > 0
+                        || !directory_updates.is_empty()
+                    {
+                        if profile.enabled {
+                            profile.flush_drain += 1;
+                        }
                         flush_batch(
                             service,
                             &mut c,
@@ -666,6 +897,7 @@ fn scan_sync_with_mode(
                             pending,
                             &result_rx,
                             &mut results,
+                            &mut directory_updates,
                             &mut profile,
                         )?;
                         pending = 0;
@@ -707,6 +939,45 @@ fn scan_sync_with_mode(
                     }
                 };
                 match message {
+                    DirectoryMessage::Metadata(update) => {
+                        batch_path_bytes +=
+                            update.bytes() + std::mem::size_of::<DirectoryMetadataUpdate>();
+                        profile.peak_batch_path_bytes =
+                            profile.peak_batch_path_bytes.max(batch_path_bytes);
+                        directory_updates.push(update);
+                        // Existing collection time and owned-byte limits also
+                        // bound the independently completed directory metadata.
+                        if batch_path_bytes >= BATCH_PATH_BYTES
+                            || directory_updates.len() >= 2048
+                            || batch_started.elapsed() >= Duration::from_millis(100)
+                        {
+                            if profile.enabled {
+                                profile.flush_path_limit +=
+                                    usize::from(batch_path_bytes >= BATCH_PATH_BYTES);
+                                profile.flush_metadata_limit +=
+                                    usize::from(directory_updates.len() >= 2048);
+                                profile.flush_time_limit += usize::from(
+                                    batch_started.elapsed() >= Duration::from_millis(100),
+                                );
+                            }
+                            flush_batch(
+                                service,
+                                &mut c,
+                                scan_id,
+                                pending,
+                                &result_rx,
+                                &mut results,
+                                &mut directory_updates,
+                                &mut profile,
+                            )?;
+                            pending = 0;
+                            batch_path_bytes = 0;
+                            consumed = 0;
+                            queue_cursor.reset_after_flush();
+                            batch_started = Instant::now();
+                            refill = true;
+                        }
+                    }
                     DirectoryMessage::Entries {
                         parent,
                         path,
@@ -718,7 +989,10 @@ fn scan_sync_with_mode(
                             if job.cancel.load(Ordering::Acquire) {
                                 break 'directories;
                             }
-                            let ordinary_file = entry.scan_file_metadata().is_some();
+                            let ordinary_file = entry
+                                .scan_file_metadata()
+                                .or_else(|| entry.scan_directory_metadata())
+                                .is_some();
                             let p = entry.path;
                             if p.starts_with(&service.repo.data_dir) || service.is_work_file(&p) {
                                 continue;
@@ -745,6 +1019,16 @@ fn scan_sync_with_mode(
                                 || batch_path_bytes >= BATCH_PATH_BYTES
                                 || batch_started.elapsed() >= Duration::from_millis(100)
                             {
+                                if profile.enabled {
+                                    profile.flush_entries_limit +=
+                                        usize::from(results.len() + pending >= BATCH_ENTRIES);
+                                    profile.flush_metadata_limit += usize::from(pending >= 2000);
+                                    profile.flush_path_limit +=
+                                        usize::from(batch_path_bytes >= BATCH_PATH_BYTES);
+                                    profile.flush_time_limit += usize::from(
+                                        batch_started.elapsed() >= Duration::from_millis(100),
+                                    );
+                                }
                                 flush_batch(
                                     service,
                                     &mut c,
@@ -752,6 +1036,7 @@ fn scan_sync_with_mode(
                                     pending,
                                     &result_rx,
                                     &mut results,
+                                    &mut directory_updates,
                                     &mut profile,
                                 )?;
                                 pending = 0;
@@ -793,6 +1078,18 @@ fn scan_sync_with_mode(
         drop(directory_rx);
         reader_stop.store(true, Ordering::Release);
         budget.stop();
+        #[cfg(test)]
+        {
+            let hook = DEFERRED_DIRECTORY_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|h| h.0.parent() == Some(root))
+                .cloned();
+            if let Some((_, _, _, stopped)) = hook {
+                let _ = stopped.try_send(());
+            }
+        }
         let mut reader_error = None;
         for reader in readers {
             match reader.join() {
@@ -811,7 +1108,10 @@ fn scan_sync_with_mode(
     }
     // Cancellation keeps every already-discovered metadata result in the partial
     // snapshot. Errors keep the preceding committed revision and fail the job.
-    if failed.is_none() && (pending > 0 || !results.is_empty()) {
+    if failed.is_none() && (pending > 0 || !results.is_empty() || !directory_updates.is_empty()) {
+        if profile.enabled {
+            profile.flush_final += 1;
+        }
         if let Err(error) = flush_batch(
             service,
             &mut c,
@@ -819,6 +1119,7 @@ fn scan_sync_with_mode(
             pending,
             &result_rx,
             &mut results,
+            &mut directory_updates,
             &mut profile,
         ) {
             failed = Some(error);
@@ -837,6 +1138,9 @@ fn scan_sync_with_mode(
         return Err(error);
     }
     let scan = service.repo.scan(scan_id)?;
+    if !job.cancel.load(Ordering::Acquire) {
+        crate::repository::check_directory_metadata_complete(&c, scan_id)?;
+    }
     let state = if job.cancel.load(Ordering::Acquire) {
         "cancelled"
     } else if scan.error_count != "0" {
@@ -911,8 +1215,9 @@ fn record_error(
     error: AppError,
 ) -> Result<()> {
     let _writer = service.writer.lock().unwrap();
+    let tx = c.unchecked_transaction()?;
     Repository::error_conn(
-        c,
+        &tx,
         scan_id,
         ScanError {
             node_id: Some(id.to_string()),
@@ -920,8 +1225,15 @@ fn record_error(
             stage: stage.into(),
             error,
         },
-    )
+    )?;
+    tx.execute(
+        "DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id=?2",
+        params![scan_id, id],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
+#[allow(clippy::too_many_arguments)] // Both result buffers share this one discovery/revision transaction.
 fn flush_batch(
     service: &Service,
     c: &mut rusqlite::Connection,
@@ -929,6 +1241,7 @@ fn flush_batch(
     count: usize,
     receiver: &crossbeam_channel::Receiver<MetadataResult>,
     results: &mut Vec<MetadataResult>,
+    directory_updates: &mut Vec<DirectoryMetadataUpdate>,
     profile: &mut ScanProfile,
 ) -> Result<()> {
     let flush_started = Instant::now();
@@ -1038,6 +1351,9 @@ fn flush_batch(
         profile.pending_insert_ms += timings.pending_ms;
     }
     drop(inserter);
+    for update in directory_updates.drain(..) {
+        apply_directory_metadata(&tx, scan_id, &update)?;
+    }
     profile.insert_ms += milliseconds(insert_started);
     let aggregate_started = Instant::now();
     let aggregation = aggregate_many(&tx, scan_id, &aggregates)?;
@@ -1098,6 +1414,10 @@ pub fn replace_subtree(
     let ancestors = Repository::ancestors_conn(&tx, target_scan, parse_id(scope_id)?)?;
     tx.execute_batch("CREATE TEMP TABLE refresh_ids(old_id INTEGER PRIMARY KEY,new_id INTEGER); CREATE TEMP TABLE refresh_old(path BLOB PRIMARY KEY,id INTEGER,identity TEXT,fingerprint TEXT); CREATE TEMP TABLE refreshed_nodes(id INTEGER PRIMARY KEY);")?;
     tx.execute("WITH RECURSIVE subtree(id) AS (SELECT ?2 UNION ALL SELECT n.id FROM subtree s CROSS JOIN nodes n ON n.scan_id=?1 AND n.parent_id=s.id) INSERT INTO refreshed_nodes SELECT id FROM subtree",params![target_scan,parse_id(scope_id)?])?;
+    tx.execute(
+        "DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id IN refreshed_nodes",
+        [target_scan],
+    )?;
     tx.execute("INSERT INTO refresh_old SELECT path,id,COALESCE(json_extract(payload,'$.fingerprint.identity'),json_extract(payload,'$.metadata.identity'),json_extract(payload,'$.i')),json_object('kind',kind,'logical',COALESCE(json_extract(payload,'$.fingerprint.logical'),json_extract(payload,'$.metadata.logical'),json_extract(payload,'$.b')),'modified',modified,'reparse_tag',COALESCE(json_extract(payload,'$.fingerprint.reparse_tag'),json_extract(payload,'$.metadata.reparse_tag'),json_extract(payload,'$.t'),0)) FROM nodes WHERE scan_id=?1 AND id IN refreshed_nodes",[target_scan])?;
     let max: i64 = tx.query_row(
         "SELECT COALESCE(MAX(id),0) FROM nodes WHERE scan_id=?1",
@@ -1114,7 +1434,7 @@ pub fn replace_subtree(
         |r| r.get(0),
     )?;
     tx.execute("UPDATE nodes SET payload=json_set(?3,'$.node.depth',depth),logical_total=?4,allocated_total=?5,allocated_unknown=?6,file_count=?7,dir_count=?8,children_count=?9,incomplete=?10,stale=0,error_code=?11,modified=?12,kind=?13,extension=?14 WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(scope_id)?,root_payload,parse_bytes(&new.node.logical_total_bytes)?,parse_bytes(&new.node.allocated_known_total_bytes)?,parse_bytes(&new.node.allocated_unknown_count)?,parse_bytes(&new.node.file_count)?,parse_bytes(&new.node.directory_count)?,parse_bytes(&new.node.children_count)?,new.node.incomplete,new.node.error_code,new.node.modified_at,new.node.kind,new.node.extension])?;
-    tx.execute("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,stale,error_code,search_path) SELECT ?1,m.new_id,p.new_id,n.path,json_set(n.payload,'$.node.depth',n.depth+?3),n.name,n.kind,n.extension,n.depth+?3,n.modified,n.logical_total,n.allocated_total,n.allocated_unknown,n.file_count,n.dir_count,n.children_count,n.incomplete,0,n.error_code,n.search_path FROM nodes n JOIN refresh_ids m ON n.id=m.old_id JOIN refresh_ids p ON n.parent_id=p.old_id WHERE n.scan_id=?2 AND n.id<>1",params![target_scan,staging_scan,old.node.depth])?;
+    tx.execute("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,stale,error_code,search_path) SELECT ?1,m.new_id,p.new_id,n.path,json_set(n.payload,'$.node.depth',n.depth+?3),n.name,n.kind,n.extension,n.depth+?3,n.modified,n.logical_total,n.allocated_total,n.allocated_unknown,n.file_count,n.dir_count,n.children_count,CASE WHEN n.incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=n.scan_id) ELSE n.incomplete END,0,n.error_code,n.search_path FROM nodes n JOIN refresh_ids m ON n.id=m.old_id JOIN refresh_ids p ON n.parent_id=p.old_id WHERE n.scan_id=?2 AND n.id<>1",params![target_scan,staging_scan,old.node.depth])?;
     for ancestor in ancestors.into_iter().rev() {
         let delta = parse_bytes(&new.node.logical_total_bytes)?
             - parse_bytes(&old.node.logical_total_bytes)?;
@@ -1122,7 +1442,7 @@ pub fn replace_subtree(
             - parse_bytes(&old.node.allocated_known_total_bytes)?;
         checked_aggregate(&ancestor.node, delta, adelta)?;
         tx.execute("UPDATE nodes SET logical_total=logical_total+?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5,file_count=file_count+?6,dir_count=dir_count+?7 WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(&ancestor.node.node_id)?,delta,adelta,parse_bytes(&new.node.allocated_unknown_count)?-parse_bytes(&old.node.allocated_unknown_count)?,parse_bytes(&new.node.file_count)?-parse_bytes(&old.node.file_count)?,parse_bytes(&new.node.directory_count)?-parse_bytes(&old.node.directory_count)?+i64::from(new.node.kind=="directory")-i64::from(old.node.kind=="directory")])?;
-        tx.execute("UPDATE nodes SET incomplete=CASE WHEN error_code IS NULL AND NOT EXISTS(SELECT 1 FROM nodes child WHERE child.scan_id=?1 AND child.parent_id=?2 AND child.incomplete=1) THEN 0 ELSE 1 END WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(&ancestor.node.node_id)?])?;
+        tx.execute("UPDATE nodes SET incomplete=CASE WHEN error_code IS NULL AND NOT EXISTS(SELECT 1 FROM nodes child WHERE child.scan_id=?1 AND child.parent_id=?2 AND (child.incomplete=1 OR (child.incomplete=2 AND (SELECT status FROM scans WHERE id=?1) NOT IN('completed','completed_with_errors')))) THEN 0 ELSE 1 END WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(&ancestor.node.node_id)?])?;
     }
     tx.execute("UPDATE scans SET history_stale=CASE WHEN ?3=1 THEN 0 ELSE history_stale END,revision=revision+1,stale=(CASE WHEN ?3=1 THEN 0 ELSE history_stale END OR EXISTS(SELECT 1 FROM nodes WHERE scan_id=?1 AND stale=1)),discovered=(SELECT COUNT(*) FROM nodes WHERE scan_id=?1),disk_json=?2 WHERE id=?1",params![target_scan,platform::disk_space(&service.repo.root_path(target_scan)?).map(|d|serde_json::to_string(&d)).transpose()?,parse_id(scope_id)?])?;
     // Replace issues from this subtree and retain issues from unaffected scopes.
@@ -1161,6 +1481,105 @@ fn checked_aggregate(n: &Node, delta: i64, adelta: i64) -> Result<()> {
 mod tests {
     use super::*;
     use std::{fs, sync::Arc};
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_deferred_directory_retains_explicit_unknown_metadata_after_recovery() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("source");
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("child/inside.bin"), b"own").unwrap();
+        let root = platform::absolute(&root).unwrap();
+        let child = root.join("child");
+        let data = fixture.path().join("data");
+        let service = Service::new(&data).unwrap();
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (stopped_tx, stopped_rx) = crossbeam_channel::bounded(1);
+        *DEFERRED_DIRECTORY_HOOK.lock().unwrap() =
+            Some((child.clone(), entered_tx, release_rx, stopped_tx));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *DEFERRED_DIRECTORY_HOOK.lock().unwrap() = None;
+            }
+        }
+        let _clear = Clear;
+        let scan = service.start_scan(root.clone(), None).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let c = service.repo.connect().unwrap();
+        let id: i64 = c
+            .query_row(
+                "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
+                params![scan.scan_id, platform::encode_path(&child)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let partial = service
+            .repo
+            .node(&scan.scan_id, &id.to_string(), None)
+            .unwrap();
+        assert!(partial.node.link_count.is_none());
+        assert!(partial.node.identity.is_some());
+        assert!(partial.node.incomplete);
+        assert_eq!(
+            crate::repository::check_directory_metadata_complete(&c, &scan.scan_id)
+                .unwrap_err()
+                .code,
+            "METADATA_INCOMPLETE"
+        );
+        let start = Instant::now();
+        service.cancel_job(&scan.scan_id).unwrap();
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        let event = terminal(&service, &scan.scan_id);
+        assert_eq!(event.status, "cancelled");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            service
+                .repo
+                .node(&scan.scan_id, &id.to_string(), None)
+                .unwrap()
+                .node
+                .link_count,
+            None
+        );
+        drop(c);
+        drop(service);
+        let recovered = Service::new(&data).unwrap();
+        let saved = recovered
+            .repo
+            .node(&scan.scan_id, &id.to_string(), None)
+            .unwrap();
+        assert!(saved.node.incomplete);
+        assert!(saved.node.link_count.is_none());
+        assert_eq!(
+            recovered.repo.scan(&scan.scan_id).unwrap().status,
+            "cancelled"
+        );
+        let c = recovered.repo.connect().unwrap();
+        assert_eq!(
+            crate::repository::check_directory_metadata_complete(&c, &scan.scan_id)
+                .unwrap_err()
+                .code,
+            "METADATA_INCOMPLETE"
+        );
+    }
+    #[test]
+    fn deferred_metadata_never_accepts_a_nonrecursive_directory_with_the_same_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut measured = platform::metadata(fixture.path()).unwrap();
+        let expected = measured.identity.clone();
+        assert!(matches_directory_metadata(&measured, &expected));
+        measured.recurse = false;
+        measured.cloud_state = Some("placeholder_not_recalled".into());
+        assert!(!matches_directory_metadata(&measured, &expected));
+        measured.cloud_state = None;
+        measured.attributes |= 0x1000;
+        assert!(!matches_directory_metadata(&measured, &expected));
+        measured.recurse = true;
+        measured.identity = Some("different".into());
+        assert!(!matches_directory_metadata(&measured, &expected));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1242,6 +1661,122 @@ mod tests {
         assert_eq!(root_node.allocated_known_total_bytes, sum.to_string());
         assert_eq!(root_node.allocated_unknown_count, "0");
         assert_eq!(root_node.logical_total_bytes, "12");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bulk_and_legacy_acl_failures_keep_exact_coverage_and_refresh_completion() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let denied = source.join("denied");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("child"), b"abc").unwrap();
+        let principal = std::env::var("USERNAME").unwrap();
+        let grant = std::process::Command::new("icacls")
+            .arg(&denied)
+            .args(["/deny", &format!("{principal}:(OI)(CI)(R)")])
+            .output()
+            .unwrap();
+        assert!(grant.status.success(), "{grant:?}");
+        struct Restore(std::path::PathBuf, String);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.0)
+                    .args(["/remove:d", &self.1])
+                    .output();
+            }
+        }
+        let restore = Restore(denied.clone(), principal);
+        let root = platform::absolute(&source).unwrap();
+        let child_path = root.join("denied");
+        let service = Service::new(&fixture.path().join("data")).unwrap();
+        let counters = |n: &Node| {
+            [
+                n.logical_total_bytes.clone(),
+                n.allocated_known_total_bytes.clone(),
+                n.allocated_unknown_count.clone(),
+                n.file_count.clone(),
+                n.directory_count.clone(),
+                n.children_count.clone(),
+            ]
+        };
+        let mut scans = vec![];
+        for fast in [false, true] {
+            let id = service.repo.new_scan_id().unwrap();
+            service.repo.insert_scan(&id, &root, false).unwrap();
+            let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+            let scan = scan_sync_with_mode(&service, &id, &root, &job, fast).unwrap();
+            assert!(job.terminal());
+            assert_eq!(scan.status, "completed_with_errors");
+            assert_eq!(scan.error_count, "1");
+            assert_eq!(scan.discovered_count, "2");
+            assert_eq!(scan.logical_total_bytes, "0");
+            let c = service.repo.connect().unwrap();
+            let child_id: i64 = c
+                .query_row(
+                    "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
+                    params![id, platform::encode_path(&child_path)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::repository::check_directory_metadata_complete(&c, &id).unwrap();
+            let child = service
+                .repo
+                .node(&id, &child_id.to_string(), None)
+                .unwrap()
+                .node;
+            let root_node = service.repo.node(&id, "1", None).unwrap().node;
+            assert_eq!(child.error_code.as_deref(), Some("ACCESS_DENIED"));
+            assert!(child.incomplete && root_node.incomplete);
+            assert_eq!(child.link_count, None);
+            if fast {
+                assert_eq!(child.kind, "directory");
+                assert!(child.identity.is_some());
+                assert_eq!(child.allocated_bytes.as_deref(), Some("0"));
+                assert_eq!(counters(&child), ["0", "0", "0", "0", "0", "0"]);
+                assert_eq!(counters(&root_node), ["0", "0", "0", "0", "1", "1"]);
+            } else {
+                assert_eq!(child.kind, "other");
+                assert_eq!(child.identity, None);
+                assert_eq!(child.allocated_bytes, None);
+                assert_eq!(counters(&child), ["0", "0", "1", "0", "0", "0"]);
+                assert_eq!(counters(&root_node), ["0", "0", "1", "0", "0", "1"]);
+            }
+            scans.push((scan, child));
+        }
+        drop(restore);
+        let measured = platform::metadata(&child_path).unwrap();
+        let allocation = platform::metadata(&child_path.join("child"))
+            .unwrap()
+            .allocated
+            .unwrap()
+            .to_string();
+        for (scan, old_child) in scans {
+            service
+                .refresh(scan.scan_id.clone(), old_child.node_id.clone(), None)
+                .unwrap();
+            let event = terminal(&service, &scan.scan_id);
+            assert_eq!(event.status, "completed", "{event:?}");
+            let current = service.repo.scan(&scan.scan_id).unwrap();
+            assert_eq!(current.status, "completed");
+            assert_eq!(current.error_count, "0");
+            let child = service
+                .repo
+                .node(&scan.scan_id, &old_child.node_id, None)
+                .unwrap()
+                .node;
+            let root_node = service.repo.node(&scan.scan_id, "1", None).unwrap().node;
+            assert_eq!(child.kind, "directory");
+            assert_eq!(child.identity, measured.identity);
+            assert_eq!(child.link_count, measured.links.map(|n| n.to_string()));
+            assert_eq!(child.error_code, None);
+            assert!(!child.incomplete && !root_node.incomplete);
+            assert_eq!(counters(&child), ["3", &allocation, "0", "1", "0", "1"]);
+            assert_eq!(counters(&root_node), ["3", &allocation, "0", "1", "1", "1"]);
+            let c = service.repo.connect().unwrap();
+            crate::repository::check_directory_metadata_complete(&c, &scan.scan_id).unwrap();
+        }
     }
 
     fn terminal(service: &Service, id: &str) -> JobEvent {
@@ -1426,7 +1961,23 @@ mod tests {
     fn metadata_worker_panic_fails_without_missing_result_or_hanging() {
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
-        fs::create_dir_all(source.join("panic-directory")).unwrap();
+        fs::create_dir(&source).unwrap();
+        #[cfg(windows)]
+        {
+            let target = fixture.path().join("target");
+            fs::create_dir(&target).unwrap();
+            assert!(std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(source.join("panic-directory"))
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+        }
+        #[cfg(not(windows))]
+        fs::create_dir(source.join("panic-directory")).unwrap();
         let root = platform::absolute(&source).unwrap();
         *METADATA_PANIC_PATH.lock().unwrap() = Some(root.join("panic-directory"));
         struct ClearPanic;
@@ -1485,16 +2036,16 @@ mod directory_queue_tests {
 
     fn connection(count: i64) -> rusqlite::Connection {
         let c = rusqlite::Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID; CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);").unwrap();
+        c.execute_batch("CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,expected_identity TEXT,metadata_deferred INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scan_id,id)) WITHOUT ROWID; CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);").unwrap();
         for id in 1..=count {
             c.execute(
-                "INSERT INTO pending_dirs VALUES('s',?1,?2,?1)",
+                "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES('s',?1,?2,?1)",
                 params![id, id.to_le_bytes().as_slice()],
             )
             .unwrap();
         }
         c.execute(
-            "INSERT INTO pending_dirs VALUES('other',?1,?2,0)",
+            "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES('other',?1,?2,0)",
             params![count + 2, b"other".as_slice()],
         )
         .unwrap();
@@ -1503,79 +2054,183 @@ mod directory_queue_tests {
 
     #[test]
     fn one_directory_refills_match_legacy_order_across_flush_and_new_ids() {
-        let c = connection(400);
-        let mut cursor = DirectoryQueueCursor::default();
-        let mut seen = Vec::new();
-        loop {
-            let found = cursor.read(&c, "s", 1).unwrap();
-            let legacy = DirectoryQueueCursor::default().read(&c, "s", 1).unwrap();
-            assert_eq!(found, legacy);
-            let Some((id, path, depth)) = found.first() else {
-                break;
-            };
-            assert_eq!(*depth, *id as u32);
-            assert_eq!(path, &id.to_le_bytes());
-            let mut mark = c
-                .prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")
-                .unwrap();
-            cursor.consume(&mut mark, *id).unwrap();
-            drop(mark);
-            seen.push(*id);
-            if seen.len() == 256 {
-                let tx = c.unchecked_transaction().unwrap();
-                tx.execute(
-                    "DELETE FROM pending_dirs WHERE scan_id='s' AND id IN consumed_dirs",
-                    [],
-                )
-                .unwrap();
-                tx.execute("DELETE FROM consumed_dirs", []).unwrap();
-                for id in [1000i64, 1001] {
+        for flush_after in [13, 256, 1024] {
+            let c = connection(1200);
+            let mut cursor = DirectoryQueueCursor::default();
+            let mut seen = Vec::new();
+            let mut queries = 0;
+            loop {
+                if cursor.needs_refill() {
+                    cursor.refill(&c, "s").unwrap();
+                    queries += 1;
+                }
+                assert!(cursor.cache.len() <= DIRECTORY_PREFETCH);
+                assert!(cursor.owned_bytes() <= DIRECTORY_CACHE_BYTES);
+                let found = cursor.cache.front().cloned();
+                let mut stmt = c.prepare_cached(FIRST_PENDING_DIRECTORIES).unwrap();
+                let legacy = stmt
+                    .query_map(params!["s", 1], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, u32>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .next()
+                    .transpose()
+                    .unwrap();
+                assert_eq!(found, legacy);
+                let Some((id, path, depth, _, _)) = found else {
+                    break;
+                };
+                assert_eq!(depth, id as u32);
+                assert_eq!(path, id.to_le_bytes());
+                let mut mark = c
+                    .prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")
+                    .unwrap();
+                assert_eq!(cursor.consume(&mut mark).unwrap().0, id);
+                drop(mark);
+                seen.push(id);
+                if seen.len() == flush_after {
+                    let tx = c.unchecked_transaction().unwrap();
                     tx.execute(
-                        "INSERT INTO pending_dirs VALUES('s',?1,?2,?1)",
-                        params![id, id.to_le_bytes().as_slice()],
+                        "DELETE FROM pending_dirs WHERE scan_id='s' AND id IN consumed_dirs",
+                        [],
                     )
                     .unwrap();
+                    tx.execute("DELETE FROM consumed_dirs", []).unwrap();
+                    for id in [2000i64, 2001] {
+                        tx.execute(
+                            "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES('s',?1,?2,?1)",
+                            params![id, id.to_le_bytes().as_slice()],
+                        )
+                        .unwrap();
+                    }
+                    tx.commit().unwrap();
+                    cursor.reset_after_flush();
                 }
-                tx.commit().unwrap();
-                cursor.reset_after_flush();
             }
+            let expected = ((1201 - flush_after as i64)..=1200)
+                .rev()
+                .chain([2001, 2000])
+                .chain((1..=(1200 - flush_after as i64)).rev())
+                .collect::<Vec<_>>();
+            assert_eq!(seen, expected);
+            assert_eq!(
+                seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+                1202
+            );
+            assert!(
+                queries < 45,
+                "{queries} queries for 1202 one-at-a-time dispatches"
+            );
         }
-        let expected = (145..=400)
-            .rev()
-            .chain([1001, 1000])
-            .chain((1..=144).rev())
-            .collect::<Vec<_>>();
-        assert_eq!(seen, expected);
-        assert_eq!(
-            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
-            402
-        );
     }
 
     #[test]
     fn unread_or_failed_dispatch_does_not_advance_past_queued_directories() {
         let c = connection(40);
         let mut cursor = DirectoryQueueCursor::default();
-        let first = cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap();
-        assert_eq!(cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap(), first);
+        cursor.refill(&c, "s").unwrap();
+        let first = cursor.cache.clone();
+        assert_eq!(cursor.before_id, None);
+        assert!(!cursor.needs_refill());
         let mut mark = c
             .prepare_cached("INSERT INTO consumed_dirs(id) VALUES(?1)")
             .unwrap();
-        for (id, _, _) in first.iter().take(5) {
-            cursor.consume(&mut mark, *id).unwrap();
+        for row in first.iter().take(5) {
+            assert_eq!(cursor.consume(&mut mark).unwrap().0, row.0);
         }
-        let remainder = cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap();
-        assert_eq!(remainder.first().unwrap().0, 35);
+        let remainder = cursor.cache.clone();
+        assert_eq!(remainder.front().unwrap().0, 35);
         c.execute_batch("CREATE TEMP TRIGGER reject_consumed BEFORE INSERT ON consumed_dirs WHEN NEW.id=35 BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
-        assert!(cursor.consume(&mut mark, 35).is_err());
-        assert_eq!(cursor.read(&c, "s", DIRECTORY_PREFETCH).unwrap(), remainder);
+        assert!(cursor.consume(&mut mark).is_err());
+        assert_eq!(cursor.cache, remainder);
+        assert_eq!(cursor.before_id, Some(36));
         c.execute_batch("DROP TRIGGER reject_consumed;").unwrap();
         let mut seen = first.iter().take(5).map(|row| row.0).collect::<Vec<_>>();
-        while let Some((id, _, _)) = cursor.read(&c, "s", 1).unwrap().first() {
-            cursor.consume(&mut mark, *id).unwrap();
-            seen.push(*id);
+        loop {
+            if cursor.needs_refill() {
+                cursor.refill(&c, "s").unwrap();
+            }
+            if cursor.cache.is_empty() {
+                break;
+            }
+            seen.push(cursor.consume(&mut mark).unwrap().0);
         }
         assert_eq!(seen, (1..=40).rev().collect::<Vec<_>>());
+        assert!(!cursor.needs_refill());
+    }
+
+    #[test]
+    fn cache_bounds_owned_paths_and_dispatches_an_oversized_singleton() {
+        let c = connection(0);
+        for (id, bytes) in [(1, 110_000), (2, 160_000), (3, 300_000)] {
+            c.execute(
+                "INSERT INTO pending_dirs VALUES('s',?1,?2,1,'expected-identity',1)",
+                params![id, vec![7u8; bytes]],
+            )
+            .unwrap();
+        }
+        let mut cursor = DirectoryQueueCursor::default();
+        let mut mark = c
+            .prepare_cached("INSERT INTO consumed_dirs VALUES(?1)")
+            .unwrap();
+        for id in [3, 2, 1] {
+            cursor.refill(&c, "s").unwrap();
+            assert_eq!(cursor.cache.len(), 1);
+            assert!(cursor.owned_bytes() <= BATCH_PATH_BYTES);
+            if id == 3 {
+                assert!(cursor.owned_bytes() > DIRECTORY_CACHE_BYTES);
+            } else {
+                assert!(cursor.owned_bytes() <= DIRECTORY_CACHE_BYTES);
+            }
+            let item = cursor.consume(&mut mark).unwrap();
+            assert_eq!(item.0, id);
+            assert_eq!(item.3.as_deref(), Some("expected-identity"));
+            assert!(item.4);
+        }
+        assert!(!cursor.needs_refill());
+        assert_eq!(cursor.payload_bytes, 0);
+    }
+
+    #[test]
+    fn path_exceeding_singleton_limit_is_rejected_without_consuming() {
+        let c = connection(0);
+        c.execute(
+            "INSERT INTO pending_dirs(scan_id,id,path,depth) VALUES('s',1,?1,0)",
+            [vec![7u8; BATCH_PATH_BYTES + 1]],
+        )
+        .unwrap();
+        let mut cursor = DirectoryQueueCursor::default();
+        assert_eq!(cursor.refill(&c, "s").unwrap_err().code, "PATH_LIMIT");
+        assert!(cursor.cache.is_empty());
+        assert_eq!(cursor.before_id, None);
+        assert_eq!(
+            c.query_row::<i64, _, _>("SELECT COUNT(*) FROM consumed_dirs", [], |r| r.get(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn consumed_override_only_accepts_the_three_bounded_comparison_values() {
+        assert_eq!(consumed_limit_override(Some("256")), 256);
+        assert_eq!(consumed_limit_override(Some("1024")), 1024);
+        assert_eq!(consumed_limit_override(Some("2048")), 2048);
+        for value in [
+            None,
+            Some("0"),
+            Some("4096"),
+            Some("-1"),
+            Some("garbage"),
+            Some("1024 "),
+        ] {
+            assert_eq!(consumed_limit_override(value), DEFAULT_CONSUMED_LIMIT);
+        }
     }
 
     #[test]
