@@ -671,10 +671,15 @@ fn refresh_affected(
         }
         if let Some((target, _)) = &source.destination_parent {
             use rusqlite::OptionalExtension;
+            // Directory paths remain full, but saved histories can mix the two
+            // lossless encodings. This lookup is only for post-operation refresh;
+            // the operation's fresh file/parent identity checks are unchanged.
+            let wtf8 = crate::stored_path::encode(target, crate::stored_path::Mode::Wtf8)
+                .map_err(crate::stored_path::app_error)?;
             let id: Option<i64> = c
                 .query_row(
-                    "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
-                    rusqlite::params![plan.dto.scan_id, platform::encode_path(target)],
+                    "SELECT id FROM nodes WHERE scan_id=?1 AND kind='directory' AND path IN(?2,?3)",
+                    rusqlite::params![plan.dto.scan_id, platform::encode_path(target), wtf8],
                     |r| r.get(0),
                 )
                 .optional()?;

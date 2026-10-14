@@ -454,6 +454,111 @@ fn real_copy_rename_move_auto_refresh_and_conflicts() {
     assert_eq!(scan.logical_total_bytes, "59");
     assert!(!scan.stale);
 }
+
+#[cfg(windows)]
+#[test]
+fn copy_into_indexed_directory_refreshes_wtf8_and_legacy_destination_paths() {
+    for legacy_destination in [false, true] {
+        let (dir, service, scan) = fixture();
+        let destination = platform::absolute(&dir.path().join("source/empty")).unwrap();
+        let dest_node = find(&service, &scan, "empty");
+        let source = find(&service, &scan, "root.bin");
+        if legacy_destination {
+            service
+                .repo
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE nodes SET path=?3 WHERE scan_id=?1 AND id=?2",
+                    rusqlite::params![
+                        scan.scan_id,
+                        parse_id(&dest_node.node_id).unwrap(),
+                        platform::encode_path(&destination)
+                    ],
+                )
+                .unwrap();
+        }
+        let raw: Vec<u8> = service
+            .repo
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT path FROM nodes WHERE scan_id=?1 AND id=?2",
+                rusqlite::params![scan.scan_id, parse_id(&dest_node.node_id).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let baseline_utf16 =
+            std::env::var("SPACEFOLD_STORED_PATH_CODEC").ok().as_deref() == Some("off");
+        assert_eq!(
+            raw.len() % 2,
+            usize::from(!legacy_destination && !baseline_utf16)
+        );
+        if !legacy_destination && !baseline_utf16 {
+            assert_eq!(&raw[..2], b"SF");
+            assert_eq!(raw[2] & 0x7f, 1);
+        }
+        let plan = file_ops::plan(
+            &service,
+            operation_request(&scan, &source, "copy", Some(&destination), None, "skip"),
+        )
+        .unwrap();
+        let job = file_ops::execute(&service, &plan.plan_id, None).unwrap();
+        let done = wait_job(&service, &job.job_id);
+        assert_eq!(
+            done.results.as_ref().unwrap()[0].status,
+            "success",
+            "{done:?}"
+        );
+        assert_eq!(
+            fs::read(destination.join("root.bin")).unwrap(),
+            vec![1u8; 17]
+        );
+        let updated = service.repo.scan(&scan.scan_id).unwrap();
+        assert!(updated.revision > scan.revision);
+        assert_eq!(updated.logical_total_bytes, "93");
+        assert!(!updated.stale);
+        let destination_node = service
+            .repo
+            .node(&scan.scan_id, &dest_node.node_id, None)
+            .unwrap();
+        assert_eq!(destination_node.path, destination);
+        assert_eq!(destination_node.node.logical_total_bytes, "17");
+        assert_eq!(destination_node.node.file_count, "1");
+        assert_eq!(destination_node.node.children_count, "1");
+        let children = service
+            .repo
+            .page(
+                &PageRequest {
+                    scan_id: scan.scan_id.clone(),
+                    parent_id: Some(dest_node.node_id),
+                    revision: updated.revision,
+                    sort: None,
+                    filter: None,
+                    cursor: None,
+                    page_size: Some(50),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(children.nodes.len(), 1);
+        assert_eq!(
+            children.nodes[0].identity,
+            platform::metadata(&destination.join("root.bin"))
+                .unwrap()
+                .identity
+        );
+        assert_eq!(
+            service
+                .repo
+                .node(&scan.scan_id, &source.node_id, None)
+                .unwrap()
+                .node
+                .identity,
+            source.identity
+        );
+    }
+}
 #[cfg(windows)]
 #[test]
 fn source_replacement_and_late_destination_are_rejected() {
