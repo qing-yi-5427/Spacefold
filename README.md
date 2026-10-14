@@ -10,8 +10,8 @@
 
 | 版本 | 使用方式 |
 |---|---|
-| 安装版，约 4.3 MiB | 双击 setup 安装；系统缺少 WebView2 时需下载微软官方运行依赖。 |
-| 便携版，约 302.1 MiB | 完整解压到本地磁盘，运行 `Spacefold.exe`；包含 WebView2 155.0.4283.45 x64，免安装。保留旁边的 `WebView2Runtime` 目录。 |
+| 安装版，约 5.2 MiB | 双击 setup 安装；系统缺少 WebView2 时需下载微软官方运行依赖。 |
+| 便携版，约 311.4 MiB | 完整解压到本地磁盘，运行 `Spacefold.exe`；包含 WebView2 155.0.4283.45 x64，免安装。保留旁边的 `WebView2Runtime` 目录。 |
 
 下载页附 SHA-256 校验清单和中文使用说明。设置与扫描记录保存在 `%APPDATA%\com.spacefold.desktop`。固定版运行组件不自动更新，随新版发行包更新；不支持从网络位置/UNC 启动便携程序。
 
