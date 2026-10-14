@@ -1,3 +1,4 @@
+use crate::stored_metadata::{self, Payload as MetadataPayload, Record as TinyPayload};
 use crate::{model::*, platform, stored_path};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::{
@@ -388,7 +389,7 @@ fn check_schema_version(c: &Connection) -> Result<()> {
     let mut rows = statement.query([])?;
     let row = rows.next()?.ok_or_else(unsupported)?;
     let version: i64 = row.get(0).map_err(|_| unsupported())?;
-    if !matches!(version, 1 | 2) || rows.next()?.is_some() {
+    if !matches!(version, 1..=3) || rows.next()?.is_some() {
         return Err(unsupported());
     }
     Ok(())
@@ -422,7 +423,7 @@ impl Repository {
         c.execute_batch("PRAGMA journal_mode=WAL;")?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema_version(&tx)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS directory_metadata_pending(scan_id TEXT NOT NULL,id INTEGER NOT NULL,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id,id) REFERENCES nodes(scan_id,id) ON DELETE CASCADE) WITHOUT ROWID;
@@ -476,7 +477,20 @@ impl Repository {
             |r| r.get(0),
         )?;
         if !has_search_path {
-            tx.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';UPDATE nodes SET search_path=COALESCE(json_extract(payload,'$.node.displayPath'),'');")?;
+            tx.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';UPDATE nodes SET search_path=COALESCE(json_extract(payload,'$.node.displayPath'),'') WHERE typeof(payload)='text';")?;
+            let mut select =
+                tx.prepare("SELECT scan_id,id,path FROM nodes WHERE typeof(payload)='blob'")?;
+            let mut rows = select.query([])?;
+            let mut update =
+                tx.prepare("UPDATE nodes SET search_path=?3 WHERE scan_id=?1 AND id=?2")?;
+            while let Some(row) = rows.next()? {
+                let path = stored_path::decode(row.get(2)?).map_err(stored_path::app_error)?;
+                update.execute(params![
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    platform::display(&path)
+                ])?;
+            }
         }
         let has_history_stale: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('scans') WHERE name='history_stale')",
@@ -488,7 +502,7 @@ impl Repository {
                 "ALTER TABLE scans ADD COLUMN history_stale INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        tx.execute("UPDATE schema_info SET version=2", [])?;
+        tx.execute("UPDATE schema_info SET version=3", [])?;
         tx.commit()?;
         Ok(repo)
     }
@@ -1507,86 +1521,37 @@ struct CompactPayload {
     v: u8,
     metadata: platform::Metadata,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TinyPayload {
-    v: u8,
-    b: u64,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    f: u32,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    t: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    a: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    i: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    n: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    l: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    g: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    c: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    m: Option<String>,
-}
-fn is_zero(n: &u32) -> bool {
-    *n == 0
-}
-impl TinyPayload {
-    fn from_meta(m: &platform::Metadata) -> Self {
-        Self {
-            v: 3,
-            b: m.logical,
-            f: m.attributes,
-            t: m.reparse_tag,
-            a: m.allocated,
-            i: m.identity.clone(),
-            n: m.links,
-            l: m.link_type.clone(),
-            g: m.link_target.clone(),
-            c: m.cloud_state.clone(),
-            m: m.allocation_method.clone(),
-        }
-    }
-}
 pub fn read_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
-    let text: String = r.get(3)?;
+    let value = r.get_ref(3)?;
+    let compact = stored_metadata::compact_ref(value)
+        .map_err(|e| stored_metadata::sql_error(3, value.data_type(), e))?;
     let path = stored_path::decode(r.get(2)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, Box::new(error))
     })?;
-    let (mut node, fingerprint) = if text.starts_with("{\"v\":3") || text.starts_with("{\"v\":2") {
-        let m = if text.starts_with("{\"v\":3") {
-            let p: TinyPayload = serde_json::from_str(&text).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
-            platform::Metadata {
-                kind: r.get(15)?,
-                logical: p.b,
-                allocated: p.a,
-                modified: r.get(17)?,
-                identity: p.i,
-                links: p.n,
-                attributes: p.f,
-                reparse_tag: p.t,
-                link_type: p.l,
-                link_target: p.g,
-                cloud_state: p.c,
-                allocation_method: p.m,
-                recurse: false,
-            }
+    let text = if compact.is_none() {
+        stored_metadata::legacy_ref(value)
+            .map_err(|e| stored_metadata::sql_error(3, value.data_type(), e))?
+    } else {
+        ""
+    };
+    let (mut node, fingerprint) = if compact.is_some() || text.starts_with("{\"v\":2") {
+        let m = if let Some(p) = compact {
+            p.metadata(r.get(15)?, r.get(17)?)
         } else {
-            let p: CompactPayload = serde_json::from_str(&text).map_err(|e| {
+            let p: CompactPayload = serde_json::from_str(text).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?;
+            if p.v != 2 {
+                return Err(stored_metadata::sql_error(
+                    3,
+                    value.data_type(),
+                    stored_metadata::Error::unsupported_version(),
+                ));
+            }
             p.metadata
         };
         let fp = m.fingerprint();
@@ -1619,7 +1584,7 @@ pub fn read_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
         };
         (node, fp)
     } else {
-        let p: Payload = serde_json::from_str(&text).map_err(|e| {
+        let p: Payload = serde_json::from_str(text).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
         })?;
         (p.node, p.fingerprint)
@@ -1686,7 +1651,7 @@ pub struct InsertTimings {
 /// unchanged; the display and search strings remain separate from that path.
 pub struct EncodedNode {
     raw_path: Vec<u8>,
-    payload: String,
+    payload: MetadataPayload,
     name: String,
     extension: String,
     display_path: String,
@@ -1701,16 +1666,30 @@ impl EncodedNode {
     }
 }
 pub fn encode_node(path: &Path, m: &platform::Metadata) -> Result<EncodedNode> {
-    encode_node_with_mode(path, m, stored_path::Mode::from_environment())
+    encode_node_with_codecs(
+        path,
+        m,
+        stored_path::Mode::from_environment(),
+        stored_metadata::Mode::from_environment(),
+    )
 }
+#[cfg(test)]
 pub(crate) fn encode_node_with_mode(
     path: &Path,
     m: &platform::Metadata,
     mode: stored_path::Mode,
 ) -> Result<EncodedNode> {
+    encode_node_with_codecs(path, m, mode, stored_metadata::Mode::Json)
+}
+pub(crate) fn encode_node_with_codecs(
+    path: &Path,
+    m: &platform::Metadata,
+    mode: stored_path::Mode,
+    metadata_mode: stored_metadata::Mode,
+) -> Result<EncodedNode> {
     Ok(EncodedNode {
         raw_path: stored_path::encode(path, mode).map_err(stored_path::app_error)?,
-        payload: serde_json::to_string(&TinyPayload::from_meta(m))?,
+        payload: stored_metadata::encode(m, metadata_mode)?,
         name: path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1734,22 +1713,38 @@ pub struct NodeInserter<'a> {
     pending: rusqlite::CachedStatement<'a>,
     metadata_pending: rusqlite::CachedStatement<'a>,
     path_codec: stored_path::Mode,
+    metadata_codec: stored_metadata::Mode,
     pub timings: Option<InsertTimings>,
 }
 impl<'a> NodeInserter<'a> {
     pub fn new(tx: &'a Transaction<'_>, profile: bool) -> Result<Self> {
-        Self::with_path_mode(tx, profile, stored_path::Mode::from_environment())
+        Self::with_codecs(
+            tx,
+            profile,
+            stored_path::Mode::from_environment(),
+            stored_metadata::Mode::from_environment(),
+        )
     }
+    #[cfg(test)]
     pub(crate) fn with_path_mode(
         tx: &'a Transaction<'_>,
         profile: bool,
         path_codec: stored_path::Mode,
+    ) -> Result<Self> {
+        Self::with_codecs(tx, profile, path_codec, stored_metadata::Mode::Json)
+    }
+    pub(crate) fn with_codecs(
+        tx: &'a Transaction<'_>,
+        profile: bool,
+        path_codec: stored_path::Mode,
+        metadata_codec: stored_metadata::Mode,
     ) -> Result<Self> {
         Ok(Self {
             insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete,children_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?18,?15,?16,?17,?19)")?,
             pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth,expected_identity,metadata_deferred) VALUES(?1,?2,?3,?4,?5,?6)")?,
             metadata_pending: tx.prepare_cached("INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,?2)")?,
             path_codec,
+            metadata_codec,
             timings: profile.then(InsertTimings::default),
         })
     }
@@ -1765,7 +1760,7 @@ impl<'a> NodeInserter<'a> {
         error: Option<&AppError>,
     ) -> Result<()> {
         let started = self.timings.as_ref().map(|_| std::time::Instant::now());
-        let encoded = encode_node_with_mode(path, m, self.path_codec)?;
+        let encoded = encode_node_with_codecs(path, m, self.path_codec, self.metadata_codec)?;
         if let (Some(timings), Some(started)) = (&mut self.timings, started) {
             timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
         }
@@ -1802,7 +1797,7 @@ impl<'a> NodeInserter<'a> {
             encoded
         } else {
             let started = self.timings.as_ref().map(|_| std::time::Instant::now());
-            owned = encode_node_with_mode(path, m, self.path_codec)?;
+            owned = encode_node_with_codecs(path, m, self.path_codec, self.metadata_codec)?;
             if let (Some(timings), Some(started)) = (&mut self.timings, started) {
                 timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
@@ -1948,6 +1943,18 @@ mod stored_path_tests {
         PathBuf,
         String,
     ) {
+        fixture_with_metadata(mode, stored_metadata::Mode::Json)
+    }
+    fn fixture_with_metadata(
+        mode: stored_path::Mode,
+        metadata_mode: stored_metadata::Mode,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<Service>,
+        PathBuf,
+        PathBuf,
+        String,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("source-中文");
         let child = root.join("子目录");
@@ -1959,7 +1966,7 @@ mod stored_path_tests {
         service.repo.insert_scan(&id, &root, false).unwrap();
         let mut c = service.repo.connect().unwrap();
         let tx = c.transaction().unwrap();
-        let mut insert = NodeInserter::with_path_mode(&tx, false, mode).unwrap();
+        let mut insert = NodeInserter::with_codecs(&tx, false, mode, metadata_mode).unwrap();
         for (node, parent, path, depth) in [
             (1, None, &root, 0),
             (2, Some(1), &child, 1),
@@ -1985,14 +1992,14 @@ mod stored_path_tests {
     }
 
     #[test]
-    fn schema_v1_upgrade_preserves_history_blobs_and_v2_reopens() {
+    fn schema_v1_upgrade_preserves_history_blobs_and_v3_reopens() {
         let (temp, service, root, _, scan) = fixture(stored_path::Mode::Utf16);
         let c = service.repo.connect().unwrap();
         assert_eq!(
             c.query_row("SELECT version FROM schema_info", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         let snapshot = || {
             c.prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
@@ -2023,7 +2030,7 @@ mod stored_path_tests {
             c.query_row("SELECT version FROM schema_info", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         let after = c
             .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
@@ -2082,7 +2089,7 @@ mod stored_path_tests {
     #[test]
     fn schema_rejects_unknown_empty_multiple_and_noninteger_versions_without_database_writes() {
         for sql in [
-            "UPDATE schema_info SET version=3",
+            "UPDATE schema_info SET version=4",
             "DELETE FROM schema_info",
             "INSERT INTO schema_info VALUES(1)",
             "UPDATE schema_info SET version='future'",
@@ -2110,7 +2117,7 @@ mod stored_path_tests {
     fn schema_upgrade_failure_rolls_back_recovery_queue_and_schema_repairs() {
         let (temp, service, _, _, scan) = fixture(stored_path::Mode::Utf16);
         let c = service.repo.connect().unwrap();
-        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='running';DROP INDEX nodes_parent_name_v2;CREATE TRIGGER fail_schema_promotion BEFORE UPDATE ON schema_info WHEN new.version=2 BEGIN SELECT RAISE(ABORT,'promotion fault');END;").unwrap();
+        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='running';DROP INDEX nodes_parent_name_v2;CREATE TRIGGER fail_schema_promotion BEFORE UPDATE ON schema_info WHEN new.version=3 BEGIN SELECT RAISE(ABORT,'promotion fault');END;").unwrap();
         let pending: i64 = c
             .query_row("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
             .unwrap();
@@ -2155,7 +2162,7 @@ mod stored_path_tests {
             c.query_row("SELECT version FROM schema_info", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             c.query_row("SELECT status FROM scans WHERE id=?1", [&scan], |r| r
@@ -2211,13 +2218,13 @@ mod stored_path_tests {
                         .recv_timeout(Duration::from_secs(12))
                         .unwrap()
                         .unwrap(),
-                    2
+                    3
                 );
             }
         });
         assert_eq!(
             c.query_row(
-                "SELECT COUNT(*) FROM schema_info WHERE version=2",
+                "SELECT COUNT(*) FROM schema_info WHERE version=3",
                 [],
                 |r| r.get::<_, i64>(0)
             )
@@ -2368,10 +2375,521 @@ mod stored_path_tests {
     }
 
     #[test]
+    fn metadata_mixed_sqlite_formats_preserve_all_fields_and_reject_malformed_records() {
+        let (temp, service, _root, file, scan) =
+            fixture_with_metadata(stored_path::Mode::Wtf8, stored_metadata::Mode::Binary);
+        let c = service.repo.connect().unwrap();
+        let mut meta = platform::metadata(&file).unwrap();
+        meta.allocated = Some(0);
+        meta.links = Some(u64::MAX);
+        meta.identity = Some("OPAQUE 中文\0😀".into());
+        meta.attributes = u32::MAX;
+        meta.reparse_tag = u32::MAX;
+        meta.modified = None;
+        meta.link_type = Some("".into());
+        meta.link_target = Some("中文\0😀".into());
+        meta.cloud_state = Some("".into());
+        meta.allocation_method = Some("unknown-method\0".into());
+        c.execute(
+            "UPDATE nodes SET payload=?2,modified=NULL WHERE scan_id=?1 AND id=3",
+            params![
+                scan,
+                stored_metadata::encode(&meta, stored_metadata::Mode::Json).unwrap()
+            ],
+        )
+        .unwrap();
+        let expected = service.repo.node(&scan, "3", None).unwrap();
+        let mut full = serde_json::to_value(Payload {
+            node: expected.node.clone(),
+            fingerprint: expected.fingerprint.clone(),
+        })
+        .unwrap();
+        full["unknown"] = serde_json::json!({"preserved":"中文\0😀"});
+        let full = serde_json::to_string(&full).unwrap();
+        let wrapped = MetadataPayload::Binary(Vec::new())
+            .replacing_legacy_text(full.clone())
+            .unwrap();
+        for payload in [
+            MetadataPayload::Json(full.clone()),
+            MetadataPayload::Json(
+                serde_json::to_string(&CompactPayload {
+                    v: 2,
+                    metadata: meta.clone(),
+                })
+                .unwrap(),
+            ),
+            stored_metadata::encode(&meta, stored_metadata::Mode::Json).unwrap(),
+            stored_metadata::encode(&meta, stored_metadata::Mode::Binary).unwrap(),
+            wrapped,
+        ] {
+            c.execute(
+                "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=3",
+                params![scan, payload],
+            )
+            .unwrap();
+            let actual = service.repo.node(&scan, "3", None).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual.node).unwrap(),
+                serde_json::to_value(&expected.node).unwrap()
+            );
+            assert_eq!(actual.fingerprint, expected.fingerprint);
+        }
+        let wrapper = c
+            .query_row(
+                "SELECT payload FROM nodes WHERE scan_id=?1 AND id=3",
+                [&scan],
+                |r| r.get::<_, rusqlite::types::Value>(0),
+            )
+            .unwrap();
+        for payload in [
+            MetadataPayload::Binary(b"SM\x01\0".to_vec()),
+            MetadataPayload::Json(
+                serde_json::to_string(&CompactPayload {
+                    v: 20,
+                    metadata: meta.clone(),
+                })
+                .unwrap(),
+            ),
+            MetadataPayload::Json("{\"v\":3,\"b\":4,\"b\":5}".into()),
+            MetadataPayload::Binary(Vec::new())
+                .replacing_legacy_text("not JSON".into())
+                .unwrap(),
+        ] {
+            c.execute(
+                "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=3",
+                params![scan, payload],
+            )
+            .unwrap();
+            assert!(service.repo.node(&scan, "3", None).is_err());
+        }
+        c.execute(
+            "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=3",
+            params![scan, wrapper],
+        )
+        .unwrap();
+        c.execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;UPDATE schema_info SET version=2;").unwrap();
+        drop(c);
+        drop(service);
+        let repo = Repository::new(&temp.path().join("data")).unwrap();
+        assert_eq!(
+            repo.node(&scan, "3", None).unwrap().fingerprint,
+            expected.fingerprint
+        );
+        let c = repo.connect().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT payload FROM nodes WHERE scan_id=?1 AND id=3",
+                [&scan],
+                |r| r.get::<_, rusqlite::types::Value>(0)
+            )
+            .unwrap(),
+            wrapper
+        );
+        assert_eq!(
+            c.query_row("SELECT version FROM schema_info", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn binary_metadata_measure_and_sql_integer_limits_preserve_real_identity_and_capacity() {
+        let (_temp, service, root, file, scan) =
+            fixture_with_metadata(stored_path::Mode::Wtf8, stored_metadata::Mode::Binary);
+        let mut meta = platform::metadata(&file).unwrap();
+        meta.links = None;
+        let mut c = service.repo.connect().unwrap();
+        c.execute(
+            "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=3",
+            params![
+                scan,
+                stored_metadata::encode(&meta, stored_metadata::Mode::Binary).unwrap()
+            ],
+        )
+        .unwrap();
+        c.execute("DELETE FROM pending_dirs WHERE scan_id=?1", [&scan])
+            .unwrap();
+        let saved = service.repo.finish(&scan, "completed").unwrap();
+        let (measured, revision) = service
+            .measure_node_with_codec(&scan, "3", saved.revision, stored_metadata::Mode::Binary)
+            .unwrap();
+        assert_eq!(revision, saved.revision + 1);
+        assert_eq!(measured.identity, meta.identity);
+        assert_eq!(
+            measured.link_count,
+            platform::metadata(&file)
+                .unwrap()
+                .links
+                .map(|n| n.to_string())
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT typeof(payload) FROM nodes WHERE scan_id=?1 AND id=3",
+                [&scan],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "blob"
+        );
+        meta.links = Some(u64::MAX);
+        meta.logical = u64::MAX;
+        let mut encoded = encode_node_with_codecs(
+            &file,
+            &meta,
+            stored_path::Mode::Wtf8,
+            stored_metadata::Mode::Binary,
+        )
+        .unwrap();
+        let before = encoded.bytes();
+        let payload_before = encoded.payload.capacity();
+        if let MetadataPayload::Binary(raw) = &mut encoded.payload {
+            raw.reserve(1000);
+        }
+        assert_eq!(
+            encoded.bytes() - before,
+            encoded.payload.capacity() - payload_before
+        );
+        let tx = c.transaction().unwrap();
+        let mut inserter = NodeInserter::with_codecs(
+            &tx,
+            false,
+            stored_path::Mode::Wtf8,
+            stored_metadata::Mode::Binary,
+        )
+        .unwrap();
+        assert_eq!(
+            inserter
+                .insert_encoded(&scan, 4, Some(2), 2, &meta, None, &encoded)
+                .unwrap_err()
+                .code,
+            "SIZE_OUT_OF_RANGE"
+        );
+        drop(inserter);
+        tx.rollback().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE scan_id=?1",
+                [&scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        meta.logical = 4;
+        let tx = c.transaction().unwrap();
+        NodeInserter::with_codecs(
+            &tx,
+            false,
+            stored_path::Mode::Wtf8,
+            stored_metadata::Mode::Binary,
+        )
+        .unwrap()
+        .insert(&scan, 4, Some(2), &file, 2, &meta, None)
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            service.repo.node(&scan, "4", None).unwrap().node.link_count,
+            Some(u64::MAX.to_string())
+        );
+        assert_eq!(service.repo.root_path(&scan).unwrap(), root);
+    }
+
+    #[test]
+    fn metadata_refresh_keeps_mixed_formats_identity_rules_and_legacy_depth_bytes() {
+        for target_mode in [stored_metadata::Mode::Json, stored_metadata::Mode::Binary] {
+            for staging_mode in [stored_metadata::Mode::Json, stored_metadata::Mode::Binary] {
+                let (temp, service, _root, file, scan) =
+                    fixture_with_metadata(stored_path::Mode::Wtf8, target_mode);
+                let scope = file.parent().unwrap();
+                let meta = platform::metadata(&file).unwrap();
+                let make_stage = |metadata: &platform::Metadata| {
+                    let staging = service.repo.new_scan_id().unwrap();
+                    service.repo.insert_scan(&staging, scope, true).unwrap();
+                    let mut c = service.repo.connect().unwrap();
+                    let tx = c.transaction().unwrap();
+                    let mut insert = NodeInserter::with_codecs(
+                        &tx,
+                        false,
+                        stored_path::Mode::Wtf8,
+                        staging_mode,
+                    )
+                    .unwrap();
+                    insert
+                        .insert(
+                            &staging,
+                            1,
+                            None,
+                            scope,
+                            0,
+                            &platform::metadata(scope).unwrap(),
+                            None,
+                        )
+                        .unwrap();
+                    insert
+                        .insert(&staging, 2, Some(1), &file, 1, metadata, None)
+                        .unwrap();
+                    drop(insert);
+                    aggregate_batch(
+                        &tx,
+                        &staging,
+                        1,
+                        integer(metadata.logical).unwrap(),
+                        metadata
+                            .allocated
+                            .map(integer)
+                            .transpose()
+                            .unwrap()
+                            .unwrap_or(0),
+                        i64::from(metadata.allocated.is_none()),
+                        1,
+                        0,
+                        1,
+                    )
+                    .unwrap();
+                    tx.execute("DELETE FROM pending_dirs WHERE scan_id=?1", [&staging])
+                        .unwrap();
+                    tx.execute("UPDATE nodes SET incomplete=0 WHERE scan_id=?1", [&staging])
+                        .unwrap();
+                    tx.commit().unwrap();
+                    service.repo.finish(&staging, "completed").unwrap();
+                    staging
+                };
+                let staging = make_stage(&meta);
+                let c = service.repo.connect().unwrap();
+                let legacy_case = target_mode == stored_metadata::Mode::Json
+                    && staging_mode == stored_metadata::Mode::Json;
+                if legacy_case {
+                    let stored = service.repo.node(&staging, "2", None).unwrap();
+                    let mut node = stored.node;
+                    node.depth = 999;
+                    let mut legacy = serde_json::to_value(Payload {
+                        node,
+                        fingerprint: stored.fingerprint,
+                    })
+                    .unwrap();
+                    legacy["largeUnknown"] = serde_json::Value::String(
+                        "x".repeat(stored_metadata::MAX_RECORD_BYTES + 256),
+                    );
+                    c.execute(
+                        "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=2",
+                        params![staging, serde_json::to_string(&legacy).unwrap()],
+                    )
+                    .unwrap();
+                }
+                let original = c
+                    .query_row(
+                        "SELECT payload FROM nodes WHERE scan_id=?1 AND id=2",
+                        [&staging],
+                        |r| r.get::<_, rusqlite::types::Value>(0),
+                    )
+                    .unwrap();
+                crate::scan::replace_subtree(&service, &scan, "2", &staging).unwrap();
+                let saved = service.repo.node(&scan, "3", None).unwrap();
+                assert_eq!(saved.path, file);
+                assert_eq!(saved.node.depth, 2);
+                assert_eq!(saved.fingerprint.identity, meta.identity);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT payload FROM nodes WHERE scan_id=?1 AND id=3",
+                        [&scan],
+                        |r| r.get::<_, rusqlite::types::Value>(0)
+                    )
+                    .unwrap(),
+                    original
+                );
+                if legacy_case {
+                    let current = service.repo.scan(&scan).unwrap();
+                    let request = ExportRequest {
+                        scan_id: scan.clone(),
+                        revision: current.revision,
+                        scope: "selected".into(),
+                        scope_id: "3".into(),
+                        selected_ids: vec!["3".into()],
+                        recursive: false,
+                        fields: vec!["depth".into()],
+                        format: "json".into(),
+                        target_path: None,
+                        html_row_budget: Some(20),
+                    };
+                    let target = temp.path().join("legacy-depth.json");
+                    let job = JobRuntime::new(
+                        JobEvent::new("export", &scan, "export", current.revision),
+                        None,
+                    );
+                    export::write_report(&service, &request, &target, &job).unwrap();
+                    let report: serde_json::Value =
+                        serde_json::from_slice(&fs::read(target).unwrap()).unwrap();
+                    assert_eq!(report["rows"][0]["depth"], "2");
+                }
+                let mut unknown = meta.clone();
+                unknown.identity = None;
+                unknown.attributes ^= 0x20;
+                unknown.links = None;
+                let staging = make_stage(&unknown);
+                crate::scan::replace_subtree(&service, &scan, "2", &staging).unwrap();
+                assert_eq!(service.repo.node(&scan, "3", None).unwrap().path, file);
+                let mut changed = meta.clone();
+                changed.identity = Some("different-saved-fid".into());
+                // Re-establish a known old identity before testing known mismatch.
+                c.execute(
+                    "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=3",
+                    params![scan, stored_metadata::encode(&meta, target_mode).unwrap()],
+                )
+                .unwrap();
+                let staging = make_stage(&changed);
+                crate::scan::replace_subtree(&service, &scan, "2", &staging).unwrap();
+                assert!(service.repo.node(&scan, "3", None).is_err());
+                let replacement: i64 = c
+                    .query_row(
+                        "SELECT id FROM nodes WHERE scan_id=?1 AND kind='file'",
+                        [&scan],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(replacement > 3);
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_directory_completion_separate_and_fused_preserve_fields_and_patch_budget() {
+        for fused in [false, true] {
+            let (_temp, service, _root, file, scan) =
+                fixture_with_metadata(stored_path::Mode::Wtf8, stored_metadata::Mode::Binary);
+            let mut complete = platform::metadata(file.parent().unwrap()).unwrap();
+            complete.modified = None;
+            let mut partial = complete.clone();
+            partial.links = None;
+            let mut c = service.repo.connect().unwrap();
+            c.execute(
+                "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=2",
+                params![
+                    scan,
+                    stored_metadata::encode(&partial, stored_metadata::Mode::Binary).unwrap()
+                ],
+            )
+            .unwrap();
+            let update = DirectoryMetadataUpdate {
+                id: 2,
+                expected_identity: complete.identity.clone().unwrap(),
+                result: Ok(complete.clone()),
+            };
+            let tx = c.transaction().unwrap();
+            if fused {
+                let updates = [update];
+                let direct = std::collections::BTreeMap::from([(2, [0; 6])]);
+                prepare_directory_fusion_with_codec(
+                    &tx,
+                    &scan,
+                    &updates,
+                    &direct,
+                    false,
+                    stored_metadata::Mode::Binary,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+                .apply(&tx, &scan, None)
+                .unwrap();
+            } else {
+                apply_directory_metadata_with_codec(
+                    &tx,
+                    &scan,
+                    &update,
+                    stored_metadata::Mode::Binary,
+                    None,
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            let saved = service.repo.node(&scan, "2", None).unwrap();
+            assert_eq!(saved.node.link_count, complete.links.map(|n| n.to_string()));
+            assert_eq!(saved.node.modified_at, None);
+            assert_eq!(saved.fingerprint, complete.fingerprint());
+            assert_eq!(
+                c.query_row(
+                    "SELECT typeof(payload) FROM nodes WHERE scan_id=?1 AND id=2",
+                    [&scan],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "blob"
+            );
+            if fused {
+                let before = c
+                    .query_row(
+                        "SELECT payload FROM nodes WHERE scan_id=?1 AND id=2",
+                        [&scan],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .unwrap();
+                complete.link_target = Some("x".repeat(1024 * 1024));
+                let updates = [DirectoryMetadataUpdate {
+                    id: 2,
+                    expected_identity: complete.identity.clone().unwrap(),
+                    result: Ok(complete),
+                }];
+                let direct = std::collections::BTreeMap::from([(2, [0; 6])]);
+                let tx = c.transaction().unwrap();
+                assert!(prepare_directory_fusion_with_codec(
+                    &tx,
+                    &scan,
+                    &updates,
+                    &direct,
+                    false,
+                    stored_metadata::Mode::Binary,
+                    None
+                )
+                .unwrap()
+                .is_none());
+                tx.commit().unwrap();
+                assert_eq!(
+                    c.query_row(
+                        "SELECT payload FROM nodes WHERE scan_id=?1 AND id=2",
+                        [&scan],
+                        |r| r.get::<_, Vec<u8>>(0)
+                    )
+                    .unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stored_path_codecs_preserve_sqlite_paths_queue_identity_reopen_and_four_formats() {
-        for mode in [stored_path::Mode::Utf16, stored_path::Mode::Wtf8] {
-            let (temp, service, root, file, id) = fixture(mode);
+        for (mode, metadata_mode) in [
+            (stored_path::Mode::Utf16, stored_metadata::Mode::Json),
+            (stored_path::Mode::Wtf8, stored_metadata::Mode::Json),
+            (stored_path::Mode::Wtf8, stored_metadata::Mode::Binary),
+        ] {
+            let (temp, service, root, file, id) = fixture_with_metadata(mode, metadata_mode);
             let c = service.repo.connect().unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND typeof(payload)<>?2",
+                    params![
+                        id,
+                        if metadata_mode == stored_metadata::Mode::Binary {
+                            "blob"
+                        } else {
+                            "text"
+                        }
+                    ],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
             let stored: Vec<(i64, Vec<u8>)> = c
                 .prepare("SELECT id,path FROM nodes WHERE scan_id=?1 ORDER BY id")
                 .unwrap()
@@ -2775,6 +3293,23 @@ mod directory_metadata_tests {
             if reason == "legacy" {
                 let revision = service.repo.scan(&seed).unwrap().revision;
                 service.measure_node(&seed, "2", revision).unwrap();
+                let saved = service.repo.node(&seed, "2", None).unwrap();
+                service
+                    .repo
+                    .connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=2",
+                        params![
+                            seed,
+                            serde_json::to_string(&Payload {
+                                node: saved.node,
+                                fingerprint: saved.fingerprint
+                            })
+                            .unwrap()
+                        ],
+                    )
+                    .unwrap();
             }
             let separate = copy_scan(&service, &seed);
             let candidate = copy_scan(&service, &seed);
@@ -3653,6 +4188,21 @@ pub(crate) fn apply_directory_metadata_observed(
     tx: &Transaction<'_>,
     scan_id: &str,
     update: &DirectoryMetadataUpdate,
+    probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<()> {
+    apply_directory_metadata_with_codec(
+        tx,
+        scan_id,
+        update,
+        stored_metadata::Mode::from_environment(),
+        probe,
+    )
+}
+pub(crate) fn apply_directory_metadata_with_codec(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    update: &DirectoryMetadataUpdate,
+    metadata_mode: stored_metadata::Mode,
     mut probe: Option<&mut DirectoryWriteSqlProbe>,
 ) -> Result<()> {
     if let Some(probe) = probe.as_deref_mut() {
@@ -3661,13 +4211,18 @@ pub(crate) fn apply_directory_metadata_observed(
     }
     let mut select =
         tx.prepare_cached("SELECT kind,payload,modified FROM nodes WHERE scan_id=?1 AND id=?2")?;
-    let (kind, payload, modified): (String, String, Option<String>) = select
+    let (kind, compact, modified): (String, Option<TinyPayload>, Option<String>) = select
         .query_row(params![scan_id, update.id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            let value = r.get_ref(1)?;
+            Ok((
+                r.get(0)?,
+                stored_metadata::compact_ref(value)
+                    .map_err(|e| stored_metadata::sql_error(1, value.data_type(), e))?,
+                r.get(2)?,
+            ))
         })?;
     drop(select);
-    let (identity, logical, allocated) = if payload.starts_with("{\"v\":3") {
-        let old: TinyPayload = serde_json::from_str(&payload)?;
+    let (identity, logical, allocated) = if let Some(old) = compact {
         (old.i, old.b, old.a)
     } else {
         // Public detail measurement can replace the compact payload while this
@@ -3714,7 +4269,7 @@ pub(crate) fn apply_directory_metadata_observed(
             }
             // Directory-own allocation is zero under the existing accounting
             // policy. No aggregate/discovered/direct-child value changes here.
-            let payload = serde_json::to_string(&TinyPayload::from_meta(m))?;
+            let payload = stored_metadata::encode(m, metadata_mode)?;
             if let Some(probe) = probe.as_deref_mut() {
                 probe.stats.metadata_payload_update_calls += 1;
                 if let Some(entry) = probe.metadata.get_mut(&update.id) {
@@ -3880,7 +4435,7 @@ impl DirectoryWriteMode {
 struct DirectoryPatch<'a> {
     id: i64,
     row: AggregateRow,
-    payload: String,
+    payload: MetadataPayload,
     modified: Option<&'a str>,
     modified_changed: bool,
 }
@@ -3934,6 +4489,7 @@ fn fusion_fallback(probe: Option<&mut DirectoryWriteSqlProbe>, reason: FusionFal
         }
     }
 }
+#[cfg(test)]
 pub(crate) fn prepare_directory_fusion<'a>(
     tx: &Transaction<'_>,
     scan_id: &str,
@@ -3942,7 +4498,26 @@ pub(crate) fn prepare_directory_fusion<'a>(
     has_errors: bool,
     probe: Option<&mut DirectoryWriteSqlProbe>,
 ) -> Result<Option<DirectoryFusionPlan<'a>>> {
-    prepare_directory_fusion_with_limits(
+    prepare_directory_fusion_with_codec(
+        tx,
+        scan_id,
+        updates,
+        direct,
+        has_errors,
+        stored_metadata::Mode::from_environment(),
+        probe,
+    )
+}
+pub(crate) fn prepare_directory_fusion_with_codec<'a>(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    updates: &'a [DirectoryMetadataUpdate],
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    has_errors: bool,
+    metadata_mode: stored_metadata::Mode,
+    probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<Option<DirectoryFusionPlan<'a>>> {
+    prepare_directory_fusion_with_limits_and_codec(
         tx,
         scan_id,
         updates,
@@ -3950,10 +4525,12 @@ pub(crate) fn prepare_directory_fusion<'a>(
         has_errors,
         1024 * 1024,
         32_768,
+        metadata_mode,
         probe,
     )
 }
-#[allow(clippy::too_many_arguments)] // Testable, separate patch and graph bounds.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn prepare_directory_fusion_with_limits<'a>(
     tx: &Transaction<'_>,
     scan_id: &str,
@@ -3962,6 +4539,30 @@ fn prepare_directory_fusion_with_limits<'a>(
     has_errors: bool,
     patch_bytes: usize,
     graph_rows: usize,
+    probe: Option<&mut DirectoryWriteSqlProbe>,
+) -> Result<Option<DirectoryFusionPlan<'a>>> {
+    prepare_directory_fusion_with_limits_and_codec(
+        tx,
+        scan_id,
+        updates,
+        direct,
+        has_errors,
+        patch_bytes,
+        graph_rows,
+        stored_metadata::Mode::from_environment(),
+        probe,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Testable, separate patch and graph bounds.
+fn prepare_directory_fusion_with_limits_and_codec<'a>(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    updates: &'a [DirectoryMetadataUpdate],
+    direct: &std::collections::BTreeMap<i64, [i64; 6]>,
+    has_errors: bool,
+    patch_bytes: usize,
+    graph_rows: usize,
+    metadata_mode: stored_metadata::Mode,
     mut probe: Option<&mut DirectoryWriteSqlProbe>,
 ) -> Result<Option<DirectoryFusionPlan<'a>>> {
     let metadata_started = probe.as_ref().map(|_| Instant::now());
@@ -4013,37 +4614,52 @@ fn prepare_directory_fusion_with_limits<'a>(
             probe.stats.metadata_select_calls += 1;
             probe.stats.fusion_preflight_metadata_select_calls += 1;
         }
-        let (kind, payload, modified, row): (String, String, Option<String>, AggregateRow) = select
-            .query_row(params![scan_id, update.id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    AggregateRow {
-                        parent: r.get(3)?,
-                        current: [
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                            r.get(8)?,
-                            r.get(9)?,
-                        ],
-                        ..Default::default()
-                    },
-                ))
-            })?;
-        if payload.capacity() > patch_bytes {
-            drop(payload);
+        let (kind, compact, payload_bytes, modified, row): (
+            String,
+            Option<TinyPayload>,
+            usize,
+            Option<String>,
+            AggregateRow,
+        ) = select.query_row(params![scan_id, update.id], |r| {
+            let value = r.get_ref(1)?;
+            let bytes = match value {
+                rusqlite::types::ValueRef::Text(raw) | rusqlite::types::ValueRef::Blob(raw) => {
+                    raw.len()
+                }
+                _ => 0,
+            };
+            Ok((
+                r.get(0)?,
+                if bytes > patch_bytes {
+                    None
+                } else {
+                    stored_metadata::compact_ref(value)
+                        .map_err(|e| stored_metadata::sql_error(1, value.data_type(), e))?
+                },
+                bytes,
+                r.get(2)?,
+                AggregateRow {
+                    parent: r.get(3)?,
+                    current: [
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ],
+                    ..Default::default()
+                },
+            ))
+        })?;
+        if payload_bytes > patch_bytes {
             fusion_fallback(probe, FusionFallback::Budget);
             return Ok(None);
         }
-        if !payload.starts_with("{\"v\":3") {
-            drop(payload);
+        let Some(old) = compact else {
             fusion_fallback(probe, FusionFallback::Legacy);
             return Ok(None);
-        }
-        let old: TinyPayload = serde_json::from_str(&payload)?;
+        };
         if kind != "directory"
             || old.i.as_deref() != Some(&update.expected_identity)
             || old.b != 0
@@ -4055,7 +4671,7 @@ fn prepare_directory_fusion_with_limits<'a>(
             ));
         }
         let metadata = update.result.as_ref().unwrap(); // Eligibility was checked before all SELECTs.
-        let payload = serde_json::to_string(&TinyPayload::from_meta(metadata))?;
+        let payload = stored_metadata::encode(metadata, metadata_mode)?;
         let modified_changed = metadata.modified != modified;
         if patches.owned_bytes().saturating_add(payload.capacity()) > patch_bytes {
             drop(payload);

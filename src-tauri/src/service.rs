@@ -100,6 +100,20 @@ pub struct Service {
 impl Service {
     /// Supplement selected-item metadata without doing a handle query for every scanned file.
     pub fn measure_node(&self, scan_id: &str, node_id: &str, revision: u32) -> Result<(Node, u32)> {
+        self.measure_node_with_codec(
+            scan_id,
+            node_id,
+            revision,
+            crate::stored_metadata::Mode::from_environment(),
+        )
+    }
+    pub(crate) fn measure_node_with_codec(
+        &self,
+        scan_id: &str,
+        node_id: &str,
+        revision: u32,
+        metadata_mode: crate::stored_metadata::Mode,
+    ) -> Result<(Node, u32)> {
         let stored = self.repo.node(scan_id, node_id, Some(revision))?;
         if stored.node.allocated_bytes.is_some()
             && stored.node.identity.is_some()
@@ -143,7 +157,7 @@ impl Service {
         node.link_target = meta.link_target.clone();
         node.allocation_method = meta.allocation_method.clone();
         node.allocated_bytes = meta.allocated.map(|n| n.to_string());
-        tx.execute("UPDATE nodes SET payload=?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5 WHERE scan_id=?1 AND id=?2",rusqlite::params![scan_id,parse_id(node_id)?,serde_json::to_string(&serde_json::json!({"node":node,"fingerprint":meta.fingerprint()}))?,new_alloc-old_alloc,unknown_delta])?;
+        tx.execute("UPDATE nodes SET payload=?3,allocated_total=allocated_total+?4,allocated_unknown=allocated_unknown+?5 WHERE scan_id=?1 AND id=?2",rusqlite::params![scan_id,parse_id(node_id)?,crate::stored_metadata::encode(&meta,metadata_mode)?,new_alloc-old_alloc,unknown_delta])?;
         if let Some(parent) = node.parent_id.as_deref() {
             crate::repository::aggregate_batch(
                 &tx,

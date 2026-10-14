@@ -2,7 +2,7 @@
 use crate::{
     model::*,
     platform,
-    repository::{aggregate_batch, insert_node, insert_node_shallow, Repository},
+    repository::{aggregate_batch, NodeInserter, Repository},
     service::{JobRuntime, Service},
 };
 use rusqlite::OptionalExtension;
@@ -15,6 +15,8 @@ use std::{
 #[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanProfile {
+    path_codec: crate::stored_path::Mode,
+    metadata_codec: crate::stored_metadata::Mode,
     metadata_wait_ms: f64,
     writer_wait_ms: f64,
     insert_ms: f64,
@@ -29,7 +31,11 @@ fn milliseconds(since: Instant) -> f64 {
 
 pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime) -> Result<Scan> {
     let started = Instant::now();
-    let mut profile = ScanProfile::default();
+    let mut profile = ScanProfile {
+        path_codec: crate::stored_path::Mode::from_environment(),
+        metadata_codec: crate::stored_metadata::Mode::from_environment(),
+        ..Default::default()
+    };
     let mut c = service.repo.connect()?;
     // This connection's only TEMP table is a bounded set of <=256 consumed IDs;
     // durable nodes/work queues retain the repository's WAL/NORMAL policy.
@@ -50,7 +56,12 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
             |r| r.get(0),
         )?;
         if !exists {
-            insert_node(&tx, scan_id, 1, None, root, 0, &rootmeta, None)?;
+            NodeInserter::with_codecs(&tx, false, profile.path_codec, profile.metadata_codec)?
+                .insert(scan_id, 1, None, root, 0, &rootmeta, None)?;
+            tx.execute(
+                "UPDATE scans SET discovered=discovered+1 WHERE id=?1",
+                [scan_id],
+            )?;
         }
         tx.commit()?;
     }
@@ -326,6 +337,8 @@ fn flush_batch(
     let tx = c.transaction()?;
     let insert_started = Instant::now();
     let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
+    let mut inserter =
+        NodeInserter::with_codecs(&tx, false, profile.path_codec, profile.metadata_codec)?;
     for (id, parent, path, depth, result) in results {
         let totals = aggregates.entry(parent).or_default();
         totals[5] += 1;
@@ -346,16 +359,7 @@ fn flush_batch(
                         "云目录可能需要召回；未枚举其内容",
                     )
                 });
-                insert_node_shallow(
-                    &tx,
-                    scan_id,
-                    id,
-                    Some(parent),
-                    &path,
-                    depth,
-                    &m,
-                    error.as_ref(),
-                )?;
+                inserter.insert(scan_id, id, Some(parent), &path, depth, &m, error.as_ref())?;
                 if let Some(error) = error {
                     Repository::error_conn(
                         &tx,
@@ -386,16 +390,7 @@ fn flush_batch(
                     allocation_method: None,
                     recurse: false,
                 };
-                insert_node_shallow(
-                    &tx,
-                    scan_id,
-                    id,
-                    Some(parent),
-                    &path,
-                    depth,
-                    &m,
-                    Some(&error),
-                )?;
+                inserter.insert(scan_id, id, Some(parent), &path, depth, &m, Some(&error))?;
                 Repository::error_conn(
                     &tx,
                     scan_id,
@@ -409,6 +404,7 @@ fn flush_batch(
             }
         }
     }
+    drop(inserter);
     profile.insert_ms += milliseconds(insert_started);
     let aggregate_started = Instant::now();
     for (parent, [logical, allocated, unknown, files, dirs, children]) in aggregates {

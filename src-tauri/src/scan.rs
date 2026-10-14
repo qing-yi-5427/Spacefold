@@ -1,9 +1,10 @@
+#[cfg(test)]
+use crate::repository::insert_node;
 use crate::{
     model::*,
     platform,
     repository::{
-        encode_node_with_mode, insert_node, DirectoryMetadataUpdate, EncodedNode, NodeInserter,
-        Repository,
+        encode_node_with_codecs, DirectoryMetadataUpdate, EncodedNode, NodeInserter, Repository,
     },
     service::{JobRuntime, Service},
 };
@@ -61,6 +62,7 @@ struct ScanProfile {
     directory_write_mode: crate::repository::DirectoryWriteMode,
     staged_insert_mode: staging::Mode,
     stored_path_codec: crate::stored_path::Mode,
+    metadata_codec: crate::stored_metadata::Mode,
     staged_directory_dispatches: usize,
     staged_directory_active_peak: usize,
     staged_ready_candidate_peak: usize,
@@ -732,8 +734,41 @@ struct ReaderOutput<'a> {
     auxiliary_budget: std::sync::Arc<ReaderBudget>,
     cancel: &'a std::sync::atomic::AtomicBool,
     path_codec: crate::stored_path::Mode,
+    metadata_codec: crate::stored_metadata::Mode,
+}
+#[derive(Debug)]
+enum EntryEncodingError {
+    Skip,
+    Stop,
 }
 impl ReaderOutput<'_> {
+    fn encode_entry(
+        &self,
+        parent: i64,
+        entry: &platform::DirectoryEntry,
+    ) -> std::result::Result<Option<EncodedNode>, EntryEncodingError> {
+        let encoded = entry
+            .scan_file_metadata()
+            .or_else(|| entry.scan_directory_metadata())
+            .map(|m| encode_node_with_codecs(&entry.path, m, self.path_codec, self.metadata_codec))
+            .transpose();
+        match encoded {
+            Ok(encoded) => Ok(encoded),
+            Err(error) if error.code == "STORED_METADATA_ENCODING" => {
+                let _ = self.send(DirectoryMessage::Fatal(error));
+                Err(EntryEncodingError::Stop)
+            }
+            Err(error) => match self.send(DirectoryMessage::Error {
+                parent,
+                path: entry.path.clone(),
+                stage: "encode",
+                error,
+            }) {
+                Ok(()) => Err(EntryEncodingError::Skip),
+                Err(()) => Err(EntryEncodingError::Stop),
+            },
+        }
+    }
     fn send_entries(
         &self,
         parent: i64,
@@ -1073,30 +1108,14 @@ fn read_directories(
             match entry {
                 Ok(entry) => {
                     let started = profile.then(Instant::now);
-                    let encoded = entry
-                        .scan_file_metadata()
-                        .or_else(|| entry.scan_directory_metadata())
-                        .map(|m| encode_node_with_mode(&entry.path, m, output.path_codec))
-                        .transpose();
+                    let encoded = output.encode_entry(parent, &entry);
                     if let Some(started) = started {
                         timings.encode_ms += milliseconds(started);
                     }
                     let encoded = match encoded {
                         Ok(encoded) => encoded,
-                        Err(error) => {
-                            if output
-                                .send(DirectoryMessage::Error {
-                                    parent,
-                                    path: entry.path,
-                                    stage: "encode",
-                                    error,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
+                        Err(EntryEncodingError::Stop) => return,
+                        Err(EntryEncodingError::Skip) => continue,
                     };
                     bytes += entry.path.capacity()
                         + metadata_owned_bytes(entry.hint.as_ref())
@@ -1238,6 +1257,7 @@ fn scan_sync_serial_with_queue_capacity(
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "serial",
         stored_path_codec: crate::stored_path::Mode::from_environment(),
+        metadata_codec: crate::stored_metadata::Mode::from_environment(),
         directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
             std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
                 .ok()
@@ -1276,7 +1296,17 @@ fn scan_sync_serial_with_queue_capacity(
             |r| r.get(0),
         )?;
         if !exists {
-            insert_node(&tx, scan_id, 1, None, root, 0, &rootmeta, None)?;
+            NodeInserter::with_codecs(
+                &tx,
+                false,
+                profile.stored_path_codec,
+                profile.metadata_codec,
+            )?
+            .insert(scan_id, 1, None, root, 0, &rootmeta, None)?;
+            tx.execute(
+                "UPDATE scans SET discovered=discovered+1 WHERE id=?1",
+                [scan_id],
+            )?;
         }
         tx.commit()?;
     }
@@ -1369,6 +1399,7 @@ fn scan_sync_serial_with_queue_capacity(
             let stop = reader_stop.clone();
             let directory_reader = directory_reader.clone();
             let path_codec = profile.stored_path_codec;
+            let metadata_codec = profile.metadata_codec;
             match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault_output = output.clone();
                 let output = ReaderOutput {
@@ -1377,6 +1408,7 @@ fn scan_sync_serial_with_queue_capacity(
                     auxiliary_budget: auxiliary_budget.clone(),
                     cancel: &job.cancel,
                     path_codec,
+                    metadata_codec,
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
@@ -2006,8 +2038,12 @@ fn flush_batch_with_errors(
                 .staged_counter_storage_upper_bound_bytes
                 .max(prepared.totals.capacity() * std::mem::size_of::<[i64; 6]>());
         }
-        let mut inserter =
-            NodeInserter::with_path_mode(&tx, profile.enabled, profile.stored_path_codec)?;
+        let mut inserter = NodeInserter::with_codecs(
+            &tx,
+            profile.enabled,
+            profile.stored_path_codec,
+            profile.metadata_codec,
+        )?;
         let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
         // Enumeration assigns increasing stable IDs. Sort the exceptional worker
         // results back into that order so primary/index inserts remain sequential.
@@ -2161,12 +2197,13 @@ fn flush_batch_with_errors(
             profile.directory_metadata_updates += directory_updates.len();
         }
         let fusion = if profile.directory_write_mode.fused() {
-            crate::repository::prepare_directory_fusion(
+            crate::repository::prepare_directory_fusion_with_codec(
                 &tx,
                 scan_id,
                 directory_updates,
                 &aggregates,
                 !errors.is_empty(),
+                profile.metadata_codec,
                 sql_probe.as_mut(),
             )?
         } else {
@@ -2183,10 +2220,11 @@ fn flush_batch_with_errors(
             result.aggregate
         } else {
             for update in directory_updates.iter() {
-                crate::repository::apply_directory_metadata_observed(
+                crate::repository::apply_directory_metadata_with_codec(
                     &tx,
                     scan_id,
                     update,
+                    profile.metadata_codec,
                     sql_probe.as_mut(),
                 )?;
             }
@@ -2293,7 +2331,7 @@ pub fn replace_subtree(
     let old = Repository::node_conn(&tx, target_scan, parse_id(scope_id)?)?;
     let new = Repository::node_conn(&tx, staging_scan, 1)?;
     let ancestors = Repository::ancestors_conn(&tx, target_scan, parse_id(scope_id)?)?;
-    tx.execute_batch("CREATE TEMP TABLE refresh_ids(old_id INTEGER PRIMARY KEY,new_id INTEGER); CREATE TEMP TABLE refresh_old(path BLOB PRIMARY KEY,id INTEGER,identity TEXT,fingerprint TEXT); CREATE TEMP TABLE refreshed_nodes(id INTEGER PRIMARY KEY); CREATE TEMP TABLE refresh_paths(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
+    tx.execute_batch("CREATE TEMP TABLE refresh_ids(old_id INTEGER PRIMARY KEY,new_id INTEGER); CREATE TEMP TABLE refresh_old(path BLOB PRIMARY KEY,id INTEGER,identity TEXT,kind TEXT,logical BLOB,modified TEXT,reparse_tag INTEGER); CREATE TEMP TABLE refreshed_nodes(id INTEGER PRIMARY KEY); CREATE TEMP TABLE refresh_paths(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,identity TEXT,kind TEXT,logical BLOB,modified TEXT,reparse_tag INTEGER,payload,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
     tx.execute("WITH RECURSIVE subtree(id) AS (SELECT ?2 UNION ALL SELECT n.id FROM subtree s CROSS JOIN nodes n ON n.scan_id=?1 AND n.parent_id=s.id) INSERT INTO refreshed_nodes SELECT id FROM subtree",params![target_scan,parse_id(scope_id)?])?;
     tx.execute(
         "DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id IN refreshed_nodes",
@@ -2302,37 +2340,60 @@ pub fn replace_subtree(
     // Persistent paths may mix legacy UTF16 and WTF8. Build exact legacy keys
     // one row at a time; path equality never replaces the identity checks below.
     {
-        let mut paths = tx.prepare("SELECT scan_id,id,path FROM nodes WHERE (scan_id=?1 AND id IN refreshed_nodes) OR scan_id=?2")?;
+        let mut paths = tx.prepare(&format!("SELECT {},scan_id FROM nodes WHERE (scan_id=?1 AND id IN refreshed_nodes) OR scan_id=?2", crate::repository::NODE_COLUMNS))?;
         let mut rows = paths.query(params![target_scan, staging_scan])?;
-        let mut insert =
-            tx.prepare("INSERT INTO refresh_paths(scan_id,id,path) VALUES(?1,?2,?3)")?;
+        let mut insert = tx.prepare("INSERT INTO refresh_paths(scan_id,id,path,identity,kind,logical,modified,reparse_tag,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
         while let Some(row) = rows.next()? {
-            let path =
-                crate::stored_path::decode(row.get(2)?).map_err(crate::stored_path::app_error)?;
+            let stored = crate::repository::read_node(row).map_err(|error| match error {
+                rusqlite::Error::FromSqlConversionFailure(2, _, cause) => {
+                    AppError::new("STORED_PATH_ENCODING", cause.to_string())
+                }
+                error => AppError::from(error),
+            })?;
+            let scan: String = row.get(19)?;
+            let payload = if scan == staging_scan {
+                let value = row.get_ref(3)?;
+                Some(
+                    crate::stored_metadata::Payload::from_ref(value)
+                        .map_err(crate::stored_metadata::app_error)?,
+                )
+            } else {
+                None
+            };
             insert.execute(params![
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                platform::encode_path(&path)
+                scan,
+                row.get::<_, i64>(0)?,
+                platform::encode_path(&stored.path),
+                stored.fingerprint.identity,
+                row.get::<_, String>(15)?,
+                stored.fingerprint.logical.to_le_bytes().as_slice(),
+                row.get::<_, Option<String>>(17)?,
+                stored.fingerprint.reparse_tag,
+                payload,
             ])?;
         }
     }
-    tx.execute("INSERT INTO refresh_old SELECT k.path,n.id,COALESCE(json_extract(payload,'$.fingerprint.identity'),json_extract(payload,'$.metadata.identity'),json_extract(payload,'$.i')),json_object('kind',kind,'logical',COALESCE(json_extract(payload,'$.fingerprint.logical'),json_extract(payload,'$.metadata.logical'),json_extract(payload,'$.b')),'modified',modified,'reparse_tag',COALESCE(json_extract(payload,'$.fingerprint.reparse_tag'),json_extract(payload,'$.metadata.reparse_tag'),json_extract(payload,'$.t'),0)) FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id WHERE n.scan_id=?1 AND n.id IN refreshed_nodes",[target_scan])?;
+    tx.execute("INSERT INTO refresh_old SELECT path,id,identity,kind,logical,modified,reparse_tag FROM refresh_paths WHERE scan_id=?1",[target_scan])?;
     let max: i64 = tx.query_row(
         "SELECT COALESCE(MAX(id),0) FROM nodes WHERE scan_id=?1",
         [target_scan],
         |r| r.get(0),
     )?;
-    tx.execute("INSERT INTO refresh_ids(old_id,new_id) SELECT n.id,CASE WHEN n.id=1 THEN ?2 ELSE COALESCE((SELECT old.id FROM refresh_old old WHERE old.path=k.path AND (old.identity=COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) OR ((old.identity IS NULL OR COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) IS NULL) AND json_extract(old.fingerprint,'$.kind')=n.kind AND json_extract(old.fingerprint,'$.logical')=COALESCE(json_extract(n.payload,'$.fingerprint.logical'),json_extract(n.payload,'$.metadata.logical'),json_extract(n.payload,'$.b')) AND json_extract(old.fingerprint,'$.modified') IS n.modified AND json_extract(old.fingerprint,'$.reparse_tag')=COALESCE(json_extract(n.payload,'$.fingerprint.reparse_tag'),json_extract(n.payload,'$.metadata.reparse_tag'),json_extract(n.payload,'$.t'),0)))),n.id+?3) END FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id WHERE n.scan_id=?1",params![staging_scan,parse_id(scope_id)?,max])?;
+    tx.execute("INSERT INTO refresh_ids(old_id,new_id) SELECT n.id,CASE WHEN n.id=1 THEN ?2 ELSE COALESCE((SELECT old.id FROM refresh_old old WHERE old.path=k.path AND (old.identity=k.identity OR ((old.identity IS NULL OR k.identity IS NULL) AND old.kind=k.kind AND old.logical=k.logical AND old.modified IS k.modified AND old.reparse_tag=k.reparse_tag))),n.id+?3) END FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id WHERE n.scan_id=?1",params![staging_scan,parse_id(scope_id)?,max])?;
     tx.execute("DELETE FROM scan_errors WHERE scan_id=?1 AND CAST(json_extract(payload,'$.nodeId') AS INTEGER) IN refreshed_nodes",[target_scan])?;
     tx.execute("WITH RECURSIVE subtree(id) AS (SELECT id FROM nodes WHERE scan_id=?1 AND parent_id=?2 UNION ALL SELECT n.id FROM subtree s CROSS JOIN nodes n ON n.scan_id=?1 AND n.parent_id=s.id) DELETE FROM nodes WHERE scan_id=?1 AND id IN subtree",params![target_scan,parse_id(scope_id)?])?;
     // Unchanged paths and file identities retain IDs; replaced identities receive fresh IDs.
-    let root_payload: String = tx.query_row(
-        "SELECT payload FROM nodes WHERE scan_id=?1 AND id=1",
+    let root_payload: crate::stored_metadata::Payload = tx.query_row(
+        "SELECT payload FROM refresh_paths WHERE scan_id=?1 AND id=1",
         [staging_scan],
-        |r| r.get(0),
+        |r| {
+            let value = r.get_ref(0)?;
+            crate::stored_metadata::Payload::from_ref(value)
+                .map_err(|e| crate::stored_metadata::sql_error(0, value.data_type(), e))
+        },
     )?;
-    tx.execute("UPDATE nodes SET payload=json_set(?3,'$.node.depth',depth),logical_total=?4,allocated_total=?5,allocated_unknown=?6,file_count=?7,dir_count=?8,children_count=?9,incomplete=?10,stale=0,error_code=?11,modified=?12,kind=?13,extension=?14 WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(scope_id)?,root_payload,parse_bytes(&new.node.logical_total_bytes)?,parse_bytes(&new.node.allocated_known_total_bytes)?,parse_bytes(&new.node.allocated_unknown_count)?,parse_bytes(&new.node.file_count)?,parse_bytes(&new.node.directory_count)?,parse_bytes(&new.node.children_count)?,new.node.incomplete,new.node.error_code,new.node.modified_at,new.node.kind,new.node.extension])?;
-    tx.execute("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,stale,error_code,search_path) SELECT ?1,m.new_id,p.new_id,n.path,json_set(n.payload,'$.node.depth',n.depth+?3),n.name,n.kind,n.extension,n.depth+?3,n.modified,n.logical_total,n.allocated_total,n.allocated_unknown,n.file_count,n.dir_count,n.children_count,CASE WHEN n.incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=n.scan_id) ELSE n.incomplete END,0,n.error_code,n.search_path FROM nodes n JOIN refresh_ids m ON n.id=m.old_id JOIN refresh_ids p ON n.parent_id=p.old_id WHERE n.scan_id=?2 AND n.id<>1",params![target_scan,staging_scan,old.node.depth])?;
+    tx.execute("UPDATE nodes SET payload=?3,logical_total=?4,allocated_total=?5,allocated_unknown=?6,file_count=?7,dir_count=?8,children_count=?9,incomplete=?10,stale=0,error_code=?11,modified=?12,kind=?13,extension=?14 WHERE scan_id=?1 AND id=?2",params![target_scan,parse_id(scope_id)?,root_payload,parse_bytes(&new.node.logical_total_bytes)?,parse_bytes(&new.node.allocated_known_total_bytes)?,parse_bytes(&new.node.allocated_unknown_count)?,parse_bytes(&new.node.file_count)?,parse_bytes(&new.node.directory_count)?,parse_bytes(&new.node.children_count)?,new.node.incomplete,new.node.error_code,new.node.modified_at,new.node.kind,new.node.extension])?;
+    tx.execute("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,incomplete,stale,error_code,search_path) SELECT ?1,m.new_id,p.new_id,n.path,k.payload,n.name,n.kind,n.extension,n.depth+?3,n.modified,n.logical_total,n.allocated_total,n.allocated_unknown,n.file_count,n.dir_count,n.children_count,CASE WHEN n.incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=n.scan_id) ELSE n.incomplete END,0,n.error_code,n.search_path FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id JOIN refresh_ids m ON n.id=m.old_id JOIN refresh_ids p ON n.parent_id=p.old_id WHERE n.scan_id=?2 AND n.id<>1",params![target_scan,staging_scan,old.node.depth])?;
     for ancestor in ancestors.into_iter().rev() {
         let delta = parse_bytes(&new.node.logical_total_bytes)?
             - parse_bytes(&old.node.logical_total_bytes)?;
@@ -3156,6 +3217,7 @@ mod tests {
                         auxiliary_budget: auxiliary.clone(),
                         cancel: &cancel,
                         path_codec: crate::stored_path::Mode::Utf16,
+                        metadata_codec: crate::stored_metadata::Mode::Json,
                     };
                     let reader = platform::ScanDirectoryReader::new(&root, true);
                     readers.push(scope.spawn(|| {
@@ -3211,6 +3273,7 @@ mod tests {
                 }),
                 cancel: &cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
+                metadata_codec: crate::stored_metadata::Mode::Json,
             };
             for value in [1.0, 2.0] {
                 if output
@@ -3287,6 +3350,7 @@ mod tests {
                 auxiliary_budget: auxiliary.clone(),
                 cancel: &cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
+                metadata_codec: crate::stored_metadata::Mode::Json,
             };
             let mut text = String::with_capacity(512);
             text.push_str("saved error");
@@ -3336,31 +3400,17 @@ mod tests {
     }
 
     #[test]
-    fn wtf8_unicode_entry_uses_actual_capacity_and_is_rejected_before_exceeding_reader_budget() {
+    fn binary_metadata_encoding_cap_uses_the_real_reader_encoder_and_emits_fatal() {
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("metadata.bin");
-        std::fs::write(&file, b"abc").unwrap();
-        let metadata = platform::metadata(&file).unwrap();
-        let path = PathBuf::from(format!("C:\\{}", "中".repeat(2048)));
-        let encoded =
-            encode_node_with_mode(&path, &metadata, crate::stored_path::Mode::Wtf8).unwrap();
-        let mut entries = Vec::with_capacity(1);
-        let bytes = path.capacity()
-            + metadata_owned_bytes(Some(&metadata))
-            + encoded.bytes()
-            + entries.capacity()
-                * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
-        entries.push((
-            platform::DirectoryEntry {
-                path,
-                hint: Some(metadata),
-            },
-            Some(encoded),
-        ));
-        let budget = Arc::new(ReaderBudget {
-            limit: bytes - 1,
-            ..Default::default()
-        });
+        let file = temp.path().join("hint.bin");
+        fs::write(&file, b"abc").unwrap();
+        let mut metadata = platform::metadata(&file).unwrap();
+        metadata.link_target = Some("x".repeat(crate::stored_metadata::MAX_RECORD_BYTES));
+        let entry = platform::DirectoryEntry {
+            path: file,
+            hint: Some(metadata),
+        };
+        assert!(entry.scan_file_metadata().is_some());
         let auxiliary = Arc::new(ReaderBudget {
             limit: AUXILIARY_MESSAGE_BYTES,
             ..Default::default()
@@ -3373,20 +3423,87 @@ mod tests {
             auxiliary_budget: auxiliary.clone(),
             cancel: &cancel,
             path_codec: crate::stored_path::Mode::Wtf8,
+            metadata_codec: crate::stored_metadata::Mode::Binary,
         };
-        assert!(output
-            .send_entries(1, PathBuf::from("C:\\"), 0, entries, bytes, &budget)
-            .is_err());
+        assert!(matches!(
+            output.encode_entry(1, &entry),
+            Err(EntryEncodingError::Stop)
+        ));
         let message = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
         let DirectoryMessage::Fatal(error) = &message.message else {
-            panic!("oversized entry was not rejected")
+            panic!("encoding budget must fail the job, not skip a row")
         };
-        assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+        assert_eq!(error.code, "STORED_METADATA_ENCODING");
+        assert!(receiver.try_recv().is_err());
         drop(message);
         drop(output);
         drop(receiver);
-        assert_eq!(budget.state.lock().unwrap().0, 0);
         assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+    }
+    #[test]
+    fn wtf8_unicode_entry_uses_actual_capacity_and_is_rejected_before_exceeding_reader_budget() {
+        for metadata_codec in [
+            crate::stored_metadata::Mode::Json,
+            crate::stored_metadata::Mode::Binary,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join("metadata.bin");
+            std::fs::write(&file, b"abc").unwrap();
+            let mut metadata = platform::metadata(&file).unwrap();
+            metadata.link_target = Some("unknown-target中文".repeat(1024));
+            let path = PathBuf::from(format!("C:\\{}", "中".repeat(2048)));
+            let encoded = encode_node_with_codecs(
+                &path,
+                &metadata,
+                crate::stored_path::Mode::Wtf8,
+                metadata_codec,
+            )
+            .unwrap();
+            let mut entries = Vec::with_capacity(1);
+            let bytes = path.capacity()
+                + metadata_owned_bytes(Some(&metadata))
+                + encoded.bytes()
+                + entries.capacity()
+                    * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+            entries.push((
+                platform::DirectoryEntry {
+                    path,
+                    hint: Some(metadata),
+                },
+                Some(encoded),
+            ));
+            let budget = Arc::new(ReaderBudget {
+                limit: bytes - 1,
+                ..Default::default()
+            });
+            let auxiliary = Arc::new(ReaderBudget {
+                limit: AUXILIARY_MESSAGE_BYTES,
+                ..Default::default()
+            });
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let (sender, receiver) = crossbeam_channel::bounded(2);
+            let output = ReaderOutput {
+                sender,
+                observation: None,
+                auxiliary_budget: auxiliary.clone(),
+                cancel: &cancel,
+                path_codec: crate::stored_path::Mode::Wtf8,
+                metadata_codec,
+            };
+            assert!(output
+                .send_entries(1, PathBuf::from("C:\\"), 0, entries, bytes, &budget)
+                .is_err());
+            let message = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+            let DirectoryMessage::Fatal(error) = &message.message else {
+                panic!("oversized entry was not rejected")
+            };
+            assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+            drop(message);
+            drop(output);
+            drop(receiver);
+            assert_eq!(budget.state.lock().unwrap().0, 0);
+            assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+        }
     }
 
     #[test]
@@ -3403,6 +3520,7 @@ mod tests {
             auxiliary_budget: auxiliary.clone(),
             cancel: &cancel,
             path_codec: crate::stored_path::Mode::Utf16,
+            metadata_codec: crate::stored_metadata::Mode::Json,
         };
         let oversized = DirectoryMessage::Fatal(AppError::new("ERROR", String::with_capacity(128)));
         assert!(output.send(oversized).is_err());
@@ -3421,6 +3539,7 @@ mod tests {
                 auxiliary_budget: waiting_budget,
                 cancel: &waiting_cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
+                metadata_codec: crate::stored_metadata::Mode::Json,
             };
             output
                 .send(DirectoryMessage::Fatal(AppError::new("E", "x")))
