@@ -1312,6 +1312,7 @@ pub(super) fn scan(
         staged_insert_mode: staged_mode_for(root),
         stored_path_codec: crate::stored_path::Mode::from_environment(),
         metadata_codec: crate::stored_metadata::Mode::from_environment(),
+        file_path_storage: crate::stored_path::FileStorage::from_environment(),
         checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
@@ -1375,6 +1376,7 @@ pub(super) fn scan(
         staged_insert_mode: profile.staged_insert_mode,
         stored_path_codec: profile.stored_path_codec,
         metadata_codec: profile.metadata_codec,
+        file_path_storage: profile.file_path_storage,
         defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
@@ -1469,6 +1471,7 @@ pub(super) fn scan(
             let directory_reader = directory_reader.clone();
             let path_codec = profile.stored_path_codec;
             let metadata_codec = profile.metadata_codec;
+            let file_path_storage = profile.file_path_storage;
             match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault = sender.clone();
                 let output = ReaderOutput {
@@ -1478,6 +1481,7 @@ pub(super) fn scan(
                     cancel: &job.cancel,
                     path_codec,
                     metadata_codec,
+                    file_path_storage,
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
@@ -2739,6 +2743,20 @@ mod tests {
         exercise_staged_done_collector(1300, 4096, true, crate::stored_path::Mode::Utf16);
     }
     #[test]
+    fn basename_native_done_ack_and_cancel_preserve_fields_paths_and_permits() {
+        for (count, cancel) in [(96, false), (32, true)] {
+            exercise_staged_done_collector_with_storage(
+                count,
+                DEFAULT_CONSUMED_LIMIT,
+                cancel,
+                crate::stored_path::Mode::Wtf8,
+                crate::stored_metadata::Mode::Binary,
+                crate::stored_path::FileStorage::Basename,
+            );
+        }
+    }
+
+    #[test]
     fn binary_metadata_real_done_ack_absorption_and_cancel_preserve_fields_and_permits() {
         for (count, cancel) in [(96, false), (32, true)] {
             exercise_staged_done_collector_with_metadata(
@@ -2913,6 +2931,23 @@ mod tests {
         path_codec: crate::stored_path::Mode,
         metadata_codec: crate::stored_metadata::Mode,
     ) {
+        exercise_staged_done_collector_with_storage(
+            directory_count,
+            consumed_limit,
+            cancel_at_ack,
+            path_codec,
+            metadata_codec,
+            crate::stored_path::FileStorage::Full,
+        );
+    }
+    fn exercise_staged_done_collector_with_storage(
+        directory_count: usize,
+        consumed_limit: usize,
+        cancel_at_ack: bool,
+        path_codec: crate::stored_path::Mode,
+        metadata_codec: crate::stored_metadata::Mode,
+        file_path_storage: crate::stored_path::FileStorage,
+    ) {
         let _control = fault_control();
         let (_temp, service, root, id) = setup();
         let mut children = Vec::new();
@@ -2973,6 +3008,7 @@ mod tests {
                         staged_insert_mode: staging::Mode::Staged,
                         stored_path_codec: path_codec,
                         metadata_codec,
+                        file_path_storage,
                         ..Default::default()
                     },
                     checkpoint::Mode::Off,
@@ -2999,6 +3035,7 @@ mod tests {
                     cancel,
                     path_codec,
                     metadata_codec,
+                    file_path_storage,
                 };
                 let root_task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                 assert_eq!(root_task.0, 1);
@@ -3040,9 +3077,24 @@ mod tests {
                         }))
                         .unwrap();
                     let path = task.1.join("inside.bin");
-                    let metadata = platform::metadata(&path).unwrap();
+                    let mut metadata = platform::metadata(&path).unwrap();
+                    if file_path_storage == crate::stored_path::FileStorage::Basename {
+                        metadata.allocation_method =
+                            Some("FILE_ID_EXTD_DIR_INFO.AllocationSize".into());
+                    }
+                    let entry = platform::DirectoryEntry {
+                        path: path.clone(),
+                        hint: Some(metadata.clone()),
+                    };
+                    let encoded = if file_path_storage == crate::stored_path::FileStorage::Basename
+                    {
+                        output.encode_entry(node, &task.1, &entry).unwrap()
+                    } else {
+                        None
+                    };
                     let bytes = path.capacity()
                         + metadata_owned_bytes(Some(&metadata))
+                        + encoded.as_ref().map_or(0, EncodedNode::bytes)
                         + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
                     output
                         .send_entries(
@@ -3054,7 +3106,7 @@ mod tests {
                                     path,
                                     hint: Some(metadata),
                                 },
-                                None,
+                                encoded,
                             )],
                             bytes,
                             &reader_entries,
@@ -3177,6 +3229,10 @@ mod tests {
                 .unwrap(),
                 0
             );
+            if file_path_storage == crate::stored_path::FileStorage::Basename {
+                let count:i64=db.query_row("SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND kind='file' AND length(path)%2=1 AND substr(path,1,3) IN(X'534602',X'534682')",[&id],|r|r.get(0)).unwrap();
+                assert_eq!(count, directory_count as i64);
+            }
             assert_eq!(service.repo.root_path(&id).unwrap(), root);
             assert_eq!(
                 db.query_row(

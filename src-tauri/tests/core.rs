@@ -657,6 +657,9 @@ fn completed_event_observes_closed_scanner_and_complete_main_database() {
         .collect::<String>();
     let uri = format!("file:{encoded}?immutable=1");
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let component_expected = cfg!(windows)
+        && std::env::var("SPACEFOLD_FILE_PATH_STORAGE").ok().as_deref() == Some("basename")
+        && std::env::var("SPACEFOLD_STORED_PATH_CODEC").ok().as_deref() != Some("off");
     let scan = service
         .start_scan(
             platform::absolute(&root).unwrap(),
@@ -666,7 +669,7 @@ fn completed_event_observes_closed_scanner_and_complete_main_database() {
                 }
                 // immutable deliberately ignores WAL and cannot checkpoint it, so this
                 // callback catches a terminal event sent before scanner connection close.
-                let observed = (|| -> rusqlite::Result<(String, i64, i64, i64)> {
+                let observed = (|| -> rusqlite::Result<(String, i64, i64, i64, i64)> {
                     let c = rusqlite::Connection::open_with_flags(
                         &uri,
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -687,7 +690,8 @@ fn completed_event_observes_closed_scanner_and_complete_main_database() {
                         [&event.scan_id],
                         |r| r.get(0),
                     )?;
-                    Ok((status, revision, count, logical))
+                    let components = c.query_row("SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND kind='file' AND length(path)%2=1 AND substr(path,1,3) IN(X'534602',X'534682')",[&event.scan_id],|r|r.get(0))?;
+                    Ok((status, revision, count, logical, components))
                 })()
                 .map_err(|e| e.to_string());
                 done_tx.send((event.revision, observed)).unwrap();
@@ -697,11 +701,12 @@ fn completed_event_observes_closed_scanner_and_complete_main_database() {
     let final_event = wait_job(&service, &scan.scan_id);
     assert_eq!(final_event.status, "completed");
     let (revision, observed) = done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    let (status, stored_revision, count, logical) = observed.unwrap();
+    let (status, stored_revision, count, logical, components) = observed.unwrap();
     assert_eq!(status, "completed");
     assert_eq!(stored_revision, i64::from(revision));
     assert_eq!(count, 513);
     assert_eq!(logical, 3584);
+    assert_eq!(components, if component_expected { 512 } else { 0 });
 }
 
 #[cfg(windows)]

@@ -12,6 +12,27 @@ use std::{
 const MAGIC: [u8; 2] = *b"SF";
 const VERSION: u8 = 1;
 const PAD: u8 = 0x80;
+const COMPONENT_VERSION: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FileStorage {
+    #[default]
+    Full,
+    Basename,
+}
+impl FileStorage {
+    pub(crate) fn from_override(value: Option<&str>) -> Self {
+        if value == Some("basename") {
+            Self::Basename
+        } else {
+            Self::Full
+        }
+    }
+    pub(crate) fn from_environment() -> Self {
+        Self::from_override(std::env::var("SPACEFOLD_FILE_PATH_STORAGE").ok().as_deref())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,12 +84,127 @@ pub(crate) fn decode(raw: Vec<u8>) -> Result<PathBuf, DecodeError> {
     Ok(platform::decode_path(raw))
 }
 
+pub(crate) fn is_component(raw: &[u8]) -> bool {
+    raw.len() % 2 == 1
+        && raw.len() >= 3
+        && raw[..2] == MAGIC
+        && matches!(raw[2], COMPONENT_VERSION | 0x82)
+}
+
+/// Called only by the native ordinary-file reader with its directory task path.
+/// Validate the exact unit prefix and join before replacing a full path; generic
+/// repository/metadata/root writers never select this representation.
+pub(crate) fn encode_native_file(
+    path: &Path,
+    parent: &Path,
+    mode: Mode,
+    storage: FileStorage,
+) -> Result<Vec<u8>, DecodeError> {
+    #[cfg(windows)]
+    if storage == FileStorage::Basename
+        && mode == Mode::Wtf8
+        && parent.is_absolute()
+        && !parent.as_os_str().encode_wide().any(|unit| unit == 0)
+    {
+        let mut full = path.as_os_str().encode_wide();
+        let mut last = None;
+        let mut matched = true;
+        for unit in parent.as_os_str().encode_wide() {
+            last = Some(unit);
+            if full.next() != Some(unit) {
+                matched = false;
+                break;
+            }
+        }
+        if matched && last.is_some() {
+            if !matches!(last, Some(47 | 92)) && full.next() != Some(92) {
+                matched = false;
+            }
+            let length = full.clone().count();
+            if matched
+                && length != 0
+                && !full.clone().eq([46])
+                && !full.clone().eq([46, 46])
+                && !full.clone().any(|unit| matches!(unit, 0 | 47 | 58 | 92))
+            {
+                return encode_units_version(full, length, COMPONENT_VERSION);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (parent, storage);
+    encode(path, mode)
+}
+
+fn valid_component(units: &[u16]) -> bool {
+    !units.is_empty()
+        && units != [46]
+        && units != [46, 46]
+        && !units.iter().any(|unit| matches!(unit, 0 | 47 | 58 | 92))
+}
+
+pub(crate) fn decode_node(
+    raw: Vec<u8>,
+    kind: &str,
+    parent_id: Option<i64>,
+    parent_raw: Option<Vec<u8>>,
+) -> Result<PathBuf, DecodeError> {
+    if !is_component(&raw) {
+        return decode(raw);
+    }
+    if kind != "file" || parent_id.is_none() {
+        return Err(DecodeError("组件仅用于非根文件"));
+    }
+    #[cfg(windows)]
+    {
+        let component = decode_units_version(&raw, COMPONENT_VERSION)?;
+        if !valid_component(&component) {
+            return Err(DecodeError("文件组件含空值或路径跳转"));
+        }
+        // `decode` deliberately rejects another component: at most one lookup.
+        let parent = decode(parent_raw.ok_or(DecodeError("组件父目录缺失或种类不符"))?)?;
+        if !parent.is_absolute() {
+            return Err(DecodeError("父目录不是完整绝对路径"));
+        }
+        let mut units = parent.as_os_str().encode_wide().collect::<Vec<_>>();
+        if units.contains(&0) {
+            return Err(DecodeError("父路径含NUL"));
+        }
+        let separator = usize::from(!matches!(units.last(), Some(47 | 92)));
+        units
+            .len()
+            .checked_add(separator)
+            .and_then(|n| n.checked_add(component.len()))
+            .ok_or(DecodeError("路径容量溢出"))?;
+        units
+            .try_reserve_exact(separator + component.len())
+            .map_err(|_| DecodeError("路径容量不足"))?;
+        if separator != 0 {
+            units.push(92);
+        }
+        units.extend_from_slice(&component);
+        Ok(PathBuf::from(OsString::from_wide(&units)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parent_raw;
+        Err(DecodeError("文件组件只支持Windows"))
+    }
+}
+
 // New envelopes are always odd. Every even blob remains arbitrary legacy
 // UTF16, including all possible prefixes. A parity-changing corruption can
 // therefore become valid legacy data; this format does not promise otherwise.
 fn encode_units(
     units: impl IntoIterator<Item = u16>,
     capacity_hint: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    encode_units_version(units, capacity_hint, VERSION)
+}
+fn encode_units_version(
+    units: impl IntoIterator<Item = u16>,
+    capacity_hint: usize,
+    version: u8,
 ) -> Result<Vec<u8>, DecodeError> {
     let mut output = Vec::new();
     output
@@ -79,7 +215,7 @@ fn encode_units(
         )
         .map_err(|_| DecodeError("路径容量不足"))?;
     output.extend_from_slice(&MAGIC);
-    output.push(VERSION);
+    output.push(version);
     let mut units = units.into_iter().peekable();
     while let Some(unit) = units.next() {
         let scalar = if (0xd800..=0xdbff).contains(&unit)
@@ -120,6 +256,9 @@ fn encode_units(
 }
 
 fn decode_units(raw: &[u8]) -> Result<Vec<u16>, DecodeError> {
+    decode_units_version(raw, VERSION)
+}
+fn decode_units_version(raw: &[u8], version: u8) -> Result<Vec<u16>, DecodeError> {
     if raw.len().is_multiple_of(2) {
         return Ok(raw
             .as_chunks::<2>()
@@ -128,7 +267,7 @@ fn decode_units(raw: &[u8]) -> Result<Vec<u16>, DecodeError> {
             .map(|p| u16::from_le_bytes(*p))
             .collect());
     }
-    if raw.len() < 3 || raw[..2] != MAGIC || !matches!(raw[2], VERSION | 0x81) {
+    if raw.len() < 3 || raw[..2] != MAGIC || (raw[2] != version && raw[2] != (version | PAD)) {
         return Err(DecodeError("未知奇数格式或版本"));
     }
     let end = if raw[2] & PAD != 0 {
@@ -197,6 +336,108 @@ mod tests {
             blob.push(0);
         }
         blob
+    }
+    #[cfg(windows)]
+    #[test]
+    fn trusted_components_preserve_exact_units_prefix_case_and_fallback() {
+        assert_eq!(
+            FileStorage::from_override(Some("basename")),
+            FileStorage::Basename
+        );
+        for value in [None, Some("full"), Some("BASENAME"), Some("basename ")] {
+            assert_eq!(FileStorage::from_override(value), FileStorage::Full);
+        }
+        for parent in [
+            r"C:\MiXeD",
+            r"\\?\C:\MiXeD",
+            r"\\?\UNC\Server\Share\Case",
+            r"C:\",
+            r"C:/mixed/",
+        ] {
+            let parent = PathBuf::from(parent);
+            let mut name: Vec<_> = "MiXeD-😀-".encode_utf16().collect();
+            name.extend_from_slice(&[0xd800, 0x4e2d, 0xdc00]);
+            let mut units: Vec<_> = parent.as_os_str().encode_wide().collect();
+            if !matches!(units.last(), Some(47 | 92)) {
+                units.push(92);
+            }
+            units.extend_from_slice(&name);
+            let path = PathBuf::from(OsString::from_wide(&units));
+            let raw =
+                encode_native_file(&path, &parent, Mode::Wtf8, FileStorage::Basename).unwrap();
+            assert!(is_component(&raw));
+            for mode in [Mode::Utf16, Mode::Wtf8] {
+                let restored = decode_node(
+                    raw.clone(),
+                    "file",
+                    Some(1),
+                    Some(encode(&parent, mode).unwrap()),
+                )
+                .unwrap();
+                assert_eq!(
+                    restored.as_os_str().encode_wide().collect::<Vec<_>>(),
+                    units
+                );
+            }
+            assert!(decode(raw).is_err());
+            let other = PathBuf::from(r"C:\other");
+            let full =
+                encode_native_file(&path, &other, Mode::Wtf8, FileStorage::Basename).unwrap();
+            assert!(!is_component(&full));
+            assert_eq!(
+                decode(full)
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .collect::<Vec<_>>(),
+                units
+            );
+            assert!(!is_component(
+                &encode_native_file(&path, &parent, Mode::Wtf8, FileStorage::Full).unwrap()
+            ));
+            assert!(!is_component(
+                &encode_native_file(&path, &parent, Mode::Utf16, FileStorage::Basename).unwrap()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn components_reject_traversal_missing_wrong_and_recursive_parents() {
+        let parent = encode(Path::new(r"C:\parent"), Mode::Wtf8).unwrap();
+        for value in ["", ".", "..", "/x", "\\x", "C:foo", "a/b", "a\\b", "a\0b"] {
+            let raw =
+                encode_units_version(value.encode_utf16(), value.len(), COMPONENT_VERSION).unwrap();
+            assert!(decode_node(raw, "file", Some(1), Some(parent.clone())).is_err());
+        }
+        let valid = encode_units_version("file".encode_utf16(), 4, COMPONENT_VERSION).unwrap();
+        assert!(decode_node(valid.clone(), "file", None, Some(parent.clone())).is_err());
+        assert!(decode_node(valid.clone(), "directory", Some(1), Some(parent.clone())).is_err());
+        assert!(decode_node(valid.clone(), "file", Some(1), None).is_err());
+        assert!(decode_node(valid.clone(), "file", Some(1), Some(valid.clone())).is_err());
+        assert!(decode_node(
+            valid.clone(),
+            "file",
+            Some(1),
+            Some(encode(Path::new("relative"), Mode::Wtf8).unwrap())
+        )
+        .is_err());
+        for raw in [
+            vec![83, 70, 2, 0xc0, 0x80],
+            vec![83, 70, 0x82, 65, 1],
+            vec![83, 70, 0x42],
+        ] {
+            assert!(decode_node(raw, "file", Some(1), Some(parent.clone())).is_err());
+        }
+        let even = vec![83, 70, 2, 0];
+        assert!(!is_component(&even));
+        assert_eq!(
+            decode_node(even.clone(), "file", None, None)
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            vec![0x4653, 2]
+        );
     }
     #[test]
     fn mode_defaults_to_wtf8_with_exact_off_baseline() {

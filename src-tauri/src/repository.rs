@@ -9,7 +9,7 @@ use std::{
 
 // 0/1 retain their persisted meaning. State 2 is an ordinary directory whose
 // completeness follows the scan's terminal state without a final bulk rewrite.
-pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,CASE WHEN incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=nodes.scan_id) ELSE incomplete END,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path";
+pub const NODE_COLUMNS:&str="id,parent_id,path,payload,logical_total,allocated_total,allocated_unknown,file_count,dir_count,children_count,CASE WHEN incomplete=2 THEN (SELECT status NOT IN('completed','completed_with_errors') FROM scans WHERE id=nodes.scan_id) ELSE incomplete END,(stale OR (SELECT history_stale FROM scans WHERE id=nodes.scan_id)),error_code,depth,name,kind,extension,modified,search_path,CASE WHEN kind='file' AND parent_id IS NOT NULL AND length(path)%2=1 AND substr(path,1,3) IN(X'534602',X'534682') THEN (SELECT p.path FROM nodes p WHERE p.scan_id=nodes.scan_id AND p.id=nodes.parent_id AND p.kind='directory') END";
 struct ViewBudget {
     bytes: usize,
     nodes: usize,
@@ -389,7 +389,7 @@ fn check_schema_version(c: &Connection) -> Result<()> {
     let mut rows = statement.query([])?;
     let row = rows.next()?.ok_or_else(unsupported)?;
     let version: i64 = row.get(0).map_err(|_| unsupported())?;
-    if !matches!(version, 1..=3) || rows.next()?.is_some() {
+    if !matches!(version, 1..=4) || rows.next()?.is_some() {
         return Err(unsupported());
     }
     Ok(())
@@ -423,7 +423,7 @@ impl Repository {
         c.execute_batch("PRAGMA journal_mode=WAL;")?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema_version(&tx)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 4 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS directory_metadata_pending(scan_id TEXT NOT NULL,id INTEGER NOT NULL,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id,id) REFERENCES nodes(scan_id,id) ON DELETE CASCADE) WITHOUT ROWID;
@@ -477,14 +477,20 @@ impl Repository {
             |r| r.get(0),
         )?;
         if !has_search_path {
-            tx.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';UPDATE nodes SET search_path=COALESCE(json_extract(payload,'$.node.displayPath'),'') WHERE typeof(payload)='text';")?;
+            tx.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';")?;
             let mut select =
-                tx.prepare("SELECT scan_id,id,path FROM nodes WHERE typeof(payload)='blob'")?;
+                tx.prepare("SELECT scan_id,id,path,kind,parent_id,CASE WHEN kind='file' AND parent_id IS NOT NULL AND length(path)%2=1 AND substr(path,1,3) IN(X'534602',X'534682') THEN (SELECT p.path FROM nodes p WHERE p.scan_id=nodes.scan_id AND p.id=nodes.parent_id AND p.kind='directory') END FROM nodes")?;
             let mut rows = select.query([])?;
             let mut update =
                 tx.prepare("UPDATE nodes SET search_path=?3 WHERE scan_id=?1 AND id=?2")?;
             while let Some(row) = rows.next()? {
-                let path = stored_path::decode(row.get(2)?).map_err(stored_path::app_error)?;
+                let path = stored_path::decode_node(
+                    row.get(2)?,
+                    &row.get::<_, String>(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                )
+                .map_err(stored_path::app_error)?;
                 update.execute(params![
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -502,7 +508,7 @@ impl Repository {
                 "ALTER TABLE scans ADD COLUMN history_stale INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        tx.execute("UPDATE schema_info SET version=3", [])?;
+        tx.execute("UPDATE schema_info SET version=4", [])?;
         tx.commit()?;
         Ok(repo)
     }
@@ -1525,7 +1531,17 @@ pub fn read_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
     let value = r.get_ref(3)?;
     let compact = stored_metadata::compact_ref(value)
         .map_err(|e| stored_metadata::sql_error(3, value.data_type(), e))?;
-    let path = stored_path::decode(r.get(2)?).map_err(|error| {
+    let raw: Vec<u8> = r.get(2)?;
+    let decoded = if stored_path::is_component(&raw) {
+        let value = r.get_ref(15)?;
+        let kind = value.as_str().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(15, value.data_type(), Box::new(e))
+        })?;
+        stored_path::decode_node(raw, kind, r.get(1)?, r.get(19)?)
+    } else {
+        stored_path::decode(raw)
+    };
+    let path = decoded.map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, Box::new(error))
     })?;
     let text = if compact.is_none() {
@@ -1657,6 +1673,10 @@ pub struct EncodedNode {
     display_path: String,
 }
 impl EncodedNode {
+    #[cfg(test)]
+    pub(crate) fn path_blob_for_test(&self) -> &[u8] {
+        &self.raw_path
+    }
     pub fn bytes(&self) -> usize {
         self.raw_path.capacity()
             + self.payload.capacity()
@@ -1687,8 +1707,33 @@ pub(crate) fn encode_node_with_codecs(
     mode: stored_path::Mode,
     metadata_mode: stored_metadata::Mode,
 ) -> Result<EncodedNode> {
+    encode_node_fields(
+        path,
+        m,
+        stored_path::encode(path, mode).map_err(stored_path::app_error)?,
+        metadata_mode,
+    )
+}
+pub(crate) fn encode_native_file_with_parent(
+    path: &Path,
+    parent: &Path,
+    m: &platform::Metadata,
+    mode: stored_path::Mode,
+    metadata_mode: stored_metadata::Mode,
+    storage: stored_path::FileStorage,
+) -> Result<EncodedNode> {
+    let raw = stored_path::encode_native_file(path, parent, mode, storage)
+        .map_err(stored_path::app_error)?;
+    encode_node_fields(path, m, raw, metadata_mode)
+}
+fn encode_node_fields(
+    path: &Path,
+    m: &platform::Metadata,
+    raw_path: Vec<u8>,
+    metadata_mode: stored_metadata::Mode,
+) -> Result<EncodedNode> {
     Ok(EncodedNode {
-        raw_path: stored_path::encode(path, mode).map_err(stored_path::app_error)?,
+        raw_path,
         payload: stored_metadata::encode(m, metadata_mode)?,
         name: path
             .file_name()
@@ -1992,17 +2037,52 @@ mod stored_path_tests {
     }
 
     #[test]
-    fn schema_v1_upgrade_preserves_history_blobs_and_v3_reopens() {
-        let (temp, service, root, _, scan) = fixture(stored_path::Mode::Utf16);
-        let c = service.repo.connect().unwrap();
-        assert_eq!(
-            c.query_row("SELECT version FROM schema_info", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            3
-        );
-        let snapshot = || {
-            c.prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+    fn schema_v1_upgrade_preserves_history_blobs_and_v4_reopens() {
+        for old_version in [1, 2, 3] {
+            let (temp, service, root, _, scan) = fixture(stored_path::Mode::Utf16);
+            let c = service.repo.connect().unwrap();
+            assert_eq!(
+                c.query_row("SELECT version FROM schema_info", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+            let snapshot = || {
+                c.prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+                    .unwrap()
+                    .query_map([&scan], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let before = snapshot();
+            let root_blob: Vec<u8> = c
+                .query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            c.execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;")
+                .unwrap();
+            c.execute("UPDATE schema_info SET version=?1", [old_version])
+                .unwrap();
+            drop(c);
+            drop(service);
+            let reopened = Service::new(&temp.path().join("data")).unwrap();
+            let c = reopened.repo.connect().unwrap();
+            assert_eq!(
+                c.query_row("SELECT version FROM schema_info", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+            let after = c
+                .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
                 .unwrap()
                 .query_map([&scan], |r| {
                     Ok((
@@ -2013,83 +2093,53 @@ mod stored_path_tests {
                 })
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(before, after);
+            assert_eq!(
+                c.query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| r
+                    .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                root_blob
+            );
+            assert_eq!(reopened.repo.root_path(&scan).unwrap(), root);
+            assert_eq!(reopened.repo.scan(&scan).unwrap().status, "completed");
+            drop(c);
+            let new_scan = reopened.repo.new_scan_id().unwrap();
+            reopened.repo.insert_scan(&new_scan, &root, false).unwrap();
+            let mut c = reopened.repo.connect().unwrap();
+            let tx = c.transaction().unwrap();
+            NodeInserter::new(&tx, false)
                 .unwrap()
-        };
-        let before = snapshot();
-        let root_blob: Vec<u8> = c
-            .query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='completed';DELETE FROM pending_dirs;").unwrap();
-        drop(c);
-        drop(service);
-        let reopened = Service::new(&temp.path().join("data")).unwrap();
-        let c = reopened.repo.connect().unwrap();
-        assert_eq!(
-            c.query_row("SELECT version FROM schema_info", [], |r| r
-                .get::<_, i64>(0))
+                .insert(
+                    &new_scan,
+                    1,
+                    None,
+                    &root,
+                    0,
+                    &platform::metadata(&root).unwrap(),
+                    None,
+                )
+                .unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT length(path)%2 FROM nodes WHERE scan_id=?1",
+                    [&new_scan],
+                    |r| r.get::<_, i64>(0)
+                )
                 .unwrap(),
-            3
-        );
-        let after = c
-            .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
-            .unwrap()
-            .query_map([&scan], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(
-            c.query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| r
-                .get::<_, Vec<u8>>(0))
-                .unwrap(),
-            root_blob
-        );
-        assert_eq!(reopened.repo.root_path(&scan).unwrap(), root);
-        assert_eq!(reopened.repo.scan(&scan).unwrap().status, "completed");
-        drop(c);
-        let new_scan = reopened.repo.new_scan_id().unwrap();
-        reopened.repo.insert_scan(&new_scan, &root, false).unwrap();
-        let mut c = reopened.repo.connect().unwrap();
-        let tx = c.transaction().unwrap();
-        NodeInserter::new(&tx, false)
-            .unwrap()
-            .insert(
-                &new_scan,
-                1,
-                None,
-                &root,
-                0,
-                &platform::metadata(&root).unwrap(),
-                None,
-            )
-            .unwrap();
-        tx.commit().unwrap();
-        assert_eq!(
-            c.query_row(
-                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1",
-                [&new_scan],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        drop(c);
-        drop(reopened);
-        assert!(Repository::new(&temp.path().join("data")).is_ok());
+                1
+            );
+            drop(c);
+            drop(reopened);
+            assert!(Repository::new(&temp.path().join("data")).is_ok());
+        }
     }
 
     #[test]
     fn schema_rejects_unknown_empty_multiple_and_noninteger_versions_without_database_writes() {
         for sql in [
-            "UPDATE schema_info SET version=4",
+            "UPDATE schema_info SET version=5",
             "DELETE FROM schema_info",
             "INSERT INTO schema_info VALUES(1)",
             "UPDATE schema_info SET version='future'",
@@ -2117,7 +2167,7 @@ mod stored_path_tests {
     fn schema_upgrade_failure_rolls_back_recovery_queue_and_schema_repairs() {
         let (temp, service, _, _, scan) = fixture(stored_path::Mode::Utf16);
         let c = service.repo.connect().unwrap();
-        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='running';DROP INDEX nodes_parent_name_v2;CREATE TRIGGER fail_schema_promotion BEFORE UPDATE ON schema_info WHEN new.version=3 BEGIN SELECT RAISE(ABORT,'promotion fault');END;").unwrap();
+        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='running';DROP INDEX nodes_parent_name_v2;CREATE TRIGGER fail_schema_promotion BEFORE UPDATE ON schema_info WHEN new.version=4 BEGIN SELECT RAISE(ABORT,'promotion fault');END;").unwrap();
         let pending: i64 = c
             .query_row("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
             .unwrap();
@@ -2162,7 +2212,7 @@ mod stored_path_tests {
             c.query_row("SELECT version FROM schema_info", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             c.query_row("SELECT status FROM scans WHERE id=?1", [&scan], |r| r
@@ -2218,13 +2268,13 @@ mod stored_path_tests {
                         .recv_timeout(Duration::from_secs(12))
                         .unwrap()
                         .unwrap(),
-                    3
+                    4
                 );
             }
         });
         assert_eq!(
             c.query_row(
-                "SELECT COUNT(*) FROM schema_info WHERE version=3",
+                "SELECT COUNT(*) FROM schema_info WHERE version=4",
                 [],
                 |r| r.get::<_, i64>(0)
             )
@@ -2235,143 +2285,165 @@ mod stored_path_tests {
 
     #[test]
     fn mixed_codec_refresh_preserves_exact_path_ids_only_for_unchanged_identity() {
-        let (temp, service, _, file, scan) = fixture(stored_path::Mode::Utf16);
-        service
-            .repo
-            .connect()
-            .unwrap()
-            .execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;")
-            .unwrap();
-        let wait = |job: crate::model::Scan| {
-            let start = Instant::now();
-            loop {
-                let runtime = service.job(&job.scan_id).unwrap();
-                if runtime.terminal() {
-                    assert_eq!(runtime.snapshot().status, "completed");
-                    break;
-                }
-                assert!(start.elapsed() < Duration::from_secs(15), "refresh timeout");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        let identity = service
-            .repo
-            .node(&scan, "3", None)
-            .unwrap()
-            .fingerprint
-            .identity;
-        wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
-        let stored = service.repo.node(&scan, "3", None).unwrap();
-        assert_eq!(stored.path, file);
-        assert_eq!(stored.fingerprint.identity, identity);
-        let c = service.repo.connect().unwrap();
-        assert_eq!(
-            c.query_row(
-                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=3",
-                [&scan],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=1",
-                [&scan],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        drop(c);
-        fs::rename(&file, temp.path().join("retained-old-file.bin")).unwrap();
-        fs::write(&file, b"test").unwrap();
-        assert_ne!(platform::metadata(&file).unwrap().identity, identity);
-        wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
-        assert!(service.repo.node(&scan, "3", None).is_err());
-        let c = service.repo.connect().unwrap();
-        let id: i64 = c
-            .query_row(
-                "SELECT id FROM nodes WHERE scan_id=?1 AND kind='file'",
-                [&scan],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let replaced = Repository::node_conn(&c, &scan, id).unwrap();
-        assert_eq!(replaced.path, file);
-        assert_ne!(replaced.fingerprint.identity, identity);
-        assert!(id > 3);
-        assert_eq!(
-            c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-            0
-        );
-        // Malformed odd history paths must roll back even the marker deletion
-        // that precedes temporary path normalization.
-        let staging = service.repo.new_scan_id().unwrap();
-        let root = service.repo.root_path(&scan).unwrap();
-        service.repo.insert_scan(&staging, &root, true).unwrap();
-        let mut c = service.repo.connect().unwrap();
-        let tx = c.transaction().unwrap();
-        let mut insert = NodeInserter::with_path_mode(&tx, false, stored_path::Mode::Wtf8).unwrap();
-        for (node, parent, path, depth) in [
-            (1, None, root.clone(), 0),
-            (2, Some(1), file.parent().unwrap().to_path_buf(), 1),
-            (3, Some(2), file.clone(), 2),
-        ] {
-            insert
-                .insert(
-                    &staging,
-                    node,
-                    parent,
-                    &path,
-                    depth,
-                    &platform::metadata(&path).unwrap(),
-                    None,
+        for component_history in [false, true] {
+            let (temp, service, _, file, scan) = fixture(stored_path::Mode::Utf16);
+            if component_history {
+                let raw = stored_path::encode_native_file(
+                    &file,
+                    file.parent().unwrap(),
+                    stored_path::Mode::Wtf8,
+                    stored_path::FileStorage::Basename,
                 )
                 .unwrap();
-        }
-        drop(insert);
-        tx.execute(
-            "UPDATE nodes SET path=?3 WHERE scan_id=?1 AND id=?2",
-            params![scan, id, b"bad".as_slice()],
-        )
-        .unwrap();
-        tx.execute(
-            "INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,2)",
-            [&scan],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let revision = service.repo.scan(&scan).unwrap().revision;
-        assert_eq!(
-            crate::scan::replace_subtree(&service, &scan, "1", &staging)
-                .unwrap_err()
-                .code,
-            "STORED_PATH_ENCODING"
-        );
-        assert_eq!(service.repo.scan(&scan).unwrap().revision, revision);
-        assert_eq!(
-            c.query_row(
-                "SELECT path FROM nodes WHERE scan_id=?1 AND id=?2",
-                params![scan, id],
-                |r| r.get::<_, Vec<u8>>(0)
+                assert!(stored_path::is_component(&raw));
+                service
+                    .repo
+                    .connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=3",
+                        params![scan, raw],
+                    )
+                    .unwrap();
+            }
+            service
+                .repo
+                .connect()
+                .unwrap()
+                .execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;")
+                .unwrap();
+            let wait = |job: crate::model::Scan| {
+                let start = Instant::now();
+                loop {
+                    let runtime = service.job(&job.scan_id).unwrap();
+                    if runtime.terminal() {
+                        assert_eq!(runtime.snapshot().status, "completed");
+                        break;
+                    }
+                    assert!(start.elapsed() < Duration::from_secs(15), "refresh timeout");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            let identity = service
+                .repo
+                .node(&scan, "3", None)
+                .unwrap()
+                .fingerprint
+                .identity;
+            wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
+            let stored = service.repo.node(&scan, "3", None).unwrap();
+            assert_eq!(stored.path, file);
+            assert_eq!(stored.fingerprint.identity, identity);
+            let c = service.repo.connect().unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=3",
+                    [&scan],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=1",
+                    [&scan],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            drop(c);
+            fs::rename(&file, temp.path().join("retained-old-file.bin")).unwrap();
+            fs::write(&file, b"test").unwrap();
+            assert_ne!(platform::metadata(&file).unwrap().identity, identity);
+            wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
+            assert!(service.repo.node(&scan, "3", None).is_err());
+            let c = service.repo.connect().unwrap();
+            let id: i64 = c
+                .query_row(
+                    "SELECT id FROM nodes WHERE scan_id=?1 AND kind='file'",
+                    [&scan],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let replaced = Repository::node_conn(&c, &scan, id).unwrap();
+            assert_eq!(replaced.path, file);
+            assert_ne!(replaced.fingerprint.identity, identity);
+            assert!(id > 3);
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+                0
+            );
+            // Malformed odd history paths must roll back even the marker deletion
+            // that precedes temporary path normalization.
+            let staging = service.repo.new_scan_id().unwrap();
+            let root = service.repo.root_path(&scan).unwrap();
+            service.repo.insert_scan(&staging, &root, true).unwrap();
+            let mut c = service.repo.connect().unwrap();
+            let tx = c.transaction().unwrap();
+            let mut insert =
+                NodeInserter::with_path_mode(&tx, false, stored_path::Mode::Wtf8).unwrap();
+            for (node, parent, path, depth) in [
+                (1, None, root.clone(), 0),
+                (2, Some(1), file.parent().unwrap().to_path_buf(), 1),
+                (3, Some(2), file.clone(), 2),
+            ] {
+                insert
+                    .insert(
+                        &staging,
+                        node,
+                        parent,
+                        &path,
+                        depth,
+                        &platform::metadata(&path).unwrap(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            drop(insert);
+            tx.execute(
+                "UPDATE nodes SET path=?3 WHERE scan_id=?1 AND id=?2",
+                params![scan, id, b"bad".as_slice()],
             )
-            .unwrap(),
-            b"bad"
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT COUNT(*) FROM directory_metadata_pending WHERE scan_id=?1",
+            .unwrap();
+            tx.execute(
+                "INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,2)",
                 [&scan],
-                |r| r.get::<_, i64>(0)
             )
-            .unwrap(),
-            1
-        );
+            .unwrap();
+            tx.commit().unwrap();
+            let revision = service.repo.scan(&scan).unwrap().revision;
+            assert_eq!(
+                crate::scan::replace_subtree(&service, &scan, "1", &staging)
+                    .unwrap_err()
+                    .code,
+                "STORED_PATH_ENCODING"
+            );
+            assert_eq!(service.repo.scan(&scan).unwrap().revision, revision);
+            assert_eq!(
+                c.query_row(
+                    "SELECT path FROM nodes WHERE scan_id=?1 AND id=?2",
+                    params![scan, id],
+                    |r| r.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+                b"bad"
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT COUNT(*) FROM directory_metadata_pending WHERE scan_id=?1",
+                    [&scan],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -2489,7 +2561,7 @@ mod stored_path_tests {
             c.query_row("SELECT version FROM schema_info", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -2867,13 +2939,33 @@ mod stored_path_tests {
 
     #[test]
     fn stored_path_codecs_preserve_sqlite_paths_queue_identity_reopen_and_four_formats() {
-        for (mode, metadata_mode) in [
-            (stored_path::Mode::Utf16, stored_metadata::Mode::Json),
-            (stored_path::Mode::Wtf8, stored_metadata::Mode::Json),
-            (stored_path::Mode::Wtf8, stored_metadata::Mode::Binary),
+        for (mode, metadata_mode, component) in [
+            (stored_path::Mode::Utf16, stored_metadata::Mode::Json, false),
+            (stored_path::Mode::Wtf8, stored_metadata::Mode::Json, false),
+            (
+                stored_path::Mode::Wtf8,
+                stored_metadata::Mode::Binary,
+                false,
+            ),
+            (stored_path::Mode::Wtf8, stored_metadata::Mode::Binary, true),
         ] {
             let (temp, service, root, file, id) = fixture_with_metadata(mode, metadata_mode);
             let c = service.repo.connect().unwrap();
+            if component {
+                let raw = stored_path::encode_native_file(
+                    &file,
+                    file.parent().unwrap(),
+                    mode,
+                    stored_path::FileStorage::Basename,
+                )
+                .unwrap();
+                assert!(stored_path::is_component(&raw));
+                c.execute(
+                    "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=3",
+                    params![id, raw],
+                )
+                .unwrap();
+            }
             assert_eq!(
                 c.query_row(
                     "SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND typeof(payload)<>?2",
@@ -3031,6 +3123,225 @@ mod stored_path_tests {
                 }
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn component_projection_is_indexed_one_level_and_corrupt_parents_fail_closed() {
+        let (_temp, service, _root, file, id) =
+            fixture_with_metadata(stored_path::Mode::Wtf8, stored_metadata::Mode::Binary);
+        let c = service.repo.connect().unwrap();
+        let sql = format!("SELECT {NODE_COLUMNS},scan_id FROM nodes WHERE scan_id=?1 AND id=?2");
+        assert!(c
+            .query_row(&sql, params![id, 3], |r| r.get::<_, Option<Vec<u8>>>(19))
+            .unwrap()
+            .is_none());
+        let component = stored_path::encode_native_file(
+            &file,
+            file.parent().unwrap(),
+            stored_path::Mode::Wtf8,
+            stored_path::FileStorage::Basename,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=3",
+            params![id, component],
+        )
+        .unwrap();
+        let parent: Vec<u8> = c
+            .query_row(
+                "SELECT path FROM nodes WHERE scan_id=?1 AND id=2",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (saved, raw_parent, projected_scan) = c
+            .query_row(&sql, params![id, 3], |r| {
+                Ok((
+                    read_node(r)?,
+                    r.get::<_, Vec<u8>>(19)?,
+                    r.get::<_, String>(20)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(saved.path, file);
+        assert_eq!(raw_parent, parent);
+        assert_eq!(projected_scan, id);
+        let plans: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params![id, 3], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plans
+                .iter()
+                .any(|p| p.contains("SEARCH p USING PRIMARY KEY")),
+            "{plans:?}"
+        );
+        let page = service
+            .repo
+            .page(
+                &PageRequest {
+                    scan_id: id.clone(),
+                    parent_id: Some("2".into()),
+                    revision: 1,
+                    sort: Some("name_asc".into()),
+                    filter: None,
+                    cursor: None,
+                    page_size: Some(50),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].display_path, platform::display(&file));
+        let search = service
+            .repo
+            .page(
+                &PageRequest {
+                    scan_id: id.clone(),
+                    parent_id: None,
+                    revision: 1,
+                    sort: Some("size_desc".into()),
+                    filter: Some(Filter {
+                        keyword: Some("file-😀".into()),
+                        ..Default::default()
+                    }),
+                    cursor: None,
+                    page_size: Some(50),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(search.nodes.len(), 1);
+        c.execute("DELETE FROM pending_dirs WHERE scan_id=?1", [&id])
+            .unwrap();
+        let completed = service.repo.finish(&id, "completed").unwrap();
+        for fault in [
+            "missing",
+            "wrong_kind",
+            "parent_component",
+            "parent_malformed",
+            "root_component",
+        ] {
+            c.execute(
+                "UPDATE nodes SET path=?2,kind='directory' WHERE scan_id=?1 AND id=2",
+                params![id, parent],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE nodes SET parent_id=2 WHERE scan_id=?1 AND id=3",
+                [&id],
+            )
+            .unwrap();
+            match fault {
+                "missing" => {
+                    c.execute(
+                        "UPDATE nodes SET parent_id=999 WHERE scan_id=?1 AND id=3",
+                        [&id],
+                    )
+                    .unwrap();
+                }
+                "wrong_kind" => {
+                    c.execute(
+                        "UPDATE nodes SET kind='file' WHERE scan_id=?1 AND id=2",
+                        [&id],
+                    )
+                    .unwrap();
+                }
+                "parent_component" => {
+                    c.execute(
+                        "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=2",
+                        params![id, component],
+                    )
+                    .unwrap();
+                }
+                "parent_malformed" => {
+                    c.execute(
+                        "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=2",
+                        params![id, b"bad".as_slice()],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    c.execute(
+                        "UPDATE nodes SET parent_id=NULL WHERE scan_id=?1 AND id=3",
+                        [&id],
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(service.repo.node(&id, "3", None).is_err(), "{fault}");
+            let error = file_ops::plan(
+                &service,
+                OperationRequest {
+                    scan_id: id.clone(),
+                    node_ids: vec!["3".into()],
+                    expected_revision: completed.revision,
+                    kind: "copy".into(),
+                    destination_ref: None,
+                    destination_path: Some(platform::display(file.parent().unwrap())),
+                    new_name: None,
+                    conflict_policy: Some("skip".into()),
+                },
+            )
+            .expect_err("corrupt parent must reject operation planning");
+            assert_ne!(error.code, "SCAN_BUSY");
+            assert!(
+                error.message.contains("保存的路径编码无效"),
+                "{fault}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_search_path_repair_decodes_json_and_binary_component_rows_without_rewriting_blobs() {
+        for metadata in [stored_metadata::Mode::Json, stored_metadata::Mode::Binary] {
+            let (_temp, service, _root, file, id) =
+                fixture_with_metadata(stored_path::Mode::Wtf8, metadata);
+            let c = service.repo.connect().unwrap();
+            let raw = stored_path::encode_native_file(
+                &file,
+                file.parent().unwrap(),
+                stored_path::Mode::Wtf8,
+                stored_path::FileStorage::Basename,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=3",
+                params![id, raw],
+            )
+            .unwrap();
+            c.execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;ALTER TABLE nodes DROP COLUMN search_path;").unwrap();
+            let before: Vec<(i64, Vec<u8>, rusqlite::types::Value)> = c
+                .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+                .unwrap()
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            drop(c);
+            let reopened = Repository::new(&service.repo.data_dir).unwrap();
+            let c = reopened.connect().unwrap();
+            let after: Vec<(i64, Vec<u8>, rusqlite::types::Value)> = c
+                .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+                .unwrap()
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(before, after);
+            let saved = reopened.node(&id, "3", None).unwrap();
+            assert_eq!(saved.path, file);
+            assert_eq!(saved.node.display_path, platform::display(&file));
+            assert_eq!(
+                c.query_row("SELECT version FROM schema_info", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
         }
     }
 

@@ -63,6 +63,7 @@ struct ScanProfile {
     staged_insert_mode: staging::Mode,
     stored_path_codec: crate::stored_path::Mode,
     metadata_codec: crate::stored_metadata::Mode,
+    file_path_storage: crate::stored_path::FileStorage,
     staged_directory_dispatches: usize,
     staged_directory_active_peak: usize,
     staged_ready_candidate_peak: usize,
@@ -735,6 +736,7 @@ struct ReaderOutput<'a> {
     cancel: &'a std::sync::atomic::AtomicBool,
     path_codec: crate::stored_path::Mode,
     metadata_codec: crate::stored_metadata::Mode,
+    file_path_storage: crate::stored_path::FileStorage,
 }
 #[derive(Debug)]
 enum EntryEncodingError {
@@ -745,12 +747,30 @@ impl ReaderOutput<'_> {
     fn encode_entry(
         &self,
         parent: i64,
+        parent_path: &Path,
         entry: &platform::DirectoryEntry,
     ) -> std::result::Result<Option<EncodedNode>, EntryEncodingError> {
         let encoded = entry
             .scan_file_metadata()
             .or_else(|| entry.scan_directory_metadata())
-            .map(|m| encode_node_with_codecs(&entry.path, m, self.path_codec, self.metadata_codec))
+            .map(|m| {
+                if entry.scan_file_metadata().is_some()
+                    && m.identity.is_some()
+                    && m.allocation_method.as_deref()
+                        == Some("FILE_ID_EXTD_DIR_INFO.AllocationSize")
+                {
+                    crate::repository::encode_native_file_with_parent(
+                        &entry.path,
+                        parent_path,
+                        m,
+                        self.path_codec,
+                        self.metadata_codec,
+                        self.file_path_storage,
+                    )
+                } else {
+                    encode_node_with_codecs(&entry.path, m, self.path_codec, self.metadata_codec)
+                }
+            })
             .transpose();
         match encoded {
             Ok(encoded) => Ok(encoded),
@@ -1108,7 +1128,7 @@ fn read_directories(
             match entry {
                 Ok(entry) => {
                     let started = profile.then(Instant::now);
-                    let encoded = output.encode_entry(parent, &entry);
+                    let encoded = output.encode_entry(parent, &path, &entry);
                     if let Some(started) = started {
                         timings.encode_ms += milliseconds(started);
                     }
@@ -1258,6 +1278,7 @@ fn scan_sync_serial_with_queue_capacity(
         writer_mode: "serial",
         stored_path_codec: crate::stored_path::Mode::from_environment(),
         metadata_codec: crate::stored_metadata::Mode::from_environment(),
+        file_path_storage: crate::stored_path::FileStorage::from_environment(),
         directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
             std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
                 .ok()
@@ -1400,6 +1421,7 @@ fn scan_sync_serial_with_queue_capacity(
             let directory_reader = directory_reader.clone();
             let path_codec = profile.stored_path_codec;
             let metadata_codec = profile.metadata_codec;
+            let file_path_storage = profile.file_path_storage;
             match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault_output = output.clone();
                 let output = ReaderOutput {
@@ -1409,6 +1431,7 @@ fn scan_sync_serial_with_queue_capacity(
                     cancel: &job.cancel,
                     path_codec,
                     metadata_codec,
+                    file_path_storage,
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
@@ -2350,7 +2373,7 @@ pub fn replace_subtree(
                 }
                 error => AppError::from(error),
             })?;
-            let scan: String = row.get(19)?;
+            let scan: String = row.get(20)?;
             let payload = if scan == staging_scan {
                 let value = row.get_ref(3)?;
                 Some(
@@ -3218,6 +3241,7 @@ mod tests {
                         cancel: &cancel,
                         path_codec: crate::stored_path::Mode::Utf16,
                         metadata_codec: crate::stored_metadata::Mode::Json,
+                        file_path_storage: crate::stored_path::FileStorage::Full,
                     };
                     let reader = platform::ScanDirectoryReader::new(&root, true);
                     readers.push(scope.spawn(|| {
@@ -3274,6 +3298,7 @@ mod tests {
                 cancel: &cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
                 metadata_codec: crate::stored_metadata::Mode::Json,
+                file_path_storage: crate::stored_path::FileStorage::Full,
             };
             for value in [1.0, 2.0] {
                 if output
@@ -3351,6 +3376,7 @@ mod tests {
                 cancel: &cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
                 metadata_codec: crate::stored_metadata::Mode::Json,
+                file_path_storage: crate::stored_path::FileStorage::Full,
             };
             let mut text = String::with_capacity(512);
             text.push_str("saved error");
@@ -3424,9 +3450,10 @@ mod tests {
             cancel: &cancel,
             path_codec: crate::stored_path::Mode::Wtf8,
             metadata_codec: crate::stored_metadata::Mode::Binary,
+            file_path_storage: crate::stored_path::FileStorage::Full,
         };
         assert!(matches!(
-            output.encode_entry(1, &entry),
+            output.encode_entry(1, entry.path.parent().unwrap(), &entry),
             Err(EntryEncodingError::Stop)
         ));
         let message = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -3438,6 +3465,96 @@ mod tests {
         drop(message);
         drop(output);
         drop(receiver);
+        assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+    }
+    #[test]
+    fn basename_reader_uses_trusted_native_prefix_and_actual_capacity_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("metadata.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let mut m = platform::metadata(&file).unwrap();
+        m.allocation_method = Some("FILE_ID_EXTD_DIR_INFO.AllocationSize".into());
+        let parent = PathBuf::from(r"C:\Parent-Case");
+        let path = parent.join("中".repeat(2048));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let auxiliary = Arc::new(ReaderBudget {
+            limit: AUXILIARY_MESSAGE_BYTES,
+            ..Default::default()
+        });
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        let output = ReaderOutput {
+            sender,
+            observation: None,
+            auxiliary_budget: auxiliary.clone(),
+            cancel: &cancel,
+            path_codec: crate::stored_path::Mode::Wtf8,
+            metadata_codec: crate::stored_metadata::Mode::Binary,
+            file_path_storage: crate::stored_path::FileStorage::Basename,
+        };
+        let entry = platform::DirectoryEntry {
+            path: path.clone(),
+            hint: Some(m.clone()),
+        };
+        let encoded = output.encode_entry(1, &parent, &entry).unwrap().unwrap();
+        assert!(crate::stored_path::is_component(
+            encoded.path_blob_for_test()
+        ));
+        assert_eq!(
+            crate::stored_path::decode_node(
+                encoded.path_blob_for_test().to_vec(),
+                "file",
+                Some(1),
+                Some(crate::stored_path::encode(&parent, crate::stored_path::Mode::Wtf8).unwrap())
+            )
+            .unwrap(),
+            path
+        );
+        let fallback = output
+            .encode_entry(1, Path::new(r"C:\Other"), &entry)
+            .unwrap()
+            .unwrap();
+        assert!(!crate::stored_path::is_component(
+            fallback.path_blob_for_test()
+        ));
+        let mut untrusted = entry;
+        untrusted.hint.as_mut().unwrap().allocation_method =
+            Some("FILE_STANDARD_INFO.AllocationSize".into());
+        assert!(!crate::stored_path::is_component(
+            output
+                .encode_entry(1, &parent, &untrusted)
+                .unwrap()
+                .unwrap()
+                .path_blob_for_test()
+        ));
+        let mut entries = Vec::with_capacity(1);
+        let bytes = path.capacity()
+            + metadata_owned_bytes(Some(&m))
+            + encoded.bytes()
+            + entries.capacity()
+                * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+        entries.push((
+            platform::DirectoryEntry {
+                path,
+                hint: Some(m),
+            },
+            Some(encoded),
+        ));
+        let budget = Arc::new(ReaderBudget {
+            limit: bytes - 1,
+            ..Default::default()
+        });
+        assert!(output
+            .send_entries(1, parent, 0, entries, bytes, &budget)
+            .is_err());
+        let message = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        let DirectoryMessage::Fatal(error) = &message.message else {
+            panic!("actual component capacity must reject over-budget chunk");
+        };
+        assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+        drop(message);
+        drop(output);
+        drop(receiver);
+        assert_eq!(budget.state.lock().unwrap().0, 0);
         assert_eq!(auxiliary.state.lock().unwrap().0, 0);
     }
     #[test]
@@ -3489,6 +3606,7 @@ mod tests {
                 cancel: &cancel,
                 path_codec: crate::stored_path::Mode::Wtf8,
                 metadata_codec,
+                file_path_storage: crate::stored_path::FileStorage::Full,
             };
             assert!(output
                 .send_entries(1, PathBuf::from("C:\\"), 0, entries, bytes, &budget)
@@ -3521,6 +3639,7 @@ mod tests {
             cancel: &cancel,
             path_codec: crate::stored_path::Mode::Utf16,
             metadata_codec: crate::stored_metadata::Mode::Json,
+            file_path_storage: crate::stored_path::FileStorage::Full,
         };
         let oversized = DirectoryMessage::Fatal(AppError::new("ERROR", String::with_capacity(128)));
         assert!(output.send(oversized).is_err());
@@ -3540,6 +3659,7 @@ mod tests {
                 cancel: &waiting_cancel,
                 path_codec: crate::stored_path::Mode::Utf16,
                 metadata_codec: crate::stored_metadata::Mode::Json,
+                file_path_storage: crate::stored_path::FileStorage::Full,
             };
             output
                 .send(DirectoryMessage::Fatal(AppError::new("E", "x")))
