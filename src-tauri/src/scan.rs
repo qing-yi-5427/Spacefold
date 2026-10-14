@@ -63,11 +63,6 @@ struct ScanProfile {
     staged_insert_mode: staging::Mode,
     stored_path_codec: crate::stored_path::Mode,
     metadata_codec: crate::stored_metadata::Mode,
-    file_insert_mode: crate::repository::FileInsertMode,
-    bulk_file_statements: usize,
-    bulk_file_rows: usize,
-    bulk_binding_peak_bytes: usize,
-    bulk_fixed_scratch_bytes: usize,
     staged_directory_dispatches: usize,
     staged_directory_active_peak: usize,
     staged_ready_candidate_peak: usize,
@@ -1263,7 +1258,6 @@ fn scan_sync_serial_with_queue_capacity(
         writer_mode: "serial",
         stored_path_codec: crate::stored_path::Mode::from_environment(),
         metadata_codec: crate::stored_metadata::Mode::from_environment(),
-        file_insert_mode: crate::repository::FileInsertMode::from_environment(),
         directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
             std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
                 .ok()
@@ -1945,438 +1939,6 @@ fn scan_sync_serial_with_queue_capacity(
     )?;
     Ok(result)
 }
-fn bulk_row_bytes(scan_id: &str, row: &MetadataResult) -> Option<usize> {
-    NodeInserter::bulk_file_bytes(scan_id, row.4.as_ref().ok()?, row.5.as_ref()?)
-}
-fn bulk_run_fits(scan_id: &str, first: &MetadataResult, remaining: &[MetadataResult]) -> bool {
-    use crate::repository::{BULK_FILE_BIND_BYTES, BULK_FILE_ROWS};
-    if remaining.len() < BULK_FILE_ROWS - 1 {
-        return false;
-    }
-    std::iter::once(first)
-        .chain(&remaining[..BULK_FILE_ROWS - 1])
-        .try_fold(0usize, |sum, row| {
-            sum.checked_add(bulk_row_bytes(scan_id, row)?)
-        })
-        .is_some_and(|sum| sum <= BULK_FILE_BIND_BYTES)
-}
-fn bulk_fixed_scratch_bytes() -> usize {
-    use crate::repository::{BulkFileRow, BULK_FILE_COLUMNS, BULK_FILE_ROWS};
-    // Main fixed arrays only, excluding small scalar temporaries, alignment,
-    // compiled SQLite VM/parameter headers and allocator overhead. Not total RSS.
-    // Original path/payload allocations move into the fixed run without cloning;
-    // their existing packet charge remains live until the transaction finishes.
-    BULK_FILE_ROWS
-        * (std::mem::size_of::<MetadataResult>()
-            + std::mem::size_of::<BulkFileRow<'_>>()
-            + std::mem::size_of::<[i64; 6]>())
-        + BULK_FILE_ROWS * BULK_FILE_COLUMNS * std::mem::size_of::<rusqlite::types::ValueRef<'_>>()
-}
-#[allow(clippy::too_many_arguments)]
-fn insert_bulk_run(
-    inserter: &mut NodeInserter<'_>,
-    scan_id: &str,
-    first: MetadataResult,
-    remaining: &mut std::vec::Drain<'_, MetadataResult>,
-    start: usize,
-    prepared: Option<&staging::PreparedBatch>,
-    aggregates: &mut std::collections::BTreeMap<i64, [i64; 6]>,
-) -> Result<()> {
-    use crate::repository::{BulkFileRow, BULK_FILE_ROWS};
-    let mut first = Some(first);
-    let rows: [MetadataResult; BULK_FILE_ROWS] = std::array::from_fn(|_| {
-        first
-            .take()
-            .or_else(|| remaining.next())
-            .expect("preflighted full file run")
-    });
-    let mut totals = [[0; 6]; BULK_FILE_ROWS];
-    for (offset, row) in rows.iter().enumerate() {
-        let m = row.4.as_ref().expect("preflighted ordinary file");
-        let own = [
-            integer(m.logical)?,
-            m.allocated.map(integer).transpose()?.unwrap_or(0),
-            i64::from(m.allocated.is_none()),
-            1,
-            0,
-            0,
-        ];
-        totals[offset] = prepared.map_or(own, |p| p.totals[start + offset]);
-        if prepared.is_none() {
-            let target = aggregates.entry(row.1).or_default();
-            for index in 0..5 {
-                target[index] = crate::repository::checked_add(target[index], own[index])?;
-            }
-            target[5] += 1;
-        }
-    }
-    let refs = std::array::from_fn(|offset| {
-        let row = &rows[offset];
-        BulkFileRow {
-            id: row.0,
-            parent: row.1,
-            depth: row.3,
-            metadata: row.4.as_ref().unwrap(),
-            encoded: row.5.as_ref().unwrap(),
-            totals: totals[offset],
-        }
-    });
-    inserter.insert_bulk_files(scan_id, &refs)
-}
-#[cfg(all(test, windows))]
-mod file_bulk_tests {
-    use super::*;
-    use crate::repository::{
-        FileInsertMode, BULK_FILE_BIND_BYTES, BULK_FILE_COLUMNS, BULK_FILE_ROWS,
-    };
-    use rusqlite::types::Value;
-    use std::fs;
-
-    fn seed(
-        service: &Service,
-        root: &Path,
-        metadata_codec: crate::stored_metadata::Mode,
-    ) -> (String, rusqlite::Connection) {
-        let id = service.repo.new_scan_id().unwrap();
-        service.repo.insert_scan(&id, root, false).unwrap();
-        let mut c = service.repo.connect().unwrap();
-        let tx = c.transaction().unwrap();
-        let mut insert =
-            NodeInserter::with_codecs(&tx, false, crate::stored_path::Mode::Wtf8, metadata_codec)
-                .unwrap();
-        insert
-            .insert(
-                &id,
-                1,
-                None,
-                root,
-                0,
-                &platform::metadata(root).unwrap(),
-                None,
-            )
-            .unwrap();
-        drop(insert);
-        tx.execute("UPDATE scans SET discovered=1 WHERE id=?1", [&id])
-            .unwrap();
-        tx.commit().unwrap();
-        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
-            .unwrap();
-        (id, c)
-    }
-    fn row(
-        id: i64,
-        parent: i64,
-        path: &Path,
-        codec: crate::stored_metadata::Mode,
-    ) -> MetadataResult {
-        let metadata = platform::metadata(path).unwrap();
-        let encoded =
-            encode_node_with_codecs(path, &metadata, crate::stored_path::Mode::Wtf8, codec)
-                .unwrap();
-        (id, parent, path.into(), 1, Ok(metadata), Some(encoded))
-    }
-    fn flush(
-        service: &Service,
-        c: &mut rusqlite::Connection,
-        id: &str,
-        rows: &mut Vec<MetadataResult>,
-        mode: FileInsertMode,
-        codec: crate::stored_metadata::Mode,
-    ) -> Result<ScanProfile> {
-        let (_, rx) = crossbeam_channel::bounded(0);
-        let mut profile = ScanProfile {
-            enabled: true,
-            file_insert_mode: mode,
-            stored_path_codec: crate::stored_path::Mode::Wtf8,
-            metadata_codec: codec,
-            ..Default::default()
-        };
-        flush_batch(service, c, id, 0, &rx, rows, &mut Vec::new(), &mut profile)?;
-        Ok(profile)
-    }
-    fn stored_rows(c: &rusqlite::Connection, id: &str) -> Vec<Vec<Value>> {
-        let mut s = c
-            .prepare("SELECT * FROM nodes WHERE scan_id=?1 ORDER BY id")
-            .unwrap();
-        let columns = s.column_count();
-        s.query_map([id], |r| (1..columns).map(|column| r.get(column)).collect())
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-    }
-    fn create_files(root: &Path, count: i64) {
-        fs::create_dir_all(root.join("child-中文")).unwrap();
-        for id in 3..3 + count {
-            fs::write(
-                root.join(format!("file-{id}-😀.bin")),
-                vec![42; (id % 11) as usize],
-            )
-            .unwrap();
-        }
-    }
-    fn mixed_rows(root: &Path, codec: crate::stored_metadata::Mode) -> Vec<MetadataResult> {
-        let mut rows = vec![row(2, 1, &root.join("child-中文"), codec)];
-        for id in 3..134 {
-            let mut item = row(
-                id,
-                if id % 2 == 0 { 2 } else { 1 },
-                &root.join(format!("file-{id}-😀.bin")),
-                codec,
-            );
-            if id == 67 {
-                item.4.as_mut().unwrap().cloud_state = Some("local_cloud_metadata".into());
-                item.5 = Some(
-                    encode_node_with_codecs(
-                        &item.2,
-                        item.4.as_ref().unwrap(),
-                        crate::stored_path::Mode::Wtf8,
-                        codec,
-                    )
-                    .unwrap(),
-                );
-            }
-            if id == 68 {
-                item.5
-                    .as_mut()
-                    .unwrap()
-                    .reserve_bulk_test_capacity(BULK_FILE_BIND_BYTES + 1);
-            }
-            if id == 69 {
-                item.4 = Err(AppError::new("READ_DENIED", "fixture denied"));
-                item.5 = None;
-            }
-            if id == 102 {
-                item.4.as_mut().unwrap().kind = "other".into();
-                item.5 = None;
-            }
-            rows.push(item);
-        }
-        rows.reverse();
-        rows
-    }
-    #[test]
-    fn bulk_file_mode_parser_variable_limit_and_single_fallback_are_exact() {
-        assert!(matches!(
-            FileInsertMode::from_override(Some("bulk")),
-            FileInsertMode::Bulk
-        ));
-        for value in [
-            None,
-            Some("single"),
-            Some("Bulk"),
-            Some("bulk32"),
-            Some(" bulk"),
-            Some(""),
-        ] {
-            assert!(matches!(
-                FileInsertMode::from_override(value),
-                FileInsertMode::Single
-            ));
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("source");
-        create_files(&root, 64);
-        let service = Service::new(&temp.path().join("data")).unwrap();
-        let codec = crate::stored_metadata::Mode::Binary;
-        let (id, mut c) = seed(&service, &root, codec);
-        assert!(
-            c.limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
-                .unwrap()
-                >= (BULK_FILE_ROWS * BULK_FILE_COLUMNS) as i32
-        );
-        {
-            let tx = c.transaction().unwrap();
-            let mut insert =
-                NodeInserter::with_codecs(&tx, true, crate::stored_path::Mode::Wtf8, codec)
-                    .unwrap();
-            insert.enable_file_mode(&tx, FileInsertMode::Bulk).unwrap();
-            assert_eq!(
-                insert.bulk_parameter_count_for_test(),
-                BULK_FILE_ROWS * BULK_FILE_COLUMNS
-            );
-        }
-        c.set_limit(
-            rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
-            (BULK_FILE_ROWS * BULK_FILE_COLUMNS - 1) as i32,
-        )
-        .unwrap();
-        let mut rows = (3..67)
-            .map(|n| row(n, 1, &root.join(format!("file-{n}-😀.bin")), codec))
-            .collect();
-        let profile = flush(
-            &service,
-            &mut c,
-            &id,
-            &mut rows,
-            FileInsertMode::Bulk,
-            codec,
-        )
-        .unwrap();
-        assert_eq!(profile.bulk_file_rows, 0);
-        assert_eq!(stored_rows(&c, &id).len(), 65);
-        assert_eq!(service.repo.scan(&id).unwrap().discovered_count, "65");
-        c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 32766)
-            .unwrap();
-        let (id, mut c) = seed(&service, &root, codec);
-        let mut rows: Vec<_> = (3..35)
-            .map(|n| row(n, 1, &root.join(format!("file-{n}-😀.bin")), codec))
-            .collect();
-        for item in &mut rows {
-            item.5
-                .as_mut()
-                .unwrap()
-                .reserve_bulk_test_capacity(BULK_FILE_BIND_BYTES / BULK_FILE_ROWS + 1);
-            assert!(bulk_row_bytes(&id, item).unwrap() <= BULK_FILE_BIND_BYTES);
-        }
-        // Lengths remain small; real capacities make this full run inadmissible.
-        assert!(!bulk_run_fits(&id, &rows[0], &rows[1..]));
-        let profile = flush(
-            &service,
-            &mut c,
-            &id,
-            &mut rows,
-            FileInsertMode::Bulk,
-            codec,
-        )
-        .unwrap();
-        assert_eq!(profile.bulk_file_rows, 0);
-        assert_eq!(stored_rows(&c, &id).len(), 33);
-        let mut special = row(3, 1, &root.join("file-3-😀.bin"), codec);
-        special.4.as_mut().unwrap().attributes |=
-            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_RECALL_ON_OPEN.0;
-        assert!(bulk_row_bytes(&id, &special).is_none());
-    }
-    #[test]
-    fn bulk_files_mixed_boundaries_preserve_every_column_and_live_aggregates() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("source");
-        create_files(&root, 131);
-        let service = Service::new(&temp.path().join("data")).unwrap();
-        for codec in [
-            crate::stored_metadata::Mode::Json,
-            crate::stored_metadata::Mode::Binary,
-        ] {
-            let mut arms = Vec::new();
-            for mode in [FileInsertMode::Single, FileInsertMode::Bulk] {
-                let (id, mut c) = seed(&service, &root, codec);
-                let mut rows = mixed_rows(&root, codec);
-                let profile = flush(&service, &mut c, &id, &mut rows, mode, codec).unwrap();
-                assert!(rows.is_empty());
-                if matches!(mode, FileInsertMode::Bulk) {
-                    assert_eq!(profile.bulk_file_rows, 96);
-                    assert_eq!(profile.bulk_file_statements, 3);
-                    assert!(profile.bulk_binding_peak_bytes <= BULK_FILE_BIND_BYTES);
-                    assert_eq!(profile.bulk_fixed_scratch_bytes, bulk_fixed_scratch_bytes());
-                    assert!(bulk_fixed_scratch_bytes() <= 64 * 1024);
-                } else {
-                    assert_eq!(profile.bulk_file_rows, 0);
-                }
-                let scan = service.repo.scan(&id).unwrap();
-                assert_eq!(scan.discovered_count, "133");
-                assert_eq!(scan.error_count, "1");
-                assert_eq!(
-                    c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-                        .unwrap(),
-                    "ok"
-                );
-                assert!(c
-                    .prepare("PRAGMA foreign_key_check")
-                    .unwrap()
-                    .query([])
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .is_none());
-                let actual = stored_rows(&c, &id);
-                assert_eq!(actual.len(), 133);
-                arms.push((id, actual, scan.logical_total_bytes));
-            }
-            assert_eq!(arms[0].1, arms[1].1);
-            assert_eq!(arms[0].2, arms[1].2);
-            for n in 1..134 {
-                let a = service.repo.node(&arms[0].0, &n.to_string(), None).unwrap();
-                let b = service.repo.node(&arms[1].0, &n.to_string(), None).unwrap();
-                assert_eq!(a.path, b.path);
-                assert_eq!(a.fingerprint, b.fingerprint);
-                assert_eq!(
-                    serde_json::to_value(a.node).unwrap(),
-                    serde_json::to_value(b.node).unwrap()
-                );
-            }
-        }
-    }
-    #[test]
-    fn bulk_file_trigger_and_u64_failures_rollback_to_committed_prefix() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("source");
-        create_files(&root, 65);
-        let service = Service::new(&temp.path().join("data")).unwrap();
-        let codec = crate::stored_metadata::Mode::Binary;
-        for trigger in [false, true] {
-            let mut codes = Vec::new();
-            for mode in [FileInsertMode::Single, FileInsertMode::Bulk] {
-                let (id, mut c) = seed(&service, &root, codec);
-                flush(
-                    &service,
-                    &mut c,
-                    &id,
-                    &mut vec![row(3, 1, &root.join("file-3-😀.bin"), codec)],
-                    FileInsertMode::Single,
-                    codec,
-                )
-                .unwrap();
-                let before = stored_rows(&c, &id);
-                let revision = service.repo.scan(&id).unwrap().revision;
-                let mut rows: Vec<_> = (4..36)
-                    .map(|n| row(n, 1, &root.join(format!("file-{n}-😀.bin")), codec))
-                    .collect();
-                if trigger {
-                    c.execute_batch("CREATE TEMP TRIGGER reject_bulk_middle BEFORE INSERT ON nodes WHEN NEW.id=19 BEGIN SELECT RAISE(ABORT,'fixture late insert failure'); END;").unwrap();
-                } else {
-                    rows[15].4.as_mut().unwrap().logical = u64::MAX;
-                    rows[15].5 = Some(
-                        encode_node_with_codecs(
-                            &rows[15].2,
-                            rows[15].4.as_ref().unwrap(),
-                            crate::stored_path::Mode::Wtf8,
-                            codec,
-                        )
-                        .unwrap(),
-                    );
-                }
-                let error = flush(&service, &mut c, &id, &mut rows, mode, codec)
-                    .err()
-                    .expect("fixture must fail");
-                codes.push(error.code);
-                assert_eq!(stored_rows(&c, &id), before);
-                assert_eq!(service.repo.scan(&id).unwrap().revision, revision);
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM consumed_dirs", [], |r| r
-                        .get::<_, i64>(0))
-                        .unwrap(),
-                    0
-                );
-                // The same connection can make progress after the failed transaction.
-                c.execute_batch("DROP TRIGGER IF EXISTS reject_bulk_middle;")
-                    .unwrap();
-                let mut retry: Vec<_> = (4..36)
-                    .map(|n| row(n, 1, &root.join(format!("file-{n}-😀.bin")), codec))
-                    .collect();
-                let profile = flush(&service, &mut c, &id, &mut retry, mode, codec).unwrap();
-                assert_eq!(stored_rows(&c, &id).len(), 34);
-                assert_eq!(
-                    profile.bulk_file_rows,
-                    if matches!(mode, FileInsertMode::Bulk) {
-                        32
-                    } else {
-                        0
-                    }
-                );
-            }
-            assert_eq!(codes[0], codes[1]);
-        }
-    }
-}
 fn record_error(
     service: &Service,
     c: &rusqlite::Connection,
@@ -2482,31 +2044,12 @@ fn flush_batch_with_errors(
             profile.stored_path_codec,
             profile.metadata_codec,
         )?;
-        inserter.enable_file_mode(&tx, profile.file_insert_mode)?;
         let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
         // Enumeration assigns increasing stable IDs. Sort the exceptional worker
         // results back into that order so primary/index inserts remain sequential.
         results.sort_unstable_by_key(|entry| entry.0);
-        let mut row_index = 0;
-        let mut rows = results.drain(..);
-        while let Some(row) = rows.next() {
-            if inserter.bulk_enabled() && bulk_run_fits(scan_id, &row, rows.as_slice()) {
-                insert_bulk_run(
-                    &mut inserter,
-                    scan_id,
-                    row,
-                    &mut rows,
-                    row_index,
-                    prepared.as_ref(),
-                    &mut aggregates,
-                )?;
-                row_index += crate::repository::BULK_FILE_ROWS;
-                profile.bulk_fixed_scratch_bytes = bulk_fixed_scratch_bytes();
-                continue;
-            }
-            let (id, parent, path, depth, result, encoded) = row;
-            let current_index = row_index;
-            row_index += 1;
+        for (row_index, (id, parent, path, depth, result, encoded)) in results.drain(..).enumerate()
+        {
             let mut own_only = [0; 6];
             let totals = if prepared.is_some() {
                 &mut own_only
@@ -2541,7 +2084,7 @@ fn flush_batch_with_errors(
                             &m,
                             error.as_ref(),
                             encoded.as_ref(),
-                            prepared.totals[current_index],
+                            prepared.totals[row_index],
                         )?;
                     } else if let Some(encoded) = encoded {
                         inserter.insert_encoded(
@@ -2607,7 +2150,7 @@ fn flush_batch_with_errors(
                             &m,
                             Some(&error),
                             None,
-                            prepared.totals[current_index],
+                            prepared.totals[row_index],
                         )?;
                     } else {
                         inserter.insert(
@@ -2643,11 +2186,6 @@ fn flush_batch_with_errors(
             profile.encode_ms += timings.encode_ms;
             profile.sql_insert_ms += timings.sql_ms;
             profile.pending_insert_ms += timings.pending_ms;
-            profile.bulk_file_statements += timings.bulk_file_statements;
-            profile.bulk_file_rows += timings.bulk_file_rows;
-            profile.bulk_binding_peak_bytes = profile
-                .bulk_binding_peak_bytes
-                .max(timings.bulk_binding_peak_bytes);
         }
         drop(inserter);
         let row_insert_ms = milliseconds(insert_started);

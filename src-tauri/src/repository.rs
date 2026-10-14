@@ -1645,63 +1645,6 @@ pub struct InsertTimings {
     pub encode_ms: f64,
     pub sql_ms: f64,
     pub pending_ms: f64,
-    pub bulk_file_statements: usize,
-    pub bulk_file_rows: usize,
-    pub bulk_binding_peak_bytes: usize,
-}
-
-#[derive(Clone, Copy, Default, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum FileInsertMode {
-    #[default]
-    Single,
-    Bulk,
-}
-impl FileInsertMode {
-    pub(crate) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("bulk") {
-            Self::Bulk
-        } else {
-            Self::Single
-        }
-    }
-    pub(crate) fn from_environment() -> Self {
-        Self::from_override(std::env::var("SPACEFOLD_FILE_INSERT_MODE").ok().as_deref())
-    }
-}
-pub(crate) const BULK_FILE_ROWS: usize = 32;
-pub(crate) const BULK_FILE_COLUMNS: usize = 19;
-pub(crate) const BULK_FILE_BIND_BYTES: usize = 128 * 1024;
-pub(crate) struct BulkFileRow<'a> {
-    pub id: i64,
-    pub parent: i64,
-    pub depth: u32,
-    pub metadata: &'a platform::Metadata,
-    pub encoded: &'a EncodedNode,
-    pub totals: [i64; 6],
-}
-struct BulkValue<'a>(rusqlite::types::ValueRef<'a>);
-impl rusqlite::types::ToSql for BulkValue<'_> {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(rusqlite::types::ToSqlOutput::Borrowed(self.0))
-    }
-}
-fn bulk_file_sql() -> &'static str {
-    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SQL.get_or_init(|| {
-        let mut sql = String::from("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete,children_count) VALUES");
-        for row in 0..BULK_FILE_ROWS {
-            if row != 0 { sql.push(','); }
-            sql.push('(');
-            for column in 0..BULK_FILE_COLUMNS {
-                if column != 0 { sql.push(','); }
-                use std::fmt::Write;
-                write!(sql, "?{}", row * BULK_FILE_COLUMNS + column + 1).unwrap();
-            }
-            sql.push(')');
-        }
-        sql
-    })
 }
 
 /// Complete derived fields, prepared without SQLite ownership. Stored paths are
@@ -1714,10 +1657,6 @@ pub struct EncodedNode {
     display_path: String,
 }
 impl EncodedNode {
-    #[cfg(test)]
-    pub(crate) fn reserve_bulk_test_capacity(&mut self, bytes: usize) {
-        self.name.reserve_exact(bytes);
-    }
     pub fn bytes(&self) -> usize {
         self.raw_path.capacity()
             + self.payload.capacity()
@@ -1773,7 +1712,6 @@ pub struct NodeInserter<'a> {
     insert: rusqlite::CachedStatement<'a>,
     pending: rusqlite::CachedStatement<'a>,
     metadata_pending: rusqlite::CachedStatement<'a>,
-    bulk_insert: Option<rusqlite::CachedStatement<'a>>,
     path_codec: stored_path::Mode,
     metadata_codec: stored_metadata::Mode,
     pub timings: Option<InsertTimings>,
@@ -1805,140 +1743,10 @@ impl<'a> NodeInserter<'a> {
             insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete,children_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?18,?15,?16,?17,?19)")?,
             pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth,expected_identity,metadata_deferred) VALUES(?1,?2,?3,?4,?5,?6)")?,
             metadata_pending: tx.prepare_cached("INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,?2)")?,
-            bulk_insert: None,
             path_codec,
             metadata_codec,
             timings: profile.then(InsertTimings::default),
         })
-    }
-    pub(crate) fn enable_file_mode(
-        &mut self,
-        tx: &'a Transaction<'_>,
-        mode: FileInsertMode,
-    ) -> Result<()> {
-        if matches!(mode, FileInsertMode::Bulk)
-            && tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?
-                >= (BULK_FILE_ROWS * BULK_FILE_COLUMNS) as i32
-        {
-            self.bulk_insert = Some(tx.prepare_cached(bulk_file_sql())?);
-        }
-        Ok(())
-    }
-    pub(crate) fn bulk_enabled(&self) -> bool {
-        self.bulk_insert.is_some()
-    }
-    #[cfg(test)]
-    pub(crate) fn bulk_parameter_count_for_test(&self) -> usize {
-        self.bulk_insert.as_ref().unwrap().parameter_count()
-    }
-    pub(crate) fn bulk_file_bytes(
-        scan_id: &str,
-        m: &platform::Metadata,
-        encoded: &EncodedNode,
-    ) -> Option<usize> {
-        if m.kind != "file"
-            || m.recurse
-            || m.reparse_tag != 0
-            || m.link_type.is_some()
-            || m.link_target.is_some()
-            || m.cloud_state.is_some()
-        {
-            return None;
-        }
-        #[cfg(windows)]
-        {
-            use windows::Win32::Storage::FileSystem::*;
-            if m.attributes
-                & (FILE_ATTRIBUTE_REPARSE_POINT.0
-                    | FILE_ATTRIBUTE_OFFLINE.0
-                    | FILE_ATTRIBUTE_RECALL_ON_OPEN.0
-                    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0)
-                != 0
-            {
-                return None;
-            }
-        }
-        if m.allocation_method.as_deref() == Some("FILE_ID_EXTD_DIR_INFO.AllocationSize")
-            && m.identity.is_none()
-        {
-            return None;
-        }
-        // All text/BLOB parameters borrow the already-budgeted encoding. SQLite's
-        // transient bound copies are additionally capped across this entire run.
-        let bytes = encoded
-            .bytes()
-            .checked_add(scan_id.len())?
-            .checked_add(m.kind.capacity())?
-            .checked_add(m.modified.as_ref().map_or(0, String::capacity))?;
-        (bytes <= BULK_FILE_BIND_BYTES).then_some(bytes)
-    }
-    pub(crate) fn insert_bulk_files(
-        &mut self,
-        scan_id: &str,
-        rows: &[BulkFileRow<'_>; BULK_FILE_ROWS],
-    ) -> Result<()> {
-        use rusqlite::types::ValueRef;
-        let mut values = [ValueRef::Null; BULK_FILE_ROWS * BULK_FILE_COLUMNS];
-        let mut binding_bytes = 0usize;
-        for (index, row) in rows.iter().enumerate() {
-            let m = row.metadata;
-            binding_bytes =
-                binding_bytes
-                    .checked_add(Self::bulk_file_bytes(scan_id, m, row.encoded).ok_or_else(
-                        || AppError::new("WRITER_PROTOCOL", "批量文件不符合普通节点或字节上限"),
-                    )?)
-                    .filter(|bytes| *bytes <= BULK_FILE_BIND_BYTES)
-                    .ok_or_else(|| AppError::new("WRITER_PROTOCOL", "批量文件绑定超过字节上限"))?;
-            // Match the single-row path even when prepared totals were provided.
-            integer(m.logical)?;
-            m.allocated.map(integer).transpose()?;
-            let e = row.encoded;
-            values[index * BULK_FILE_COLUMNS..(index + 1) * BULK_FILE_COLUMNS].copy_from_slice(&[
-                ValueRef::Text(scan_id.as_bytes()),
-                ValueRef::Integer(row.id),
-                ValueRef::Integer(row.parent),
-                ValueRef::Blob(&e.raw_path),
-                match &e.payload {
-                    MetadataPayload::Json(value) => ValueRef::Text(value.as_bytes()),
-                    MetadataPayload::Binary(value) => ValueRef::Blob(value),
-                },
-                ValueRef::Text(e.name.as_bytes()),
-                ValueRef::Text(m.kind.as_bytes()),
-                ValueRef::Text(e.extension.as_bytes()),
-                ValueRef::Integer(i64::from(row.depth)),
-                m.modified
-                    .as_ref()
-                    .map_or(ValueRef::Null, |s| ValueRef::Text(s.as_bytes())),
-                ValueRef::Integer(row.totals[0]),
-                ValueRef::Integer(row.totals[1]),
-                ValueRef::Integer(row.totals[2]),
-                ValueRef::Integer(row.totals[3]),
-                ValueRef::Integer(row.totals[4]),
-                ValueRef::Null,
-                ValueRef::Text(e.display_path.as_bytes()),
-                ValueRef::Integer(0),
-                ValueRef::Integer(row.totals[5]),
-            ]);
-        }
-        let statement = self
-            .bulk_insert
-            .as_mut()
-            .ok_or_else(|| AppError::new("WRITER_PROTOCOL", "批量文件语句尚未启用"))?;
-        let started = self.timings.as_ref().map(|_| Instant::now());
-        let result = statement.execute(rusqlite::params_from_iter(
-            values.iter().copied().map(BulkValue),
-        ));
-        // Do not retain up to 128 KiB of bindings across directory/single writes,
-        // including SQL failure paths. Original rows remain owned by the packet.
-        statement.clear_bindings();
-        result?;
-        if let (Some(timings), Some(started)) = (&mut self.timings, started) {
-            timings.sql_ms += started.elapsed().as_secs_f64() * 1000.0;
-            timings.bulk_file_statements += 1;
-            timings.bulk_file_rows += BULK_FILE_ROWS;
-            timings.bulk_binding_peak_bytes = timings.bulk_binding_peak_bytes.max(binding_bytes);
-        }
-        Ok(())
     }
     #[allow(clippy::too_many_arguments)] // The persisted node's column contract.
     pub fn insert(
