@@ -808,7 +808,8 @@ fn collect_directories(
                     collector.profile.directory_queue_mark_ms += milliseconds(started);
                 }
                 let decode_started = collector.profile.enabled.then(Instant::now);
-                let path = platform::decode_path(raw);
+                let path =
+                    crate::stored_path::decode(raw).map_err(crate::stored_path::app_error)?;
                 if let Some(started) = decode_started {
                     collector.profile.directory_queue_decode_ms += milliseconds(started);
                 }
@@ -1309,6 +1310,7 @@ pub(super) fn scan(
                 .as_deref(),
         ),
         staged_insert_mode: staged_mode_for(root),
+        stored_path_codec: crate::stored_path::Mode::from_environment(),
         checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
@@ -1360,6 +1362,7 @@ pub(super) fn scan(
         enabled,
         directory_write_mode: profile.directory_write_mode,
         staged_insert_mode: profile.staged_insert_mode,
+        stored_path_codec: profile.stored_path_codec,
         defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
@@ -1452,6 +1455,7 @@ pub(super) fn scan(
             let auxiliary_budget = auxiliary_budget.clone();
             let stop = stop.clone();
             let directory_reader = directory_reader.clone();
+            let path_codec = profile.stored_path_codec;
             match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault = sender.clone();
                 let output = ReaderOutput {
@@ -1459,6 +1463,7 @@ pub(super) fn scan(
                     observation: reader_budget.observation.clone(),
                     auxiliary_budget: auxiliary_budget.clone(),
                     cancel: &job.cancel,
+                    path_codec,
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
@@ -2313,7 +2318,11 @@ mod tests {
 
     #[test]
     fn staged_cancel_between_admission_and_disconnected_send_drains_the_accepted_directory() {
-        for consumed_limit in [DEFAULT_CONSUMED_LIMIT, 4096] {
+        for (consumed_limit, path_codec) in [
+            (DEFAULT_CONSUMED_LIMIT, crate::stored_path::Mode::Utf16),
+            (4096, crate::stored_path::Mode::Utf16),
+            (DEFAULT_CONSUMED_LIMIT, crate::stored_path::Mode::Wtf8),
+        ] {
             let _control = fault_control();
             let (_temp, service, root, id) = setup();
             let mut child = row(2, &root, "accepted-child");
@@ -2346,6 +2355,7 @@ mod tests {
                         ack,
                         ScanProfile {
                             staged_insert_mode: staging::Mode::Staged,
+                            stored_path_codec: path_codec,
                             ..Default::default()
                         },
                         checkpoint::Mode::Off,
@@ -2394,6 +2404,7 @@ mod tests {
                 port.ledger_limit = ReaderPlan::new(4, consumed_limit).unwrap().ledger_limit;
                 let mut profile = ScanProfile {
                     staged_insert_mode: staging::Mode::Staged,
+                    stored_path_codec: path_codec,
                     ..Default::default()
                 };
                 let mut collector = Collector {
@@ -2456,7 +2467,11 @@ mod tests {
 
     #[test]
     fn staged_precommit_nodes_are_hidden_from_pages_details_and_operation_plans_and_rollback() {
-        for consumed_limit in [DEFAULT_CONSUMED_LIMIT, 4096] {
+        for (consumed_limit, path_codec) in [
+            (DEFAULT_CONSUMED_LIMIT, crate::stored_path::Mode::Utf16),
+            (4096, crate::stored_path::Mode::Utf16),
+            (DEFAULT_CONSUMED_LIMIT, crate::stored_path::Mode::Wtf8),
+        ] {
             let _control = fault_control();
             let (_temp, service, root, id) = setup();
             let read = read_connection(&service);
@@ -2481,6 +2496,7 @@ mod tests {
                         ack,
                         ScanProfile {
                             staged_insert_mode: staging::Mode::Staged,
+                            stored_path_codec: path_codec,
                             ..Default::default()
                         },
                         checkpoint::Mode::Off,
@@ -2627,19 +2643,49 @@ mod tests {
 
     #[test]
     fn staged_collector_consumes_real_done_before_commit_and_ack_without_repeating_the_directory() {
-        exercise_staged_done_collector(1, DEFAULT_CONSUMED_LIMIT, false);
+        exercise_staged_done_collector(
+            1,
+            DEFAULT_CONSUMED_LIMIT,
+            false,
+            crate::stored_path::Mode::Utf16,
+        );
     }
     #[test]
     fn staged_active_frontier_reuses_slots_for_96_directories_in_one_uncommitted_packet() {
-        exercise_staged_done_collector(96, DEFAULT_CONSUMED_LIMIT, false);
+        exercise_staged_done_collector(
+            96,
+            DEFAULT_CONSUMED_LIMIT,
+            false,
+            crate::stored_path::Mode::Utf16,
+        );
     }
     #[test]
     fn consumed_4096_collector_preserves_1300_directory_completions_in_one_packet() {
-        exercise_staged_done_collector(1300, 4096, false);
+        exercise_staged_done_collector(1300, 4096, false, crate::stored_path::Mode::Utf16);
+    }
+
+    #[test]
+    fn wtf8_staged_metadata_done_ack_and_active_slots_preserve_every_saved_path() {
+        exercise_staged_done_collector(
+            96,
+            DEFAULT_CONSUMED_LIMIT,
+            false,
+            crate::stored_path::Mode::Wtf8,
+        );
+    }
+
+    #[test]
+    fn wtf8_staged_cancel_at_ack_drains_paths_and_releases_every_permit() {
+        exercise_staged_done_collector(
+            32,
+            DEFAULT_CONSUMED_LIMIT,
+            true,
+            crate::stored_path::Mode::Wtf8,
+        );
     }
     #[test]
     fn consumed_4096_cancel_at_ack_preserves_every_accepted_directory_and_releases_permits() {
-        exercise_staged_done_collector(1300, 4096, true);
+        exercise_staged_done_collector(1300, 4096, true, crate::stored_path::Mode::Utf16);
     }
     #[test]
     fn consumed_4096_full_packet_publishes_then_resumes_sql_fallback_and_guards_real_temp_high_water(
@@ -2787,6 +2833,7 @@ mod tests {
         directory_count: usize,
         consumed_limit: usize,
         cancel_at_ack: bool,
+        path_codec: crate::stored_path::Mode,
     ) {
         let _control = fault_control();
         let (_temp, service, root, id) = setup();
@@ -2800,6 +2847,20 @@ mod tests {
             child.4.as_mut().unwrap().links = None;
             child.4.as_mut().unwrap().allocated = Some(0);
             children.push(child);
+        }
+        if path_codec == crate::stored_path::Mode::Wtf8 {
+            let db = service.repo.connect().unwrap();
+            let raw = crate::stored_path::encode(&root, path_codec).unwrap();
+            db.execute(
+                "UPDATE nodes SET path=?2 WHERE scan_id=?1 AND id=1",
+                params![&id, &raw],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE pending_dirs SET path=?2 WHERE scan_id=?1 AND id=1",
+                params![&id, &raw],
+            )
+            .unwrap();
         }
         let read = read_connection(&service);
         let c = service.repo.connect().unwrap();
@@ -2824,6 +2885,7 @@ mod tests {
                     ack,
                     ScanProfile {
                         staged_insert_mode: staging::Mode::Staged,
+                        stored_path_codec: path_codec,
                         ..Default::default()
                     },
                     checkpoint::Mode::Off,
@@ -2848,6 +2910,7 @@ mod tests {
                     observation: None,
                     auxiliary_budget: reader_auxiliary,
                     cancel,
+                    path_codec,
                 };
                 let root_task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                 assert_eq!(root_task.0, 1);
@@ -2954,6 +3017,7 @@ mod tests {
             port.ledger_limit = ReaderPlan::new(4, consumed_limit).unwrap().ledger_limit;
             let mut profile = ScanProfile {
                 staged_insert_mode: staging::Mode::Staged,
+                stored_path_codec: path_codec,
                 ..Default::default()
             };
             let mut collector = Collector {
@@ -3014,6 +3078,17 @@ mod tests {
             port.commands.send(WriteCommand::Finish).unwrap();
             drop(port);
             let result = writer.join().unwrap().unwrap();
+            let db = service.repo.connect().unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND length(path)%2<>?2",
+                    params![&id, i64::from(path_codec == crate::stored_path::Mode::Wtf8)],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(service.repo.root_path(&id).unwrap(), root);
             assert_eq!(
                 result.scan.status,
                 if cancel_at_ack {

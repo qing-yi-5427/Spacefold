@@ -2,7 +2,8 @@ use crate::{
     model::*,
     platform,
     repository::{
-        encode_node, insert_node, DirectoryMetadataUpdate, EncodedNode, NodeInserter, Repository,
+        encode_node_with_mode, insert_node, DirectoryMetadataUpdate, EncodedNode, NodeInserter,
+        Repository,
     },
     service::{JobRuntime, Service},
 };
@@ -59,6 +60,7 @@ struct ScanProfile {
     directory_write_sql: crate::repository::DirectoryWriteSqlStats,
     directory_write_mode: crate::repository::DirectoryWriteMode,
     staged_insert_mode: staging::Mode,
+    stored_path_codec: crate::stored_path::Mode,
     staged_directory_dispatches: usize,
     staged_directory_active_peak: usize,
     staged_ready_candidate_peak: usize,
@@ -729,6 +731,7 @@ struct ReaderOutput<'a> {
     observation: Option<std::sync::Arc<ReaderWaitProbe>>,
     auxiliary_budget: std::sync::Arc<ReaderBudget>,
     cancel: &'a std::sync::atomic::AtomicBool,
+    path_codec: crate::stored_path::Mode,
 }
 impl ReaderOutput<'_> {
     fn send_entries(
@@ -1073,7 +1076,7 @@ fn read_directories(
                     let encoded = entry
                         .scan_file_metadata()
                         .or_else(|| entry.scan_directory_metadata())
-                        .map(|m| encode_node(&entry.path, m))
+                        .map(|m| encode_node_with_mode(&entry.path, m, output.path_codec))
                         .transpose();
                     if let Some(started) = started {
                         timings.encode_ms += milliseconds(started);
@@ -1234,6 +1237,7 @@ fn scan_sync_serial_with_queue_capacity(
         directory_readers: readers,
         directory_in_flight_limit: plan.in_flight,
         writer_mode: "serial",
+        stored_path_codec: crate::stored_path::Mode::from_environment(),
         directory_write_mode: crate::repository::DirectoryWriteMode::from_override(
             std::env::var("SPACEFOLD_DIRECTORY_WRITE_FUSION")
                 .ok()
@@ -1364,6 +1368,7 @@ fn scan_sync_serial_with_queue_capacity(
             let auxiliary_budget = auxiliary_budget.clone();
             let stop = reader_stop.clone();
             let directory_reader = directory_reader.clone();
+            let path_codec = profile.stored_path_codec;
             match spawn_scoped_worker(scope, root, "reader", index, move || -> Result<()> {
                 let fault_output = output.clone();
                 let output = ReaderOutput {
@@ -1371,6 +1376,7 @@ fn scan_sync_serial_with_queue_capacity(
                     observation: reader_budget.observation.clone(),
                     auxiliary_budget: auxiliary_budget.clone(),
                     cancel: &job.cancel,
+                    path_codec,
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_directories(
@@ -1498,7 +1504,8 @@ fn scan_sync_serial_with_queue_capacity(
                                 profile.directory_queue_mark_ms += milliseconds(mark_started);
                             }
                             let decode_started = profile.enabled.then(Instant::now);
-                            let path = platform::decode_path(path);
+                            let path = crate::stored_path::decode(path)
+                                .map_err(crate::stored_path::app_error)?;
                             if let Some(decode_started) = decode_started {
                                 profile.directory_queue_decode_ms += milliseconds(decode_started);
                             }
@@ -1999,7 +2006,8 @@ fn flush_batch_with_errors(
                 .staged_counter_storage_upper_bound_bytes
                 .max(prepared.totals.capacity() * std::mem::size_of::<[i64; 6]>());
         }
-        let mut inserter = NodeInserter::new(&tx, profile.enabled)?;
+        let mut inserter =
+            NodeInserter::with_path_mode(&tx, profile.enabled, profile.stored_path_codec)?;
         let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
         // Enumeration assigns increasing stable IDs. Sort the exceptional worker
         // results back into that order so primary/index inserts remain sequential.
@@ -3106,6 +3114,7 @@ mod tests {
                         observation: None,
                         auxiliary_budget: auxiliary.clone(),
                         cancel: &cancel,
+                        path_codec: crate::stored_path::Mode::Utf16,
                     };
                     let reader = platform::ScanDirectoryReader::new(&root, true);
                     readers.push(scope.spawn(|| {
@@ -3160,6 +3169,7 @@ mod tests {
                     ..Default::default()
                 }),
                 cancel: &cancel,
+                path_codec: crate::stored_path::Mode::Utf16,
             };
             for value in [1.0, 2.0] {
                 if output
@@ -3235,6 +3245,7 @@ mod tests {
                 observation: None,
                 auxiliary_budget: auxiliary.clone(),
                 cancel: &cancel,
+                path_codec: crate::stored_path::Mode::Utf16,
             };
             let mut text = String::with_capacity(512);
             text.push_str("saved error");
@@ -3284,6 +3295,60 @@ mod tests {
     }
 
     #[test]
+    fn wtf8_unicode_entry_uses_actual_capacity_and_is_rejected_before_exceeding_reader_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("metadata.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let metadata = platform::metadata(&file).unwrap();
+        let path = PathBuf::from(format!("C:\\{}", "中".repeat(2048)));
+        let encoded =
+            encode_node_with_mode(&path, &metadata, crate::stored_path::Mode::Wtf8).unwrap();
+        let mut entries = Vec::with_capacity(1);
+        let bytes = path.capacity()
+            + metadata_owned_bytes(Some(&metadata))
+            + encoded.bytes()
+            + entries.capacity()
+                * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+        entries.push((
+            platform::DirectoryEntry {
+                path,
+                hint: Some(metadata),
+            },
+            Some(encoded),
+        ));
+        let budget = Arc::new(ReaderBudget {
+            limit: bytes - 1,
+            ..Default::default()
+        });
+        let auxiliary = Arc::new(ReaderBudget {
+            limit: AUXILIARY_MESSAGE_BYTES,
+            ..Default::default()
+        });
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        let output = ReaderOutput {
+            sender,
+            observation: None,
+            auxiliary_budget: auxiliary.clone(),
+            cancel: &cancel,
+            path_codec: crate::stored_path::Mode::Wtf8,
+        };
+        assert!(output
+            .send_entries(1, PathBuf::from("C:\\"), 0, entries, bytes, &budget)
+            .is_err());
+        let message = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        let DirectoryMessage::Fatal(error) = &message.message else {
+            panic!("oversized entry was not rejected")
+        };
+        assert_eq!(error.code, "READER_PAYLOAD_BUDGET");
+        drop(message);
+        drop(output);
+        drop(receiver);
+        assert_eq!(budget.state.lock().unwrap().0, 0);
+        assert_eq!(auxiliary.state.lock().unwrap().0, 0);
+    }
+
+    #[test]
     fn oversized_auxiliary_message_is_fatal_and_cancelled_budget_wait_does_not_enqueue() {
         let (sender, receiver) = crossbeam_channel::bounded(32);
         let auxiliary = Arc::new(ReaderBudget {
@@ -3296,6 +3361,7 @@ mod tests {
             observation: None,
             auxiliary_budget: auxiliary.clone(),
             cancel: &cancel,
+            path_codec: crate::stored_path::Mode::Utf16,
         };
         let oversized = DirectoryMessage::Fatal(AppError::new("ERROR", String::with_capacity(128)));
         assert!(output.send(oversized).is_err());
@@ -3313,6 +3379,7 @@ mod tests {
                 observation: None,
                 auxiliary_budget: waiting_budget,
                 cancel: &waiting_cancel,
+                path_codec: crate::stored_path::Mode::Utf16,
             };
             output
                 .send(DirectoryMessage::Fatal(AppError::new("E", "x")))

@@ -1,4 +1,4 @@
-use crate::{model::*, platform};
+use crate::{model::*, platform, stored_path};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
     collections::HashSet,
@@ -1548,7 +1548,9 @@ impl TinyPayload {
 }
 pub fn read_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
     let text: String = r.get(3)?;
-    let path = platform::decode_path(r.get(2)?);
+    let path = stored_path::decode(r.get(2)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, Box::new(error))
+    })?;
     let (mut node, fingerprint) = if text.starts_with("{\"v\":3") || text.starts_with("{\"v\":2") {
         let m = if text.starts_with("{\"v\":3") {
             let p: TinyPayload = serde_json::from_str(&text).map_err(|e| {
@@ -1676,7 +1678,7 @@ pub struct InsertTimings {
     pub pending_ms: f64,
 }
 
-/// Complete derived fields, prepared without SQLite ownership. Raw UTF-16 is
+/// Complete derived fields, prepared without SQLite ownership. Stored paths are
 /// unchanged; the display and search strings remain separate from that path.
 pub struct EncodedNode {
     raw_path: Vec<u8>,
@@ -1695,8 +1697,15 @@ impl EncodedNode {
     }
 }
 pub fn encode_node(path: &Path, m: &platform::Metadata) -> Result<EncodedNode> {
+    encode_node_with_mode(path, m, stored_path::Mode::from_environment())
+}
+pub(crate) fn encode_node_with_mode(
+    path: &Path,
+    m: &platform::Metadata,
+    mode: stored_path::Mode,
+) -> Result<EncodedNode> {
     Ok(EncodedNode {
-        raw_path: platform::encode_path(path),
+        raw_path: stored_path::encode(path, mode).map_err(stored_path::app_error)?,
         payload: serde_json::to_string(&TinyPayload::from_meta(m))?,
         name: path
             .file_name()
@@ -1720,14 +1729,23 @@ pub struct NodeInserter<'a> {
     insert: rusqlite::CachedStatement<'a>,
     pending: rusqlite::CachedStatement<'a>,
     metadata_pending: rusqlite::CachedStatement<'a>,
+    path_codec: stored_path::Mode,
     pub timings: Option<InsertTimings>,
 }
 impl<'a> NodeInserter<'a> {
     pub fn new(tx: &'a Transaction<'_>, profile: bool) -> Result<Self> {
+        Self::with_path_mode(tx, profile, stored_path::Mode::from_environment())
+    }
+    pub(crate) fn with_path_mode(
+        tx: &'a Transaction<'_>,
+        profile: bool,
+        path_codec: stored_path::Mode,
+    ) -> Result<Self> {
         Ok(Self {
             insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete,children_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?18,?15,?16,?17,?19)")?,
             pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth,expected_identity,metadata_deferred) VALUES(?1,?2,?3,?4,?5,?6)")?,
             metadata_pending: tx.prepare_cached("INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,?2)")?,
+            path_codec,
             timings: profile.then(InsertTimings::default),
         })
     }
@@ -1743,7 +1761,7 @@ impl<'a> NodeInserter<'a> {
         error: Option<&AppError>,
     ) -> Result<()> {
         let started = self.timings.as_ref().map(|_| std::time::Instant::now());
-        let encoded = encode_node(path, m)?;
+        let encoded = encode_node_with_mode(path, m, self.path_codec)?;
         if let (Some(timings), Some(started)) = (&mut self.timings, started) {
             timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
         }
@@ -1780,7 +1798,7 @@ impl<'a> NodeInserter<'a> {
             encoded
         } else {
             let started = self.timings.as_ref().map(|_| std::time::Instant::now());
-            owned = encode_node(path, m)?;
+            owned = encode_node_with_mode(path, m, self.path_codec)?;
             if let (Some(timings), Some(started)) = (&mut self.timings, started) {
                 timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
@@ -1908,6 +1926,284 @@ pub fn check_directory_metadata_complete(c: &Connection, scan_id: &str) -> Resul
         Ok(())
     }
 }
+#[cfg(all(test, windows))]
+mod stored_path_tests {
+    use super::*;
+    use crate::{
+        export, file_ops,
+        service::{JobRuntime, Service},
+    };
+    use std::{fs, io::Read};
+
+    fn fixture(
+        mode: stored_path::Mode,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<Service>,
+        PathBuf,
+        PathBuf,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source-中文");
+        let child = root.join("子目录");
+        fs::create_dir_all(&child).unwrap();
+        let file = child.join("file-😀.bin");
+        fs::write(&file, b"test").unwrap();
+        let service = Service::new(&temp.path().join("data")).unwrap();
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        let mut insert = NodeInserter::with_path_mode(&tx, false, mode).unwrap();
+        for (node, parent, path, depth) in [
+            (1, None, &root, 0),
+            (2, Some(1), &child, 1),
+            (3, Some(2), &file, 2),
+        ] {
+            insert
+                .insert(
+                    &id,
+                    node,
+                    parent,
+                    path,
+                    depth,
+                    &platform::metadata(path).unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+        drop(insert);
+        tx.execute("UPDATE scans SET discovered=3 WHERE id=?1", [&id])
+            .unwrap();
+        tx.commit().unwrap();
+        (temp, service, root, file, id)
+    }
+
+    #[test]
+    fn stored_path_codecs_preserve_sqlite_paths_queue_identity_reopen_and_four_formats() {
+        for mode in [stored_path::Mode::Utf16, stored_path::Mode::Wtf8] {
+            let (temp, service, root, file, id) = fixture(mode);
+            let c = service.repo.connect().unwrap();
+            let stored: Vec<(i64, Vec<u8>)> = c
+                .prepare("SELECT id,path FROM nodes WHERE scan_id=?1 ORDER BY id")
+                .unwrap()
+                .query_map([&id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(stored
+                .iter()
+                .all(|(_, raw)| raw.len() % 2 == usize::from(mode == stored_path::Mode::Wtf8)));
+            let queued: Vec<Vec<u8>> = c
+                .prepare("SELECT path FROM pending_dirs WHERE scan_id=?1 ORDER BY id")
+                .unwrap()
+                .query_map([&id], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(queued.len(), 2);
+            assert_eq!(stored_path::decode(queued[0].clone()).unwrap(), root);
+            assert_eq!(
+                stored_path::decode(queued[1].clone()).unwrap(),
+                file.parent().unwrap()
+            );
+            let root_raw: Vec<u8> = c
+                .query_row("SELECT root_path FROM scans WHERE id=?1", [&id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(root_raw, platform::encode_path(&root));
+            let saved = service.repo.node(&id, "3", None).unwrap();
+            assert_eq!(saved.path, file);
+            assert_eq!(
+                serde_json::to_value(&saved.fingerprint).unwrap(),
+                serde_json::to_value(platform::metadata(&file).unwrap().fingerprint()).unwrap()
+            );
+            c.execute("DELETE FROM pending_dirs WHERE scan_id=?1", [&id])
+                .unwrap();
+            let scan = service.repo.finish(&id, "completed").unwrap();
+            let plan = file_ops::plan(
+                &service,
+                OperationRequest {
+                    scan_id: id.clone(),
+                    node_ids: vec!["3".into()],
+                    expected_revision: scan.revision,
+                    kind: "trash".into(),
+                    destination_ref: None,
+                    destination_path: None,
+                    new_name: None,
+                    conflict_policy: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.items.len(), 1);
+            assert_eq!(plan.items[0].display_path, platform::display(&file));
+            let display = platform::display(&file);
+            for format in ["json", "csv", "html", "xlsx"] {
+                let request = ExportRequest {
+                    scan_id: id.clone(),
+                    revision: scan.revision,
+                    scope: "selected".into(),
+                    scope_id: "3".into(),
+                    selected_ids: vec!["3".into()],
+                    recursive: false,
+                    fields: vec![
+                        "path".into(),
+                        "parent_path".into(),
+                        "own_logical_bytes".into(),
+                    ],
+                    format: format.into(),
+                    target_path: None,
+                    html_row_budget: Some(20),
+                };
+                let target = temp.path().join(format!("report-{mode:?}.{format}"));
+                let job =
+                    JobRuntime::new(JobEvent::new("export", &id, "export", scan.revision), None);
+                assert_eq!(
+                    export::write_report(&service, &request, &target, &job).unwrap(),
+                    1
+                );
+                match format {
+                    "json" => {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&fs::read(target).unwrap()).unwrap();
+                        let (encoding, data, replaced) = platform::path_encoding(&file);
+                        assert_eq!(value["rows"][0]["path"], display);
+                        assert_eq!(value["rows"][0]["pathEncoding"], encoding);
+                        assert_eq!(
+                            value["rows"][0]["pathData"],
+                            serde_json::to_value(data).unwrap()
+                        );
+                        assert_eq!(value["rows"][0]["displayPathReplaced"], replaced);
+                    }
+                    "csv" => {
+                        let bytes = fs::read(target).unwrap();
+                        let mut reader = csv::Reader::from_reader(&bytes[3..]);
+                        assert!(reader
+                            .records()
+                            .map(|row| row.unwrap())
+                            .any(|row| row.iter().any(|cell| cell == display)));
+                    }
+                    "html" => assert!(fs::read_to_string(target)
+                        .unwrap()
+                        .contains(&format!("<td>{}</td>", export::html_escape(&display)))),
+                    "xlsx" => {
+                        let mut zip =
+                            zip::ZipArchive::new(fs::File::open(target).unwrap()).unwrap();
+                        let mut xml = String::new();
+                        zip.by_name("xl/worksheets/sheet2.xml")
+                            .unwrap()
+                            .read_to_string(&mut xml)
+                            .unwrap();
+                        assert!(xml.contains(&format!("<t>{}</t>", export::html_escape(&display))));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            drop(c);
+            let reopened = Repository::new(&service.repo.data_dir).unwrap();
+            assert_eq!(reopened.node(&id, "3", None).unwrap().path, file);
+            // Odd unknown data cannot authorize a plan or expose a guessed path.
+            let c = reopened.connect().unwrap();
+            c.execute(
+                "UPDATE nodes SET path=?3 WHERE scan_id=?1 AND id=?2",
+                params![&id, 3, vec![0u8, 0, 1]],
+            )
+            .unwrap();
+            assert!(reopened.node(&id, "3", None).is_err());
+            assert!(file_ops::plan(
+                &service,
+                OperationRequest {
+                    scan_id: id.clone(),
+                    node_ids: vec!["3".into()],
+                    expected_revision: scan.revision,
+                    kind: "trash".into(),
+                    destination_ref: None,
+                    destination_path: None,
+                    new_name: None,
+                    conflict_policy: None,
+                }
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn stored_path_owned_capacity_shrinks_ascii_and_charges_unicode_expansion() {
+        let (_temp, _service, _root, file, _id) = fixture(stored_path::Mode::Utf16);
+        let m = platform::metadata(&file).unwrap();
+        for (path, expands) in [
+            (PathBuf::from(format!("C:\\{}", "a".repeat(2048))), false),
+            (PathBuf::from(format!("C:\\{}", "中".repeat(2048))), true),
+        ] {
+            let legacy = encode_node_with_mode(&path, &m, stored_path::Mode::Utf16).unwrap();
+            let compact = encode_node_with_mode(&path, &m, stored_path::Mode::Wtf8).unwrap();
+            assert_eq!(stored_path::decode(compact.raw_path.clone()).unwrap(), path);
+            assert_eq!(compact.raw_path.len() > legacy.raw_path.len(), expands);
+            if !expands {
+                assert!(compact.raw_path.capacity() < legacy.raw_path.capacity());
+            }
+            assert_eq!(
+                compact.bytes() as i128 - legacy.bytes() as i128,
+                compact.raw_path.capacity() as i128 - legacy.raw_path.capacity() as i128
+            );
+        }
+    }
+
+    #[cfg(feature = "scan-reference")]
+    #[test]
+    fn wtf8_seeded_reference_queue_is_enumerated_and_mixed_paths_remain_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("reference-中文😀");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let file = root.join("child").join("inside.txt");
+        fs::write(&file, b"abc").unwrap();
+        let service = Service::new(&temp.path().join("data")).unwrap();
+        let id = service.repo.new_scan_id().unwrap();
+        service.repo.insert_scan(&id, &root, false).unwrap();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        NodeInserter::with_path_mode(&tx, false, stored_path::Mode::Wtf8)
+            .unwrap()
+            .insert(
+                &id,
+                1,
+                None,
+                &root,
+                0,
+                &platform::metadata(&root).unwrap(),
+                None,
+            )
+            .unwrap();
+        tx.execute("UPDATE scans SET discovered=1 WHERE id=?1", [&id])
+            .unwrap();
+        tx.commit().unwrap();
+        let root_raw: Vec<u8> = c
+            .query_row(
+                "SELECT path FROM pending_dirs WHERE scan_id=?1 AND id=1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_raw.len() % 2, 1);
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let scan = crate::scan_reference::scan_sync(&service, &id, &root, &job).unwrap();
+        assert_eq!(scan.status, "completed");
+        assert_eq!(scan.discovered_count, "3");
+        assert_eq!(service.repo.node(&id, "3", None).unwrap().path, file);
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}
+
 #[cfg(test)]
 mod directory_metadata_tests {
     use super::*;

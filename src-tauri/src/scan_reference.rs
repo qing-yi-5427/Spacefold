@@ -117,7 +117,7 @@ pub fn scan_sync(service: &Service, scan_id: &str, root: &Path, job: &JobRuntime
             }
             break;
         };
-        let path = platform::decode_path(path);
+        let path = crate::stored_path::decode(path).map_err(crate::stored_path::app_error)?;
         {
             let _writer = service.writer.lock().unwrap();
             c.execute("INSERT INTO consumed_dirs(id) VALUES(?1)", [parent])?;
