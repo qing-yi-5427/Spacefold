@@ -15,6 +15,8 @@ use std::{
 
 #[path = "scan_checkpoint.rs"]
 mod checkpoint;
+#[path = "scan_staging.rs"]
+mod staging;
 #[path = "scan_pipeline.rs"]
 mod writer_pipeline;
 
@@ -56,6 +58,12 @@ struct ScanProfile {
     directory_metadata_updates: usize,
     directory_write_sql: crate::repository::DirectoryWriteSqlStats,
     directory_write_mode: crate::repository::DirectoryWriteMode,
+    staged_insert_mode: staging::Mode,
+    staged_directory_dispatches: usize,
+    staged_directory_peak_per_packet: usize,
+    staged_metadata_inserts: usize,
+    staged_internal_edges: usize,
+    staged_counter_storage_upper_bound_bytes: usize,
     max_flush_ms: f64,
     peak_batch_entries: usize,
     peak_batch_path_bytes: usize,
@@ -1959,13 +1967,31 @@ fn flush_batch_with_errors(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let tx = c.transaction()?;
         let insert_started = Instant::now();
+        let prepared = if profile.staged_insert_mode.enabled() {
+            Some(staging::PreparedBatch::prepare(results, directory_updates)?)
+        } else {
+            None
+        };
+        if let Some(prepared) = &prepared {
+            profile.staged_metadata_inserts += prepared.absorbed_metadata;
+            profile.staged_internal_edges += prepared.absorbed_edges;
+            profile.staged_counter_storage_upper_bound_bytes = profile
+                .staged_counter_storage_upper_bound_bytes
+                .max(prepared.totals.capacity() * std::mem::size_of::<[i64; 6]>());
+        }
         let mut inserter = NodeInserter::new(&tx, profile.enabled)?;
         let mut aggregates = std::collections::BTreeMap::<i64, [i64; 6]>::new();
         // Enumeration assigns increasing stable IDs. Sort the exceptional worker
         // results back into that order so primary/index inserts remain sequential.
         results.sort_unstable_by_key(|entry| entry.0);
-        for (id, parent, path, depth, result, encoded) in results.drain(..) {
-            let totals = aggregates.entry(parent).or_default();
+        for (row_index, (id, parent, path, depth, result, encoded)) in results.drain(..).enumerate()
+        {
+            let mut own_only = [0; 6];
+            let totals = if prepared.is_some() {
+                &mut own_only
+            } else {
+                aggregates.entry(parent).or_default()
+            };
             totals[5] += 1;
             match result {
                 Ok(m) => {
@@ -1984,7 +2010,19 @@ fn flush_batch_with_errors(
                             "云目录可能需要召回；未枚举其内容",
                         )
                     });
-                    if let Some(encoded) = encoded {
+                    if let Some(prepared) = &prepared {
+                        inserter.insert_prepared(
+                            scan_id,
+                            id,
+                            Some(parent),
+                            &path,
+                            depth,
+                            &m,
+                            error.as_ref(),
+                            encoded.as_ref(),
+                            prepared.totals[row_index],
+                        )?;
+                    } else if let Some(encoded) = encoded {
                         inserter.insert_encoded(
                             scan_id,
                             id,
@@ -2038,7 +2076,29 @@ fn flush_batch_with_errors(
                         allocation_method: None,
                         recurse: false,
                     };
-                    inserter.insert(scan_id, id, Some(parent), &path, depth, &m, Some(&error))?;
+                    if let Some(prepared) = &prepared {
+                        inserter.insert_prepared(
+                            scan_id,
+                            id,
+                            Some(parent),
+                            &path,
+                            depth,
+                            &m,
+                            Some(&error),
+                            None,
+                            prepared.totals[row_index],
+                        )?;
+                    } else {
+                        inserter.insert(
+                            scan_id,
+                            id,
+                            Some(parent),
+                            &path,
+                            depth,
+                            &m,
+                            Some(&error),
+                        )?;
+                    }
                     Repository::error_conn(
                         &tx,
                         scan_id,
@@ -2051,6 +2111,12 @@ fn flush_batch_with_errors(
                     )?;
                 }
             }
+        }
+        let discovered_extra = prepared
+            .as_ref()
+            .map_or(0, |prepared| prepared.discovered_extra);
+        if let Some(prepared) = prepared {
+            aggregates = prepared.frontier;
         }
         if let Some(timings) = &inserter.timings {
             profile.encode_ms += timings.encode_ms;
@@ -2113,6 +2179,18 @@ fn flush_batch_with_errors(
         directory_updates.clear();
         if let Some(probe) = sql_probe {
             profile.directory_write_sql.merge(probe.finish());
+        }
+        if discovered_extra != 0 {
+            let discovered: i64 = tx.query_row(
+                "SELECT discovered FROM scans WHERE id=?1",
+                [scan_id],
+                |row| row.get(0),
+            )?;
+            let discovered = crate::repository::checked_add(discovered, discovered_extra)?;
+            tx.execute(
+                "UPDATE scans SET discovered=?2 WHERE id=?1",
+                params![scan_id, discovered],
+            )?;
         }
         profile.aggregate_direct_parents += aggregation.direct_parents;
         profile.aggregate_ancestor_rows += aggregation.ancestor_rows;

@@ -1725,7 +1725,7 @@ pub struct NodeInserter<'a> {
 impl<'a> NodeInserter<'a> {
     pub fn new(tx: &'a Transaction<'_>, profile: bool) -> Result<Self> {
         Ok(Self {
-            insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,?15,?16,?17)")?,
+            insert: tx.prepare_cached("INSERT INTO nodes(scan_id,id,parent_id,path,payload,name,kind,extension,depth,modified,logical_total,allocated_total,allocated_unknown,file_count,dir_count,error_code,search_path,incomplete,children_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?18,?15,?16,?17,?19)")?,
             pending: tx.prepare_cached("INSERT INTO pending_dirs(scan_id,id,path,depth,expected_identity,metadata_deferred) VALUES(?1,?2,?3,?4,?5,?6)")?,
             metadata_pending: tx.prepare_cached("INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,?2)")?,
             timings: profile.then(InsertTimings::default),
@@ -1760,9 +1760,57 @@ impl<'a> NodeInserter<'a> {
         error: Option<&AppError>,
         encoded: &EncodedNode,
     ) -> Result<()> {
+        self.insert_encoded_inner(scan_id, id, parent, depth, m, error, encoded, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_prepared(
+        &mut self,
+        scan_id: &str,
+        id: i64,
+        parent: Option<i64>,
+        path: &Path,
+        depth: u32,
+        m: &platform::Metadata,
+        error: Option<&AppError>,
+        encoded: Option<&EncodedNode>,
+        totals: [i64; 6],
+    ) -> Result<()> {
+        let owned;
+        let encoded = if let Some(encoded) = encoded {
+            encoded
+        } else {
+            let started = self.timings.as_ref().map(|_| std::time::Instant::now());
+            owned = encode_node(path, m)?;
+            if let (Some(timings), Some(started)) = (&mut self.timings, started) {
+                timings.encode_ms += started.elapsed().as_secs_f64() * 1000.0;
+            }
+            &owned
+        };
+        self.insert_encoded_inner(scan_id, id, parent, depth, m, error, encoded, Some(totals))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn insert_encoded_inner(
+        &mut self,
+        scan_id: &str,
+        id: i64,
+        parent: Option<i64>,
+        depth: u32,
+        m: &platform::Metadata,
+        error: Option<&AppError>,
+        encoded: &EncodedNode,
+        totals: Option<[i64; 6]>,
+    ) -> Result<()> {
         let logical = integer(m.logical)?;
         let allocated = m.allocated.map(integer).transpose()?.unwrap_or(0);
         let isfile = m.kind == "file";
+        let totals = totals.unwrap_or([
+            logical,
+            allocated,
+            i64::from(m.allocated.is_none()),
+            i64::from(isfile),
+            0,
+            0,
+        ]);
         let started = self.timings.as_ref().map(|_| std::time::Instant::now());
         self.insert.execute(params![
             scan_id,
@@ -1775,10 +1823,10 @@ impl<'a> NodeInserter<'a> {
             encoded.extension,
             depth,
             m.modified,
-            logical,
-            allocated,
-            m.allocated.is_none(),
-            isfile,
+            totals[0],
+            totals[1],
+            totals[2],
+            totals[3],
             error.map(|e| &e.code),
             encoded.display_path,
             if error.is_some() {
@@ -1787,7 +1835,9 @@ impl<'a> NodeInserter<'a> {
                 2
             } else {
                 0
-            }
+            },
+            totals[4],
+            totals[5]
         ])?;
         if let (Some(timings), Some(started)) = (&mut self.timings, started) {
             timings.sql_ms += started.elapsed().as_secs_f64() * 1000.0;
@@ -2325,8 +2375,10 @@ mod directory_metadata_tests {
             );
         }
         assert!(!DirectoryWriteMode::from_override(Some("off")).fused());
-        assert!(DirectoryWriteMode::from_override(None).fused());
-        assert!(DirectoryWriteMode::from_override(Some("OFF")).fused());
+        assert!(!DirectoryWriteMode::from_override(None).fused());
+        assert!(!DirectoryWriteMode::from_override(Some("OFF")).fused());
+        assert!(!DirectoryWriteMode::from_override(Some("ON")).fused());
+        assert!(DirectoryWriteMode::from_override(Some("on")).fused());
     }
     fn setup() -> (
         tempfile::TempDir,
@@ -3126,16 +3178,16 @@ struct AggregatePlan {
 #[derive(Clone, Copy, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DirectoryWriteMode {
-    Separate,
     #[default]
+    Separate,
     Fused,
 }
 impl DirectoryWriteMode {
     pub(crate) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("off") {
-            Self::Separate
-        } else {
+        if value == Some("on") {
             Self::Fused
+        } else {
+            Self::Separate
         }
     }
     pub(crate) fn fused(self) -> bool {

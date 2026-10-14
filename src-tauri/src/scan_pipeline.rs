@@ -20,6 +20,8 @@ struct TestFault {
     close_failure: bool,
     legacy: bool,
     metadata_oversize: bool,
+    before_staged_send: bool,
+    done_messages: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 #[cfg(test)]
 static TEST_FAULT: std::sync::Mutex<Option<TestFault>> = std::sync::Mutex::new(None);
@@ -41,6 +43,39 @@ pub(super) fn test_overlapping_root(root: &Path) -> Option<bool> {
 #[cfg(test)]
 static TEST_WRITER_MODES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, bool>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static TEST_STAGED_MODES: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(test)]
+static TEST_STAGED_OBSERVATIONS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, [usize; 4]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+pub(super) struct TestStagedMode(PathBuf);
+#[cfg(test)]
+impl Drop for TestStagedMode {
+    fn drop(&mut self) {
+        TEST_STAGED_MODES.lock().unwrap().remove(&self.0);
+        TEST_STAGED_OBSERVATIONS.lock().unwrap().remove(&self.0);
+    }
+}
+#[cfg(test)]
+impl TestStagedMode {
+    pub(super) fn observation(&self) -> [usize; 4] {
+        TEST_STAGED_OBSERVATIONS.lock().unwrap()[&self.0]
+    }
+}
+#[cfg(test)]
+pub(super) fn test_staged_mode(root: &Path) -> TestStagedMode {
+    assert!(TEST_STAGED_MODES.lock().unwrap().insert(root.into()));
+    TestStagedMode(root.into())
+}
+fn staged_mode_for(_root: &Path) -> staging::Mode {
+    #[cfg(test)]
+    if TEST_STAGED_MODES.lock().unwrap().contains(_root) {
+        return staging::Mode::Staged;
+    }
+    staging::Mode::from_override(std::env::var("SPACEFOLD_STAGED_INSERT").ok().as_deref())
+}
 #[cfg(test)]
 pub(super) struct TestWriterMode(PathBuf);
 #[cfg(test)]
@@ -131,6 +166,7 @@ struct WriteBatch {
     metadata: Vec<DirectoryMetadataUpdate>,
     errors: Vec<PendingScanError>,
     consumed: Vec<i64>,
+    staged_dispatches: usize,
     heap_bytes: usize,
     started: Instant,
 }
@@ -141,6 +177,7 @@ impl WriteBatch {
             metadata: Vec::with_capacity(2048),
             errors: Vec::with_capacity(ERROR_LIMIT),
             consumed: Vec::with_capacity(consumed_limit),
+            staged_dispatches: 0,
             heap_bytes: 0,
             started: Instant::now(),
         }
@@ -658,6 +695,8 @@ fn collect_directories(
                         .prepare_cached("INSERT INTO dispatched_dirs(id) VALUES(?1)")?;
                     collector.queue.consume(&mut mark)?
                 };
+                let task = staging::ReadTask::Committed(staging::CommittedDirectory(id));
+                let id = task.id();
                 collector.batch.consumed.push(id);
                 collector.port.ledger_count += 1;
                 if let Some(started) = marked {
@@ -786,6 +825,19 @@ fn collect_directories(
                 in_flight = in_flight
                     .checked_sub(1)
                     .ok_or_else(|| AppError::new("WRITER_PROTOCOL", "目录完成通知数量不一致"))?;
+                #[cfg(test)]
+                if let Some(counter) = TEST_FAULT
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|fault| {
+                        fault.scan_id == collector.scan_id
+                            && fault.data_dir == collector.service.repo.data_dir
+                    })
+                    .and_then(|fault| fault.done_messages.as_ref())
+                {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
                 collector.profile.directory_check_ms += timings.directory_check_ms;
                 collector.profile.enumerate_ms += timings.enumerate_ms;
                 collector.profile.encode_ms += timings.encode_ms;
@@ -821,6 +873,74 @@ fn collect_directories(
                         .ok_or_else(|| AppError::new("SIZE_OUT_OF_RANGE", "节点数量超出上限"))?;
                     if let Some(metadata) = entry.hint.filter(|_| fast) {
                         collector.add_row((id, parent, path, depth + 1, Ok(metadata), encoded))?;
+                        // Speculative work is admitted only from a backend-owned
+                        // row still in the current packet. It remains invisible
+                        // to all Repository/UI/file-operation readers.
+                        if collector.profile.staged_insert_mode.enabled()
+                            && in_flight < in_flight_limit
+                            && collector.batch.staged_dispatches < staging::HOT_DIRECTORY_LIMIT
+                            && collector.batch.consumed.len() < collector.consumed_limit
+                            && depth + 1 < 4096
+                        {
+                            let row = collector.batch.rows.last().unwrap();
+                            let metadata = row.4.as_ref().unwrap();
+                            let request_bytes = row.2.capacity().saturating_add(
+                                metadata.identity.as_ref().map_or(0, String::capacity),
+                            );
+                            if metadata.defer_directory_metadata()
+                                && request_bytes <= BATCH_PATH_BYTES / in_flight_limit.max(1)
+                            {
+                                let task = staging::ReadTask::Staged(staging::StagedDirectory(id));
+                                let task_id = task.id();
+                                if collector.port.ledger_count >= collector.port.ledger_limit {
+                                    return Err(AppError::new(
+                                        "WRITER_PROTOCOL",
+                                        "扫描派发记录超过内存预算",
+                                    ));
+                                }
+                                let requested_path = row.2.clone();
+                                let expected = metadata.identity.clone();
+                                collector.connection.execute(
+                                    "INSERT INTO dispatched_dirs(id) VALUES(?1)",
+                                    [task_id],
+                                )?;
+                                collector.batch.consumed.push(task_id);
+                                collector.batch.staged_dispatches += 1;
+                                collector.profile.staged_directory_peak_per_packet = collector
+                                    .profile
+                                    .staged_directory_peak_per_packet
+                                    .max(collector.batch.staged_dispatches);
+                                collector.port.ledger_count += 1;
+                                #[cfg(test)]
+                                {
+                                    let fault = TEST_FAULT
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .filter(|fault| {
+                                            fault.scan_id == collector.scan_id
+                                                && fault.data_dir == collector.service.repo.data_dir
+                                                && fault.before_staged_send
+                                        })
+                                        .cloned();
+                                    if let Some(fault) = fault {
+                                        fault.entered.send(()).unwrap();
+                                        fault.release.recv().unwrap();
+                                    }
+                                }
+                                if requests
+                                    .send((task_id, requested_path, depth + 1, expected, true))
+                                    .is_err()
+                                {
+                                    if job.cancel.load(Ordering::Acquire) {
+                                        break 'collect;
+                                    }
+                                    return Err(AppError::new("WORKER_FAILED", "枚举线程已退出"));
+                                }
+                                in_flight += 1;
+                                collector.profile.staged_directory_dispatches += 1;
+                            }
+                        }
                     } else {
                         // A dispatched path remains in the collection budget
                         // until its complete result is accepted into a packet.
@@ -1064,6 +1184,11 @@ fn merge_writer_profile(target: &mut ScanProfile, source: ScanProfile) {
     target.directory_metadata_apply_ms += source.directory_metadata_apply_ms;
     target.directory_metadata_updates += source.directory_metadata_updates;
     target.directory_write_sql.merge(source.directory_write_sql);
+    target.staged_metadata_inserts += source.staged_metadata_inserts;
+    target.staged_internal_edges += source.staged_internal_edges;
+    target.staged_counter_storage_upper_bound_bytes = target
+        .staged_counter_storage_upper_bound_bytes
+        .max(source.staged_counter_storage_upper_bound_bytes);
     target.aggregate_ms += source.aggregate_ms;
     target.aggregate_direct_parents += source.aggregate_direct_parents;
     target.aggregate_ancestor_rows += source.aggregate_ancestor_rows;
@@ -1133,6 +1258,7 @@ pub(super) fn scan(
                 .ok()
                 .as_deref(),
         ),
+        staged_insert_mode: staged_mode_for(root),
         checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
@@ -1183,6 +1309,7 @@ pub(super) fn scan(
     let writer_profile = ScanProfile {
         enabled,
         directory_write_mode: profile.directory_write_mode,
+        staged_insert_mode: profile.staged_insert_mode,
         defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
@@ -1434,6 +1561,19 @@ pub(super) fn scan(
         sent.map_err(|_| AppError::new("WORKER_FAILED", "扫描写线程已退出"))?;
         written
     })?;
+    merge_writer_profile(&mut profile, result.profile);
+    #[cfg(test)]
+    if profile.staged_insert_mode.enabled() {
+        TEST_STAGED_OBSERVATIONS.lock().unwrap().insert(
+            root.into(),
+            [
+                profile.staged_directory_dispatches,
+                profile.staged_metadata_inserts,
+                profile.staged_internal_edges,
+                profile.staged_directory_peak_per_packet,
+            ],
+        );
+    }
     if enabled {
         profile.directory_api = directory_reader.api_profile();
         let auxiliary = auxiliary_budget.state.lock().unwrap();
@@ -1442,7 +1582,6 @@ pub(super) fn scan(
         if let Some(probe) = &profile.reader_wait_probe {
             profile.reader_backpressure = probe.snapshot();
         }
-        merge_writer_profile(&mut profile, result.profile);
         eprintln!(
             "{}",
             serde_json::json!({ "scanProfile": profile, "totalMs": milliseconds(started), "writerMode": "overlap" })
@@ -1469,6 +1608,19 @@ mod tests {
     use std::fs;
 
     struct ClearFault;
+    struct ReleaseOnDrop(Option<Sender<()>>);
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
     impl Drop for ClearFault {
         fn drop(&mut self) {
             *TEST_FAULT.lock().unwrap() = None;
@@ -1566,6 +1718,8 @@ mod tests {
             close_failure: false,
             legacy: false,
             metadata_oversize: false,
+            before_staged_send: false,
+            done_messages: None,
         });
         (entered_rx, release)
     }
@@ -2103,6 +2257,667 @@ mod tests {
             )
             .unwrap(),
             count
+        );
+    }
+
+    #[test]
+    fn staged_cancel_between_admission_and_disconnected_send_drains_the_accepted_directory() {
+        let _control = fault_control();
+        let (_temp, service, root, id) = setup();
+        let mut child = row(2, &root, "accepted-child");
+        child.4.as_mut().unwrap().links = None;
+        child.4.as_mut().unwrap().allocated = Some(0);
+        let read = read_connection(&service);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let (entered, release) = install_fault(&service, None, id.clone(), false, false, None);
+        TEST_FAULT
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .before_staged_send = true;
+        let _clear = ClearFault;
+        std::thread::scope(|scope| {
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, output) = crossbeam_channel::bounded(1);
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile {
+                        staged_insert_mode: staging::Mode::Staged,
+                        ..Default::default()
+                    },
+                    checkpoint::Mode::Off,
+                )
+            });
+            let (requests, request_rx) =
+                crossbeam_channel::bounded::<(i64, PathBuf, u32, Option<String>, bool)>(32);
+            let (messages, message_rx) = crossbeam_channel::bounded(32);
+            let (metadata_work, _metadata_work_rx) = crossbeam_channel::bounded(2000);
+            let (_metadata_sender, metadata_rx) = crossbeam_channel::bounded(2000);
+            let budget = Arc::new(ReaderBudget::default());
+            let charged = child.2.capacity()
+                + metadata_owned_bytes(child.4.as_ref().ok())
+                + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+            let permit = budget.acquire(charged, &job.cancel).unwrap();
+            let emitter = scope.spawn(move || {
+                let task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(task.0, 1);
+                drop(request_rx);
+                messages
+                    .send(ReaderMessage {
+                        message: DirectoryMessage::Entries {
+                            parent: 1,
+                            path: task.1,
+                            depth: 0,
+                            entries: vec![(
+                                platform::DirectoryEntry {
+                                    path: child.2,
+                                    hint: child.4.ok(),
+                                },
+                                None,
+                            )],
+                            permit,
+                        },
+                        auxiliary_permit: None,
+                    })
+                    .unwrap();
+            });
+            let cancel_job = &job;
+            let canceller = scope.spawn(move || {
+                entered.recv_timeout(Duration::from_secs(3)).unwrap();
+                cancel_job.cancel.store(true, Ordering::Release);
+                release.send(()).unwrap();
+            });
+            let mut port = port(commands, output);
+            let mut profile = ScanProfile {
+                staged_insert_mode: staging::Mode::Staged,
+                ..Default::default()
+            };
+            let mut collector = Collector {
+                service: &service,
+                scan_id: &id,
+                connection: &read,
+                port: &mut port,
+                profile: &mut profile,
+                batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
+                queue: DirectoryQueueCursor::default(),
+                metadata: &metadata_rx,
+                pending: 0,
+                reserved_metadata: 0,
+                consumed_limit: DEFAULT_CONSUMED_LIMIT,
+            };
+            collect_directories(
+                &mut collector,
+                &root,
+                &job,
+                &AtomicBool::new(false),
+                &requests,
+                &message_rx,
+                &metadata_work,
+                32,
+            )
+            .unwrap();
+            assert_eq!(collector.batch.rows.len(), 1);
+            collector.flush().unwrap();
+            collector.port.wait(&read).unwrap();
+            drop(collector);
+            emitter.join().unwrap();
+            canceller.join().unwrap();
+            assert_eq!(used(&budget), 0);
+            assert_eq!(
+                read.query_row("SELECT COUNT(*) FROM dispatched_dirs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                read.query_row(
+                    "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            drop(read);
+            port.commands.send(WriteCommand::Finish).unwrap();
+            drop(port);
+            let result = writer.join().unwrap().unwrap();
+            assert_eq!(result.scan.status, "cancelled");
+            assert_eq!(result.scan.discovered_count, "2");
+            assert!(service.repo.node(&id, "2", None).unwrap().node.incomplete);
+        });
+    }
+
+    #[test]
+    fn staged_precommit_nodes_are_hidden_from_pages_details_and_operation_plans_and_rollback() {
+        let _control = fault_control();
+        let (_temp, service, root, id) = setup();
+        let read = read_connection(&service);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let (entered, release) = install_fault(&service, None, id.clone(), true, false, None);
+        let _clear = ClearFault;
+        std::thread::scope(|scope| {
+            let mut release = ReleaseOnDrop(Some(release));
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, output) = crossbeam_channel::bounded(1);
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile {
+                        staged_insert_mode: staging::Mode::Staged,
+                        ..Default::default()
+                    },
+                    checkpoint::Mode::Off,
+                )
+            });
+            let mut port = port(commands, output);
+            let mut batch = WriteBatch::new(DEFAULT_CONSUMED_LIMIT);
+            batch.rows.push(row(2, &root, "staged-hidden"));
+            batch.consumed.push(2);
+            read.execute("INSERT INTO dispatched_dirs VALUES(2)", [])
+                .unwrap();
+            port.ledger_count = 1;
+            port.submit(&read, &mut batch, DEFAULT_CONSUMED_LIMIT)
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(service.repo.node(&id, "2", None).is_err());
+            let request = PageRequest {
+                scan_id: id.clone(),
+                parent_id: Some("1".into()),
+                revision: 1,
+                sort: None,
+                filter: None,
+                cursor: None,
+                page_size: Some(32),
+            };
+            assert!(service.repo.page(&request, false).unwrap().nodes.is_empty());
+            let mut search = request.clone();
+            search.filter = Some(Filter {
+                keyword: Some("staged-hidden".into()),
+                ..Default::default()
+            });
+            assert!(service.repo.page(&search, true).unwrap().nodes.is_empty());
+            assert!(crate::file_ops::plan(
+                &service,
+                OperationRequest {
+                    scan_id: id.clone(),
+                    node_ids: vec!["2".into()],
+                    expected_revision: 1,
+                    kind: "rename".into(),
+                    destination_ref: None,
+                    destination_path: None,
+                    new_name: Some("unused-new-name".into()),
+                    conflict_policy: None
+                }
+            )
+            .is_err());
+            release.release();
+            assert!(port.wait(&read).is_err());
+            assert_eq!(
+                read.query_row("SELECT COUNT(*) FROM dispatched_dirs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert!(service.repo.node(&id, "2", None).is_err());
+            assert_eq!(service.repo.scan(&id).unwrap().discovered_count, "1");
+            drop(read);
+            drop(port);
+            assert!(writer.join().unwrap().is_err());
+        });
+    }
+
+    #[test]
+    fn staged_consumed_packet_before_ack_has_no_pending_redispatch_and_exact_ack_releases_claim() {
+        let _control = fault_control();
+        let (_temp, service, root, id) = setup();
+        let read = read_connection(&service);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let (entered, release) = install_fault(&service, None, id.clone(), false, false, Some(1));
+        let _clear = ClearFault;
+        std::thread::scope(|scope| {
+            let mut release = ReleaseOnDrop(Some(release));
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, output) = crossbeam_channel::bounded(1);
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile {
+                        staged_insert_mode: staging::Mode::Staged,
+                        ..Default::default()
+                    },
+                    checkpoint::Mode::Off,
+                )
+            });
+            let mut port = port(commands, output);
+            let mut batch = WriteBatch::new(DEFAULT_CONSUMED_LIMIT);
+            batch.rows.push(row(2, &root, "done-before-ack"));
+            batch.consumed.push(2);
+            read.execute("INSERT INTO dispatched_dirs VALUES(2)", [])
+                .unwrap();
+            port.ledger_count = 1;
+            port.submit(&read, &mut batch, DEFAULT_CONSUMED_LIMIT)
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            // This is already committed; only coordinator dependency/claim
+            // publication awaits ACK. Public readers may see its revision.
+            assert!(service.repo.node(&id, "2", None).is_ok());
+            assert_eq!(
+                read.query_row(
+                    "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1 AND id=2",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                read.query_row(
+                    "SELECT COUNT(*) FROM dispatched_dirs WHERE id=2",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            let mut visible = DirectoryQueueCursor::default();
+            refill_visible(&mut visible, &read, &id).unwrap();
+            assert!(!visible.cache.iter().any(|entry| entry.0 == 2));
+            release.release();
+            port.wait(&read).unwrap();
+            assert_eq!(port.ledger_count, 0);
+            assert_eq!(
+                read.query_row("SELECT COUNT(*) FROM dispatched_dirs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            drop(read);
+            port.commands.send(WriteCommand::Abort).unwrap();
+            drop(port);
+            assert_eq!(writer.join().unwrap().err().unwrap().code, "SCAN_ABORTED");
+        });
+    }
+
+    #[test]
+    fn staged_collector_consumes_real_done_before_commit_and_ack_without_repeating_the_directory() {
+        let _control = fault_control();
+        let (_temp, service, root, id) = setup();
+        let mut child = row(2, &root, "done-child");
+        fs::write(child.2.join("inside.bin"), b"abc").unwrap();
+        let full = platform::metadata(&child.2).unwrap();
+        child.4.as_mut().unwrap().links = None;
+        child.4.as_mut().unwrap().allocated = Some(0);
+        let read = read_connection(&service);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        let (entered, release) = install_fault(&service, None, id.clone(), false, false, Some(1));
+        let done_messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        TEST_FAULT.lock().unwrap().as_mut().unwrap().done_messages = Some(done_messages.clone());
+        let _clear = ClearFault;
+        std::thread::scope(|scope| {
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, output) = crossbeam_channel::bounded(1);
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile {
+                        staged_insert_mode: staging::Mode::Staged,
+                        ..Default::default()
+                    },
+                    checkpoint::Mode::Off,
+                )
+            });
+            let (requests, request_rx) =
+                crossbeam_channel::bounded::<(i64, PathBuf, u32, Option<String>, bool)>(32);
+            let (messages, message_rx) = crossbeam_channel::bounded(32);
+            let (metadata_work, _metadata_work_rx) = crossbeam_channel::bounded(2000);
+            let (_metadata_sender, metadata_rx) = crossbeam_channel::bounded(2000);
+            let entries_budget = Arc::new(ReaderBudget::default());
+            let auxiliary_budget = Arc::new(ReaderBudget {
+                limit: AUXILIARY_MESSAGE_BYTES,
+                ..Default::default()
+            });
+            let cancel = &job.cancel;
+            let reader_entries = entries_budget.clone();
+            let reader_auxiliary = auxiliary_budget.clone();
+            let emitter = scope.spawn(move || {
+                let output = ReaderOutput {
+                    sender: messages,
+                    observation: None,
+                    auxiliary_budget: reader_auxiliary,
+                    cancel,
+                };
+                let root_task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(root_task.0, 1);
+                let bytes = child.2.capacity()
+                    + metadata_owned_bytes(child.4.as_ref().ok())
+                    + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+                output
+                    .send_entries(
+                        1,
+                        root_task.1,
+                        0,
+                        vec![(
+                            platform::DirectoryEntry {
+                                path: child.2,
+                                hint: child.4.ok(),
+                            },
+                            None,
+                        )],
+                        bytes,
+                        &reader_entries,
+                    )
+                    .unwrap();
+                output
+                    .send(DirectoryMessage::Done(ReaderTimings::default()))
+                    .unwrap();
+                let task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(task.0, 2);
+                output
+                    .send(DirectoryMessage::Metadata(DirectoryMetadataUpdate {
+                        id: 2,
+                        expected_identity: task.3.unwrap(),
+                        result: Ok(full),
+                    }))
+                    .unwrap();
+                let path = task.1.join("inside.bin");
+                let metadata = platform::metadata(&path).unwrap();
+                let bytes = path.capacity()
+                    + metadata_owned_bytes(Some(&metadata))
+                    + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+                output
+                    .send_entries(
+                        2,
+                        task.1,
+                        1,
+                        vec![(
+                            platform::DirectoryEntry {
+                                path,
+                                hint: Some(metadata),
+                            },
+                            None,
+                        )],
+                        bytes,
+                        &reader_entries,
+                    )
+                    .unwrap();
+                output
+                    .send(DirectoryMessage::Done(ReaderTimings::default()))
+                    .unwrap();
+                // The coordinator must finish after these two real Done
+                // messages. Any redispatch would produce a third request.
+                assert!(request_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            });
+            let observed_service = &service;
+            let observed_id = &id;
+            let observer = scope.spawn(move || {
+                let mut release = ReleaseOnDrop(Some(release));
+                entered.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(done_messages.load(Ordering::SeqCst), 2);
+                let parent = observed_service.repo.node(observed_id, "2", None).unwrap();
+                assert_eq!(parent.node.logical_total_bytes, "3");
+                assert_eq!(parent.node.file_count, "1");
+                assert_eq!(parent.node.children_count, "1");
+                assert!(parent.node.link_count.is_some());
+                assert!(observed_service.repo.node(observed_id, "3", None).is_ok());
+                let database = observed_service.repo.connect().unwrap();
+                assert_eq!(
+                    database
+                        .query_row(
+                            "SELECT COUNT(*) FROM pending_dirs WHERE scan_id=?1",
+                            [observed_id],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0
+                );
+                release.release();
+            });
+            let mut port = port(commands, output);
+            let mut profile = ScanProfile {
+                staged_insert_mode: staging::Mode::Staged,
+                ..Default::default()
+            };
+            let mut collector = Collector {
+                service: &service,
+                scan_id: &id,
+                connection: &read,
+                port: &mut port,
+                profile: &mut profile,
+                batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
+                queue: DirectoryQueueCursor::default(),
+                metadata: &metadata_rx,
+                pending: 0,
+                reserved_metadata: 0,
+                consumed_limit: DEFAULT_CONSUMED_LIMIT,
+            };
+            collect_directories(
+                &mut collector,
+                &root,
+                &job,
+                &AtomicBool::new(false),
+                &requests,
+                &message_rx,
+                &metadata_work,
+                32,
+            )
+            .unwrap();
+            assert!(collector.batch.empty());
+            assert_eq!(collector.port.ledger_count, 0);
+            drop(collector);
+            drop(requests);
+            emitter.join().unwrap();
+            observer.join().unwrap();
+            assert_eq!(profile.staged_directory_dispatches, 1);
+            assert_eq!(
+                read.query_row("SELECT COUNT(*) FROM dispatched_dirs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(used(&entries_budget), 0);
+            assert_eq!(used(&auxiliary_budget), 0);
+            drop(read);
+            port.commands.send(WriteCommand::Finish).unwrap();
+            drop(port);
+            let result = writer.join().unwrap().unwrap();
+            assert_eq!(result.scan.discovered_count, "3");
+            assert_eq!(result.profile.staged_metadata_inserts, 1);
+            assert_eq!(result.profile.staged_internal_edges, 1);
+        });
+    }
+
+    #[test]
+    fn staged_owned_byte_row_and_deadline_limits_flush_and_make_progress() {
+        let (_temp, service, root, id) = setup();
+        let read = read_connection(&service);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let job = JobRuntime::new(JobEvent::new(&id, &id, "scan", 1), None);
+        std::thread::scope(|scope| {
+            let (commands, input) = crossbeam_channel::bounded(0);
+            let (ack, output) = crossbeam_channel::bounded(1);
+            let writer = scope.spawn(|| {
+                write_loop(
+                    &service,
+                    &id,
+                    &root,
+                    &job,
+                    c,
+                    input,
+                    ack,
+                    ScanProfile {
+                        staged_insert_mode: staging::Mode::Staged,
+                        ..Default::default()
+                    },
+                    checkpoint::Mode::Off,
+                )
+            });
+            let mut port = port(commands, output);
+            let (_sender, metadata) = crossbeam_channel::bounded(2000);
+            let mut profile = ScanProfile {
+                staged_insert_mode: staging::Mode::Staged,
+                ..Default::default()
+            };
+            let mut collector = Collector {
+                service: &service,
+                scan_id: &id,
+                connection: &read,
+                port: &mut port,
+                profile: &mut profile,
+                batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
+                queue: DirectoryQueueCursor::default(),
+                metadata: &metadata,
+                pending: 0,
+                reserved_metadata: 0,
+                consumed_limit: DEFAULT_CONSUMED_LIMIT,
+            };
+            for (id, name) in [(2, "large-owned-one"), (3, "large-owned-two")] {
+                let mut incoming = row(id, &root, name);
+                incoming.2.reserve_exact(BATCH_PATH_BYTES / 2 + 1);
+                collector.add_row(incoming).unwrap();
+                assert!(collector.batch.heap_bytes <= BATCH_PATH_BYTES);
+            }
+            assert!(collector.port.outstanding.is_some());
+            collector.flush().unwrap();
+            collector.port.wait(&read).unwrap();
+            assert_eq!(collector.port.committed_batches, 2);
+            let minimal = platform::Metadata {
+                kind: "file".into(),
+                logical: 0,
+                allocated: Some(0),
+                modified: None,
+                identity: None,
+                links: None,
+                attributes: 0,
+                reparse_tag: 0,
+                link_type: None,
+                link_target: None,
+                cloud_state: None,
+                allocation_method: None,
+                recurse: false,
+            };
+            for number in 0..=BATCH_ENTRIES {
+                let node = 100 + number as i64;
+                collector
+                    .add_row((
+                        node,
+                        1,
+                        root.join(format!("row-{number}")),
+                        1,
+                        Ok(minimal.clone()),
+                        None,
+                    ))
+                    .unwrap();
+                collector.flush_if_full().unwrap();
+                assert!(collector.batch.rows.len() <= BATCH_ENTRIES);
+                assert!(collector.batch.heap_bytes <= BATCH_PATH_BYTES);
+            }
+            assert_eq!(collector.batch.rows.len(), 1);
+            collector.batch.started = Instant::now() - Duration::from_millis(101);
+            collector.flush_if_full().unwrap();
+            assert!(collector.batch.rows.is_empty());
+            collector.port.wait(&read).unwrap();
+            let count: i64 = service
+                .repo
+                .scan(&id)
+                .unwrap()
+                .discovered_count
+                .parse()
+                .unwrap();
+            assert_eq!(count, BATCH_ENTRIES as i64 + 4);
+            let mut oversized = (20000, 1, root.join("oversized"), 1, Ok(minimal), None);
+            oversized.2.reserve_exact(BATCH_PATH_BYTES + 1);
+            assert_eq!(
+                collector.add_row(oversized).unwrap_err().code,
+                "READER_PAYLOAD_BUDGET"
+            );
+            assert!(collector.batch.empty());
+            drop(collector);
+            drop(read);
+            port.commands.send(WriteCommand::Abort).unwrap();
+            drop(port);
+            assert_eq!(writer.join().unwrap().err().unwrap().code, "SCAN_ABORTED");
+        });
+    }
+
+    #[test]
+    fn staged_service_transaction_failure_releases_budgets_and_allows_another_real_scan() {
+        let _control = fault_control();
+        let (_temp, service, root, _) = setup();
+        fs::create_dir(root.join("child")).unwrap();
+        fs::write(root.join("child/inside.bin"), b"abc").unwrap();
+        let _staged = test_staged_mode(&root);
+        let (entered, release) = install_fault(
+            &service,
+            Some(root.clone()),
+            String::new(),
+            true,
+            false,
+            None,
+        );
+        let _clear = ClearFault;
+        let mut release = ReleaseOnDrop(Some(release));
+        let scan = service.start_scan(root.clone(), None).unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let budgets = release_observer().unwrap();
+        release.release();
+        let event = terminal(&service, &scan.scan_id);
+        assert_eq!(event.status, "failed");
+        assert_eq!(event.error.as_ref().unwrap().code, "WORKER_FAILED");
+        assert_eq!(
+            service.repo.scan(&scan.scan_id).unwrap().discovered_count,
+            "1"
+        );
+        assert_eq!(used(&budgets.0), 0);
+        assert_eq!(used(&budgets.1), 0);
+        assert_eq!(used(&budgets.2), 0);
+        assert!(!service.writer.is_poisoned());
+        *TEST_FAULT.lock().unwrap() = None;
+        let next = service.start_scan(root, None).unwrap();
+        assert_eq!(terminal(&service, &next.scan_id).status, "completed");
+        assert_eq!(
+            service.repo.scan(&next.scan_id).unwrap().discovered_count,
+            "3"
         );
     }
 
