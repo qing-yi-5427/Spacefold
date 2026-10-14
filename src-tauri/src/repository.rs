@@ -1,5 +1,5 @@
 use crate::{model::*, platform, stored_path};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -374,6 +374,26 @@ mod database_path_tests {
     }
 }
 
+fn check_schema_version(c: &Connection) -> Result<()> {
+    let has_schema: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_schema {
+        return Ok(());
+    }
+    let unsupported = || AppError::new("DATABASE_VERSION", "扫描数据库版本不支持；原数据库已保留");
+    let mut statement = c.prepare("SELECT version FROM schema_info LIMIT 2")?;
+    let mut rows = statement.query([])?;
+    let row = rows.next()?.ok_or_else(unsupported)?;
+    let version: i64 = row.get(0).map_err(|_| unsupported())?;
+    if !matches!(version, 1 | 2) || rows.next()?.is_some() {
+        return Err(unsupported());
+    }
+    Ok(())
+}
+
 pub struct Repository {
     pub path: PathBuf,
     pub data_dir: PathBuf,
@@ -395,23 +415,14 @@ impl Repository {
             sqlite_path,
             id_allocator: std::sync::Mutex::new(()),
         };
-        let c = repo.connect()?;
-        let has_schema: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info')",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_schema {
-            let version: i64 = c.query_row("SELECT version FROM schema_info", [], |r| r.get(0))?;
-            if version != 1 {
-                return Err(AppError::new(
-                    "DATABASE_VERSION",
-                    "扫描数据库版本不支持；原数据库已保留",
-                ));
-            }
-        }
-        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
-    CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
+        let mut c = repo.connect()?;
+        check_schema_version(&c)?;
+        // WAL selection must precede the transaction. All schema repair and
+        // recovery writes, including the format gate, commit together.
+        c.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_schema_version(&tx)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);INSERT INTO schema_info SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
     CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,root_path BLOB NOT NULL,source TEXT NOT NULL,started TEXT NOT NULL,finished TEXT,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovered INTEGER NOT NULL DEFAULT 0,error_count INTEGER NOT NULL DEFAULT 0,disk_json TEXT,notes_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nodes(scan_id TEXT NOT NULL,id INTEGER NOT NULL,parent_id INTEGER,path BLOB NOT NULL,payload TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,extension TEXT NOT NULL,depth INTEGER NOT NULL,modified TEXT,logical_total INTEGER NOT NULL CHECK(typeof(logical_total)='integer' AND logical_total>=0),allocated_total INTEGER NOT NULL CHECK(typeof(allocated_total)='integer' AND allocated_total>=0),allocated_unknown INTEGER NOT NULL,file_count INTEGER NOT NULL,dir_count INTEGER NOT NULL,children_count INTEGER NOT NULL DEFAULT 0,incomplete INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,error_code TEXT,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS directory_metadata_pending(scan_id TEXT NOT NULL,id INTEGER NOT NULL,PRIMARY KEY(scan_id,id),FOREIGN KEY(scan_id,id) REFERENCES nodes(scan_id,id) ON DELETE CASCADE) WITHOUT ROWID;
@@ -422,7 +433,7 @@ impl Repository {
     CREATE TABLE IF NOT EXISTS scan_sequence(next_id INTEGER NOT NULL CHECK(typeof(next_id)='integer' AND next_id>0));INSERT INTO scan_sequence SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM scan_sequence);
     UPDATE scans SET status='interrupted',finished=strftime('%Y-%m-%dT%H:%M:%fZ','now'),stale=1 WHERE status IN('running','queued','cancelling');
     DELETE FROM pending_dirs;")?;
-        let pending_without_rowid: bool = c.query_row(
+        let pending_without_rowid: bool = tx.query_row(
             "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='pending_dirs'",
             [],
             |row| row.get(0),
@@ -430,9 +441,7 @@ impl Repository {
         if !pending_without_rowid {
             // Pending work is already discarded when active jobs become interrupted.
             // Rebuild only that empty queue; saved nodes and scans stay in place.
-            let tx = c.unchecked_transaction()?;
             tx.execute_batch("DROP TABLE pending_dirs; CREATE TABLE pending_dirs(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,depth INTEGER NOT NULL,expected_identity TEXT,metadata_deferred INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
-            tx.commit()?;
         }
         for (name, definition) in [
             ("expected_identity", "expected_identity TEXT"),
@@ -441,51 +450,46 @@ impl Repository {
                 "metadata_deferred INTEGER NOT NULL DEFAULT 0",
             ),
         ] {
-            let exists: bool = c.query_row(
+            let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pending_dirs') WHERE name=?1)",
                 [name],
                 |row| row.get(0),
             )?;
             if !exists {
-                c.execute_batch(&format!(
+                tx.execute_batch(&format!(
                     "ALTER TABLE pending_dirs ADD COLUMN {definition};"
                 ))?;
             }
         }
-        let version: i64 = c.query_row("SELECT version FROM schema_info", [], |r| r.get(0))?;
-        if version != 1 {
-            return Err(AppError::new(
-                "DATABASE_VERSION",
-                "扫描数据库版本不支持；原数据库已保留",
-            ));
-        }
-        let has_sort_size: bool = c.query_row(
+        let has_sort_size: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('nodes') WHERE name='sort_size')",
             [],
             |r| r.get(0),
         )?;
         if !has_sort_size {
-            c.execute_batch("ALTER TABLE nodes ADD COLUMN sort_size INTEGER GENERATED ALWAYS AS (-logical_total) VIRTUAL;")?;
+            tx.execute_batch("ALTER TABLE nodes ADD COLUMN sort_size INTEGER GENERATED ALWAYS AS (-logical_total) VIRTUAL;")?;
         }
-        c.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_errors ON nodes(scan_id,id) WHERE error_code IS NOT NULL; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_parent_size_asc_v2; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
-        let has_search_path: bool = c.query_row(
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent_size_v3 ON nodes(scan_id,parent_id,sort_size,name COLLATE NOCASE,id); CREATE INDEX IF NOT EXISTS nodes_incomplete ON nodes(scan_id,id) WHERE incomplete=1; CREATE INDEX IF NOT EXISTS nodes_errors ON nodes(scan_id,id) WHERE error_code IS NOT NULL; CREATE INDEX IF NOT EXISTS nodes_special_kind_v2 ON nodes(scan_id,kind,parent_id,sort_size,name COLLATE NOCASE,id,logical_total,extension,modified) WHERE kind<>'file'; DROP INDEX IF EXISTS nodes_parent_size_asc_v2; DROP INDEX IF EXISTS nodes_kind; DROP INDEX IF EXISTS nodes_special_kind; DROP INDEX IF EXISTS nodes_parent_size; DROP INDEX IF EXISTS nodes_parent_name; DROP INDEX IF EXISTS nodes_parent_size_v2;")?;
+        let has_search_path: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('nodes') WHERE name='search_path')",
             [],
             |r| r.get(0),
         )?;
         if !has_search_path {
-            c.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';UPDATE nodes SET search_path=COALESCE(json_extract(payload,'$.node.displayPath'),'');")?;
+            tx.execute_batch("ALTER TABLE nodes ADD COLUMN search_path TEXT NOT NULL DEFAULT '';UPDATE nodes SET search_path=COALESCE(json_extract(payload,'$.node.displayPath'),'');")?;
         }
-        let has_history_stale: bool = c.query_row(
+        let has_history_stale: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('scans') WHERE name='history_stale')",
             [],
             |row| row.get(0),
         )?;
         if !has_history_stale {
-            c.execute_batch(
+            tx.execute_batch(
                 "ALTER TABLE scans ADD COLUMN history_stale INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        tx.execute("UPDATE schema_info SET version=2", [])?;
+        tx.commit()?;
         Ok(repo)
     }
     pub fn connect(&self) -> Result<Connection> {
@@ -1978,6 +1982,389 @@ mod stored_path_tests {
             .unwrap();
         tx.commit().unwrap();
         (temp, service, root, file, id)
+    }
+
+    #[test]
+    fn schema_v1_upgrade_preserves_history_blobs_and_v2_reopens() {
+        let (temp, service, root, _, scan) = fixture(stored_path::Mode::Utf16);
+        let c = service.repo.connect().unwrap();
+        assert_eq!(
+            c.query_row("SELECT version FROM schema_info", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let snapshot = || {
+            c.prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+                .unwrap()
+                .query_map([&scan], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = snapshot();
+        let root_blob: Vec<u8> = c
+            .query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='completed';DELETE FROM pending_dirs;").unwrap();
+        drop(c);
+        drop(service);
+        let reopened = Service::new(&temp.path().join("data")).unwrap();
+        let c = reopened.repo.connect().unwrap();
+        assert_eq!(
+            c.query_row("SELECT version FROM schema_info", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let after = c
+            .prepare("SELECT id,path,payload FROM nodes WHERE scan_id=?1 ORDER BY id")
+            .unwrap()
+            .query_map([&scan], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            c.query_row("SELECT root_path FROM scans WHERE id=?1", [&scan], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            root_blob
+        );
+        assert_eq!(reopened.repo.root_path(&scan).unwrap(), root);
+        assert_eq!(reopened.repo.scan(&scan).unwrap().status, "completed");
+        drop(c);
+        let new_scan = reopened.repo.new_scan_id().unwrap();
+        reopened.repo.insert_scan(&new_scan, &root, false).unwrap();
+        let mut c = reopened.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        NodeInserter::new(&tx, false)
+            .unwrap()
+            .insert(
+                &new_scan,
+                1,
+                None,
+                &root,
+                0,
+                &platform::metadata(&root).unwrap(),
+                None,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1",
+                [&new_scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(c);
+        drop(reopened);
+        assert!(Repository::new(&temp.path().join("data")).is_ok());
+    }
+
+    #[test]
+    fn schema_rejects_unknown_empty_multiple_and_noninteger_versions_without_database_writes() {
+        for sql in [
+            "UPDATE schema_info SET version=3",
+            "DELETE FROM schema_info",
+            "INSERT INTO schema_info VALUES(1)",
+            "UPDATE schema_info SET version='future'",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let repo = Repository::new(&data).unwrap();
+            let c = repo.connect().unwrap();
+            c.execute_batch(sql).unwrap();
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let path = repo.path.clone();
+            drop(c);
+            drop(repo);
+            let before = fs::read(&path).unwrap();
+            let error = match Repository::new(&data) {
+                Ok(_) => panic!("invalid schema accepted: {sql}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "DATABASE_VERSION");
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn schema_upgrade_failure_rolls_back_recovery_queue_and_schema_repairs() {
+        let (temp, service, _, _, scan) = fixture(stored_path::Mode::Utf16);
+        let c = service.repo.connect().unwrap();
+        c.execute_batch("UPDATE schema_info SET version=1;UPDATE scans SET status='running';DROP INDEX nodes_parent_name_v2;CREATE TRIGGER fail_schema_promotion BEFORE UPDATE ON schema_info WHEN new.version=2 BEGIN SELECT RAISE(ABORT,'promotion fault');END;").unwrap();
+        let pending: i64 = c
+            .query_row("SELECT COUNT(*) FROM pending_dirs", [], |r| r.get(0))
+            .unwrap();
+        assert!(pending > 0);
+        drop(c);
+        drop(service);
+        assert!(Repository::new(&temp.path().join("data")).is_err());
+        let c = Connection::open(temp.path().join("data/spacefold.sqlite3")).unwrap();
+        assert_eq!(
+            c.query_row("SELECT version FROM schema_info", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row("SELECT status FROM scans WHERE id=?1", [&scan], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM pending_dirs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            pending
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='nodes_parent_name_v2'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        c.execute_batch("DROP TRIGGER fail_schema_promotion")
+            .unwrap();
+        drop(c);
+        let reopened = Repository::new(&temp.path().join("data")).unwrap();
+        let c = reopened.connect().unwrap();
+        assert_eq!(
+            c.query_row("SELECT version FROM schema_info", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row("SELECT status FROM scans WHERE id=?1", [&scan], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "interrupted"
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM pending_dirs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_startups_wait_for_writer_and_recheck_the_committed_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let repo = Repository::new(&data).unwrap();
+        let mut c = repo.connect().unwrap();
+        c.execute("UPDATE schema_info SET version=1", []).unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let started = started_tx.clone();
+                let done = done_tx.clone();
+                let data = &data;
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let result = Repository::new(data).and_then(|repo| {
+                        repo.connect()?
+                            .query_row("SELECT version FROM schema_info", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .map_err(AppError::from)
+                    });
+                    done.send(result).unwrap();
+                });
+            }
+            let started = (0..2).all(|_| started_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+            let blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+            tx.execute("UPDATE schema_info SET version=2", []).unwrap();
+            tx.commit().unwrap();
+            assert!(started && blocked);
+            for _ in 0..2 {
+                assert_eq!(
+                    done_rx
+                        .recv_timeout(Duration::from_secs(12))
+                        .unwrap()
+                        .unwrap(),
+                    2
+                );
+            }
+        });
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM schema_info WHERE version=2",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn mixed_codec_refresh_preserves_exact_path_ids_only_for_unchanged_identity() {
+        let (temp, service, _, file, scan) = fixture(stored_path::Mode::Utf16);
+        service
+            .repo
+            .connect()
+            .unwrap()
+            .execute_batch("UPDATE scans SET status='completed';DELETE FROM pending_dirs;")
+            .unwrap();
+        let wait = |job: crate::model::Scan| {
+            let start = Instant::now();
+            loop {
+                let runtime = service.job(&job.scan_id).unwrap();
+                if runtime.terminal() {
+                    assert_eq!(runtime.snapshot().status, "completed");
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(15), "refresh timeout");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let identity = service
+            .repo
+            .node(&scan, "3", None)
+            .unwrap()
+            .fingerprint
+            .identity;
+        wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
+        let stored = service.repo.node(&scan, "3", None).unwrap();
+        assert_eq!(stored.path, file);
+        assert_eq!(stored.fingerprint.identity, identity);
+        let c = service.repo.connect().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=3",
+                [&scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT length(path)%2 FROM nodes WHERE scan_id=?1 AND id=1",
+                [&scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(c);
+        fs::rename(&file, temp.path().join("retained-old-file.bin")).unwrap();
+        fs::write(&file, b"test").unwrap();
+        assert_ne!(platform::metadata(&file).unwrap().identity, identity);
+        wait(service.refresh(scan.clone(), "1".into(), None).unwrap());
+        assert!(service.repo.node(&scan, "3", None).is_err());
+        let c = service.repo.connect().unwrap();
+        let id: i64 = c
+            .query_row(
+                "SELECT id FROM nodes WHERE scan_id=?1 AND kind='file'",
+                [&scan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let replaced = Repository::node_conn(&c, &scan, id).unwrap();
+        assert_eq!(replaced.path, file);
+        assert_ne!(replaced.fingerprint.identity, identity);
+        assert!(id > 3);
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        // Malformed odd history paths must roll back even the marker deletion
+        // that precedes temporary path normalization.
+        let staging = service.repo.new_scan_id().unwrap();
+        let root = service.repo.root_path(&scan).unwrap();
+        service.repo.insert_scan(&staging, &root, true).unwrap();
+        let mut c = service.repo.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        let mut insert = NodeInserter::with_path_mode(&tx, false, stored_path::Mode::Wtf8).unwrap();
+        for (node, parent, path, depth) in [
+            (1, None, root.clone(), 0),
+            (2, Some(1), file.parent().unwrap().to_path_buf(), 1),
+            (3, Some(2), file.clone(), 2),
+        ] {
+            insert
+                .insert(
+                    &staging,
+                    node,
+                    parent,
+                    &path,
+                    depth,
+                    &platform::metadata(&path).unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+        drop(insert);
+        tx.execute(
+            "UPDATE nodes SET path=?3 WHERE scan_id=?1 AND id=?2",
+            params![scan, id, b"bad".as_slice()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO directory_metadata_pending(scan_id,id) VALUES(?1,2)",
+            [&scan],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let revision = service.repo.scan(&scan).unwrap().revision;
+        assert_eq!(
+            crate::scan::replace_subtree(&service, &scan, "1", &staging)
+                .unwrap_err()
+                .code,
+            "STORED_PATH_ENCODING"
+        );
+        assert_eq!(service.repo.scan(&scan).unwrap().revision, revision);
+        assert_eq!(
+            c.query_row(
+                "SELECT path FROM nodes WHERE scan_id=?1 AND id=?2",
+                params![scan, id],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            b"bad"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM directory_metadata_pending WHERE scan_id=?1",
+                [&scan],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

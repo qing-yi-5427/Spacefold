@@ -16,16 +16,16 @@ const PAD: u8 = 0x80;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mode {
-    #[default]
     Utf16,
+    #[default]
     Wtf8,
 }
 impl Mode {
     pub(crate) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("wtf8") {
-            Self::Wtf8
-        } else {
+        if value == Some("off") {
             Self::Utf16
+        } else {
+            Self::Wtf8
         }
     }
     pub(crate) fn from_environment() -> Self {
@@ -199,18 +199,18 @@ mod tests {
         blob
     }
     #[test]
-    fn mode_only_accepts_exact_wtf8() {
-        assert_eq!(Mode::from_override(Some("wtf8")), Mode::Wtf8);
+    fn mode_defaults_to_wtf8_with_exact_off_baseline() {
+        assert_eq!(Mode::from_override(Some("off")), Mode::Utf16);
         for value in [
             None,
-            Some("off"),
+            Some("wtf8"),
             Some("utf16"),
             Some("on"),
             Some("WTF8"),
             Some("wtf8 "),
             Some("1"),
         ] {
-            assert_eq!(Mode::from_override(value), Mode::Utf16);
+            assert_eq!(Mode::from_override(value), Mode::Wtf8);
         }
     }
     #[test]

@@ -2293,19 +2293,36 @@ pub fn replace_subtree(
     let old = Repository::node_conn(&tx, target_scan, parse_id(scope_id)?)?;
     let new = Repository::node_conn(&tx, staging_scan, 1)?;
     let ancestors = Repository::ancestors_conn(&tx, target_scan, parse_id(scope_id)?)?;
-    tx.execute_batch("CREATE TEMP TABLE refresh_ids(old_id INTEGER PRIMARY KEY,new_id INTEGER); CREATE TEMP TABLE refresh_old(path BLOB PRIMARY KEY,id INTEGER,identity TEXT,fingerprint TEXT); CREATE TEMP TABLE refreshed_nodes(id INTEGER PRIMARY KEY);")?;
+    tx.execute_batch("CREATE TEMP TABLE refresh_ids(old_id INTEGER PRIMARY KEY,new_id INTEGER); CREATE TEMP TABLE refresh_old(path BLOB PRIMARY KEY,id INTEGER,identity TEXT,fingerprint TEXT); CREATE TEMP TABLE refreshed_nodes(id INTEGER PRIMARY KEY); CREATE TEMP TABLE refresh_paths(scan_id TEXT NOT NULL,id INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(scan_id,id)) WITHOUT ROWID;")?;
     tx.execute("WITH RECURSIVE subtree(id) AS (SELECT ?2 UNION ALL SELECT n.id FROM subtree s CROSS JOIN nodes n ON n.scan_id=?1 AND n.parent_id=s.id) INSERT INTO refreshed_nodes SELECT id FROM subtree",params![target_scan,parse_id(scope_id)?])?;
     tx.execute(
         "DELETE FROM directory_metadata_pending WHERE scan_id=?1 AND id IN refreshed_nodes",
         [target_scan],
     )?;
-    tx.execute("INSERT INTO refresh_old SELECT path,id,COALESCE(json_extract(payload,'$.fingerprint.identity'),json_extract(payload,'$.metadata.identity'),json_extract(payload,'$.i')),json_object('kind',kind,'logical',COALESCE(json_extract(payload,'$.fingerprint.logical'),json_extract(payload,'$.metadata.logical'),json_extract(payload,'$.b')),'modified',modified,'reparse_tag',COALESCE(json_extract(payload,'$.fingerprint.reparse_tag'),json_extract(payload,'$.metadata.reparse_tag'),json_extract(payload,'$.t'),0)) FROM nodes WHERE scan_id=?1 AND id IN refreshed_nodes",[target_scan])?;
+    // Persistent paths may mix legacy UTF16 and WTF8. Build exact legacy keys
+    // one row at a time; path equality never replaces the identity checks below.
+    {
+        let mut paths = tx.prepare("SELECT scan_id,id,path FROM nodes WHERE (scan_id=?1 AND id IN refreshed_nodes) OR scan_id=?2")?;
+        let mut rows = paths.query(params![target_scan, staging_scan])?;
+        let mut insert =
+            tx.prepare("INSERT INTO refresh_paths(scan_id,id,path) VALUES(?1,?2,?3)")?;
+        while let Some(row) = rows.next()? {
+            let path =
+                crate::stored_path::decode(row.get(2)?).map_err(crate::stored_path::app_error)?;
+            insert.execute(params![
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                platform::encode_path(&path)
+            ])?;
+        }
+    }
+    tx.execute("INSERT INTO refresh_old SELECT k.path,n.id,COALESCE(json_extract(payload,'$.fingerprint.identity'),json_extract(payload,'$.metadata.identity'),json_extract(payload,'$.i')),json_object('kind',kind,'logical',COALESCE(json_extract(payload,'$.fingerprint.logical'),json_extract(payload,'$.metadata.logical'),json_extract(payload,'$.b')),'modified',modified,'reparse_tag',COALESCE(json_extract(payload,'$.fingerprint.reparse_tag'),json_extract(payload,'$.metadata.reparse_tag'),json_extract(payload,'$.t'),0)) FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id WHERE n.scan_id=?1 AND n.id IN refreshed_nodes",[target_scan])?;
     let max: i64 = tx.query_row(
         "SELECT COALESCE(MAX(id),0) FROM nodes WHERE scan_id=?1",
         [target_scan],
         |r| r.get(0),
     )?;
-    tx.execute("INSERT INTO refresh_ids(old_id,new_id) SELECT n.id,CASE WHEN n.id=1 THEN ?2 ELSE COALESCE((SELECT old.id FROM refresh_old old WHERE old.path=n.path AND (old.identity=COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) OR ((old.identity IS NULL OR COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) IS NULL) AND json_extract(old.fingerprint,'$.kind')=n.kind AND json_extract(old.fingerprint,'$.logical')=COALESCE(json_extract(n.payload,'$.fingerprint.logical'),json_extract(n.payload,'$.metadata.logical'),json_extract(n.payload,'$.b')) AND json_extract(old.fingerprint,'$.modified') IS n.modified AND json_extract(old.fingerprint,'$.reparse_tag')=COALESCE(json_extract(n.payload,'$.fingerprint.reparse_tag'),json_extract(n.payload,'$.metadata.reparse_tag'),json_extract(n.payload,'$.t'),0)))),n.id+?3) END FROM nodes n WHERE n.scan_id=?1",params![staging_scan,parse_id(scope_id)?,max])?;
+    tx.execute("INSERT INTO refresh_ids(old_id,new_id) SELECT n.id,CASE WHEN n.id=1 THEN ?2 ELSE COALESCE((SELECT old.id FROM refresh_old old WHERE old.path=k.path AND (old.identity=COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) OR ((old.identity IS NULL OR COALESCE(json_extract(n.payload,'$.fingerprint.identity'),json_extract(n.payload,'$.metadata.identity'),json_extract(n.payload,'$.i')) IS NULL) AND json_extract(old.fingerprint,'$.kind')=n.kind AND json_extract(old.fingerprint,'$.logical')=COALESCE(json_extract(n.payload,'$.fingerprint.logical'),json_extract(n.payload,'$.metadata.logical'),json_extract(n.payload,'$.b')) AND json_extract(old.fingerprint,'$.modified') IS n.modified AND json_extract(old.fingerprint,'$.reparse_tag')=COALESCE(json_extract(n.payload,'$.fingerprint.reparse_tag'),json_extract(n.payload,'$.metadata.reparse_tag'),json_extract(n.payload,'$.t'),0)))),n.id+?3) END FROM nodes n JOIN refresh_paths k ON k.scan_id=n.scan_id AND k.id=n.id WHERE n.scan_id=?1",params![staging_scan,parse_id(scope_id)?,max])?;
     tx.execute("DELETE FROM scan_errors WHERE scan_id=?1 AND CAST(json_extract(payload,'$.nodeId') AS INTEGER) IN refreshed_nodes",[target_scan])?;
     tx.execute("WITH RECURSIVE subtree(id) AS (SELECT id FROM nodes WHERE scan_id=?1 AND parent_id=?2 UNION ALL SELECT n.id FROM subtree s CROSS JOIN nodes n ON n.scan_id=?1 AND n.parent_id=s.id) DELETE FROM nodes WHERE scan_id=?1 AND id IN subtree",params![target_scan,parse_id(scope_id)?])?;
     // Unchanged paths and file identities retain IDs; replaced identities receive fresh IDs.
@@ -2597,13 +2614,30 @@ mod tests {
         let scan = service.start_scan(root.clone(), None).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let c = service.repo.connect().unwrap();
-        let id: i64 = c
-            .query_row(
-                "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
-                params![scan.scan_id, platform::encode_path(&child)],
-                |r| r.get(0),
-            )
+        // Staged dispatch may enter the reader hook before its row commits.
+        // Inspect only the committed prefix, retaining the metadata barrier.
+        let raw = crate::stored_path::encode(&child, crate::stored_path::Mode::from_environment())
             .unwrap();
+        let start = Instant::now();
+        let id: i64 = loop {
+            if let Some(id) = c
+                .query_row(
+                    "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
+                    params![scan.scan_id, raw],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    error => Err(error),
+                })
+                .unwrap()
+            {
+                break id;
+            }
+            assert!(start.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let partial = service
             .repo
             .node(&scan.scan_id, &id.to_string(), None)
@@ -2866,7 +2900,14 @@ mod tests {
             let child_id: i64 = c
                 .query_row(
                     "SELECT id FROM nodes WHERE scan_id=?1 AND path=?2",
-                    params![id, platform::encode_path(&child_path)],
+                    params![
+                        id,
+                        crate::stored_path::encode(
+                            &child_path,
+                            crate::stored_path::Mode::from_environment()
+                        )
+                        .unwrap()
+                    ],
                     |r| r.get(0),
                 )
                 .unwrap();

@@ -2848,7 +2848,7 @@ mod tests {
             child.4.as_mut().unwrap().allocated = Some(0);
             children.push(child);
         }
-        if path_codec == crate::stored_path::Mode::Wtf8 {
+        {
             let db = service.repo.connect().unwrap();
             let raw = crate::stored_path::encode(&root, path_codec).unwrap();
             db.execute(

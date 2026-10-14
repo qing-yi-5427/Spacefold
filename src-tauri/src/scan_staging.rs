@@ -1,4 +1,4 @@
-//! Experimental, batch-local preparation. No staged reference is a public node.
+//! Batch-local preparation. No staged reference is a public node.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -7,16 +7,16 @@ pub(super) const HOT_DIRECTORY_LIMIT: usize = 32;
 #[derive(Clone, Copy, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum Mode {
-    #[default]
     Off,
+    #[default]
     Staged,
 }
 impl Mode {
     pub(super) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("on") {
-            Self::Staged
-        } else {
+        if value == Some("off") {
             Self::Off
+        } else {
+            Self::Staged
         }
     }
     pub(super) fn enabled(self) -> bool {
@@ -329,8 +329,9 @@ mod tests {
                 .code,
             "SIZE_OUT_OF_RANGE"
         );
-        assert!(!Mode::from_override(None).enabled());
-        assert!(!Mode::from_override(Some("ON")).enabled());
+        assert!(Mode::from_override(None).enabled());
+        assert!(Mode::from_override(Some("ON")).enabled());
+        assert!(!Mode::from_override(Some("off")).enabled());
         assert!(Mode::from_override(Some("on")).enabled());
     }
 
