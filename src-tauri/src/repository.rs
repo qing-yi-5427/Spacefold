@@ -1628,6 +1628,45 @@ pub fn checked_add(a: i64, b: i64) -> Result<i64> {
         .filter(|v| *v >= 0)
         .ok_or_else(|| AppError::new("SIZE_OUT_OF_RANGE", "扫描合计超过支持的精确整数范围"))
 }
+#[cfg(test)]
+fn mutate_test_compact_payload(
+    c: &Connection,
+    scan: &str,
+    id: i64,
+    change: impl FnOnce(&mut TinyPayload),
+) {
+    let (mut record, kind, modified) = c
+        .query_row(
+            "SELECT payload,kind,modified FROM nodes WHERE scan_id=?1 AND id=?2",
+            params![scan, id],
+            |r| {
+                let value = r.get_ref(0)?;
+                let record = stored_metadata::compact_ref(value)
+                    .map_err(|e| stored_metadata::sql_error(0, value.data_type(), e))?
+                    .expect("known compact test fixture");
+                Ok((
+                    record,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    change(&mut record);
+    c.execute(
+        "UPDATE nodes SET payload=?3 WHERE scan_id=?1 AND id=?2",
+        params![
+            scan,
+            id,
+            stored_metadata::encode(
+                &record.metadata(kind, modified),
+                stored_metadata::Mode::from_environment()
+            )
+            .unwrap()
+        ],
+    )
+    .unwrap();
+}
 // Explicit SQL column inputs keep identity/path/aggregation choices visible.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_node(
@@ -3711,7 +3750,9 @@ mod directory_metadata_tests {
             let meta = platform::metadata(&file).unwrap();
             let mut c = service.repo.connect().unwrap();
             if failure == "identity" {
-                c.execute("UPDATE nodes SET payload=json_set(payload,'$.i','changed') WHERE scan_id=?1 AND id=2",[&scan]).unwrap();
+                mutate_test_compact_payload(&c, &scan, 2, |record| {
+                    record.i = Some("changed".into())
+                });
             }
             if failure == "overflow" {
                 c.execute(
@@ -4253,7 +4294,9 @@ mod directory_metadata_tests {
         assert_eq!(after.discovered_count, before.discovered_count);
         assert_eq!(after.logical_total_bytes, before.logical_total_bytes);
         let tx = c.transaction().unwrap();
-        tx.execute("UPDATE nodes SET payload=json_set(payload,'$.i','new-row-identity') WHERE scan_id=?1 AND id=2",[&scan]).unwrap();
+        mutate_test_compact_payload(&tx, &scan, 2, |record| {
+            record.i = Some("new-row-identity".into())
+        });
         assert_eq!(
             apply_directory_metadata(
                 &tx,
@@ -5886,11 +5929,7 @@ mod view_snapshot_tests {
             [&scan_id],
         )
         .unwrap();
-        tx.execute(
-            "UPDATE nodes SET payload=json_set(payload,'$.b',117) WHERE scan_id=?1 AND id=3",
-            [&scan_id],
-        )
-        .unwrap();
+        mutate_test_compact_payload(&tx, &scan_id, 3, |record| record.b = 117);
         tx.execute(
             "UPDATE scans SET revision=revision+1 WHERE id=?1",
             [&scan_id],

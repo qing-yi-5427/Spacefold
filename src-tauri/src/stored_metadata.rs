@@ -17,16 +17,16 @@ const METHODS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mode {
-    #[default]
     Json,
+    #[default]
     Binary,
 }
 impl Mode {
     pub(crate) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("binary") {
-            Self::Binary
-        } else {
+        if value == Some("json") {
             Self::Json
+        } else {
+            Self::Binary
         }
     }
     pub(crate) fn from_environment() -> Self {
@@ -565,8 +565,15 @@ mod tests {
         }
         roundtrip(&record());
         assert_eq!(Mode::from_override(Some("binary")), Mode::Binary);
-        for value in [None, Some("off"), Some("BINARY"), Some("binary ")] {
-            assert_eq!(Mode::from_override(value), Mode::Json);
+        assert_eq!(Mode::from_override(Some("json")), Mode::Json);
+        for value in [
+            None,
+            Some("off"),
+            Some("JSON"),
+            Some("json "),
+            Some("binary "),
+        ] {
+            assert_eq!(Mode::from_override(value), Mode::Binary);
         }
     }
     #[test]

@@ -17,16 +17,16 @@ const COMPONENT_VERSION: u8 = 2;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum FileStorage {
-    #[default]
     Full,
+    #[default]
     Basename,
 }
 impl FileStorage {
     pub(crate) fn from_override(value: Option<&str>) -> Self {
-        if value == Some("basename") {
-            Self::Basename
-        } else {
+        if value == Some("full") {
             Self::Full
+        } else {
+            Self::Basename
         }
     }
     pub(crate) fn from_environment() -> Self {
@@ -344,8 +344,9 @@ mod tests {
             FileStorage::from_override(Some("basename")),
             FileStorage::Basename
         );
-        for value in [None, Some("full"), Some("BASENAME"), Some("basename ")] {
-            assert_eq!(FileStorage::from_override(value), FileStorage::Full);
+        assert_eq!(FileStorage::from_override(Some("full")), FileStorage::Full);
+        for value in [None, Some("FULL"), Some("full "), Some("basename ")] {
+            assert_eq!(FileStorage::from_override(value), FileStorage::Basename);
         }
         for parent in [
             r"C:\MiXeD",

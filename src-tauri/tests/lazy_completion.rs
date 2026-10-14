@@ -63,6 +63,32 @@ fn raw_flag(repo: &Repository, id: &str, node: i64) -> i64 {
         .unwrap()
 }
 
+fn unknown_links_legacy_payload(repo: &Repository, id: &str, node: i64) -> String {
+    let stored = repo.node(id, &node.to_string(), None).unwrap();
+    let metadata = platform::Metadata {
+        kind: stored.fingerprint.kind,
+        logical: stored.fingerprint.logical,
+        allocated: stored
+            .node
+            .allocated_bytes
+            .map(|value| value.parse().unwrap()),
+        modified: stored.fingerprint.modified,
+        identity: stored.fingerprint.identity,
+        links: None,
+        attributes: stored.fingerprint.attributes,
+        reparse_tag: stored.fingerprint.reparse_tag,
+        link_type: stored.node.link_type,
+        link_target: stored.node.link_target,
+        cloud_state: stored.node.cloud_state,
+        allocation_method: stored.node.allocation_method,
+        recurse: true,
+    };
+    format!(
+        "{{\"v\":2,\"metadata\":{}}}",
+        serde_json::to_string(&metadata).unwrap()
+    )
+}
+
 #[test]
 fn persisted_zero_one_and_deferred_flags_are_consistent_across_every_read_api() {
     let (_temp, service, _root, id) = fixture();
@@ -248,8 +274,12 @@ fn partial_replacement_preserves_unscanned_siblings_and_root_replacement_materia
             )
             .unwrap();
             c.execute(
-                "UPDATE nodes SET payload=json_remove(payload,'$.n') WHERE scan_id=?1 AND id=?2",
-                rusqlite::params![id, node],
+                "UPDATE nodes SET payload=?3 WHERE scan_id=?1 AND id=?2",
+                rusqlite::params![
+                    id,
+                    node,
+                    unknown_links_legacy_payload(&service.repo, &id, node)
+                ],
             )
             .unwrap();
         }
@@ -274,8 +304,8 @@ fn partial_replacement_preserves_unscanned_siblings_and_root_replacement_materia
         c.execute("INSERT INTO directory_metadata_pending VALUES(?1,1)", [&id])
             .unwrap();
         c.execute(
-            "UPDATE nodes SET payload=json_remove(payload,'$.n') WHERE scan_id=?1 AND id=1",
-            [&id],
+            "UPDATE nodes SET payload=?2 WHERE scan_id=?1 AND id=1",
+            rusqlite::params![id, unknown_links_legacy_payload(&service.repo, &id, 1)],
         )
         .unwrap();
         let staged = insert_tree(&service, &root);
