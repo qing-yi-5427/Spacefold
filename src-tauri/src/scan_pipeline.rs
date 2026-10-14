@@ -1231,6 +1231,14 @@ fn merge_writer_profile(target: &mut ScanProfile, source: ScanProfile) {
     target.insert_ms += source.insert_ms;
     target.sql_insert_ms += source.sql_insert_ms;
     target.pending_insert_ms += source.pending_insert_ms;
+    target.bulk_file_statements += source.bulk_file_statements;
+    target.bulk_file_rows += source.bulk_file_rows;
+    target.bulk_binding_peak_bytes = target
+        .bulk_binding_peak_bytes
+        .max(source.bulk_binding_peak_bytes);
+    target.bulk_fixed_scratch_bytes = target
+        .bulk_fixed_scratch_bytes
+        .max(source.bulk_fixed_scratch_bytes);
     target.encode_ms += source.encode_ms;
     target.directory_metadata_apply_ms += source.directory_metadata_apply_ms;
     target.directory_metadata_updates += source.directory_metadata_updates;
@@ -1312,6 +1320,7 @@ pub(super) fn scan(
         staged_insert_mode: staged_mode_for(root),
         stored_path_codec: crate::stored_path::Mode::from_environment(),
         metadata_codec: crate::stored_metadata::Mode::from_environment(),
+        file_insert_mode: crate::repository::FileInsertMode::from_environment(),
         checkpoint_mode: checkpoint_mode.name(),
         output_slots,
         output_slot_storage_upper_bound_bytes: output_slots
@@ -1375,6 +1384,7 @@ pub(super) fn scan(
         staged_insert_mode: profile.staged_insert_mode,
         stored_path_codec: profile.stored_path_codec,
         metadata_codec: profile.metadata_codec,
+        file_insert_mode: profile.file_insert_mode,
         defer_commit_observation: true,
         started: Some(started),
         reader_wait_probe: profile.reader_wait_probe.clone(),
