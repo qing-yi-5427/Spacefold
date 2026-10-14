@@ -113,6 +113,7 @@ fn consumed_limit_override(value: Option<&str>) -> usize {
         Some("256") => 256,
         Some("1024") => 1024,
         Some("2048") => 2048,
+        Some("4096") => 4096,
         _ => DEFAULT_CONSUMED_LIMIT,
     }
 }
@@ -3673,15 +3674,19 @@ mod directory_queue_tests {
     }
 
     #[test]
-    fn consumed_override_only_accepts_the_three_bounded_comparison_values() {
+    fn consumed_override_only_accepts_exact_bounded_comparison_values() {
         assert_eq!(consumed_limit_override(None), 1024);
         assert_eq!(consumed_limit_override(Some("256")), 256);
         assert_eq!(consumed_limit_override(Some("1024")), 1024);
         assert_eq!(consumed_limit_override(Some("2048")), 2048);
+        assert_eq!(consumed_limit_override(Some("4096")), 4096);
         for value in [
             None,
             Some("0"),
-            Some("4096"),
+            Some("4095"),
+            Some("8192"),
+            Some("4096 "),
+            Some("04096"),
             Some("-1"),
             Some("garbage"),
             Some("1024 "),
