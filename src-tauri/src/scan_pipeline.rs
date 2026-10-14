@@ -166,7 +166,8 @@ struct WriteBatch {
     metadata: Vec<DirectoryMetadataUpdate>,
     errors: Vec<PendingScanError>,
     consumed: Vec<i64>,
-    staged_dispatches: usize,
+    staged_ready_cursor: usize,
+    staged_ready_count: usize,
     heap_bytes: usize,
     started: Instant,
 }
@@ -177,7 +178,8 @@ impl WriteBatch {
             metadata: Vec::with_capacity(2048),
             errors: Vec::with_capacity(ERROR_LIMIT),
             consumed: Vec::with_capacity(consumed_limit),
-            staged_dispatches: 0,
+            staged_ready_cursor: 0,
+            staged_ready_count: 0,
             heap_bytes: 0,
             started: Instant::now(),
         }
@@ -409,12 +411,99 @@ struct Collector<'a> {
     profile: &'a mut ScanProfile,
     batch: WriteBatch,
     queue: DirectoryQueueCursor,
+    staged_active: Vec<i64>,
     metadata: &'a Receiver<MetadataMessage>,
     pending: usize,
     reserved_metadata: usize,
     consumed_limit: usize,
 }
 impl Collector<'_> {
+    fn dispatch_staged(
+        &mut self,
+        requests: &Sender<(i64, PathBuf, u32, Option<String>, bool)>,
+        in_flight: &mut usize,
+        in_flight_limit: usize,
+        job: &JobRuntime,
+    ) -> Result<()> {
+        if !self.profile.staged_insert_mode.enabled() {
+            return Ok(());
+        }
+        while *in_flight < in_flight_limit
+            && self.staged_active.len() < staging::HOT_DIRECTORY_LIMIT
+            && self.batch.consumed.len() < self.consumed_limit
+            && self.batch.staged_ready_cursor < self.batch.rows.len()
+        {
+            if job.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            let index = self.batch.staged_ready_cursor;
+            self.batch.staged_ready_cursor += 1;
+            let row = &self.batch.rows[index];
+            let Ok(metadata) = &row.4 else {
+                continue;
+            };
+            if !metadata.defer_directory_metadata() {
+                continue;
+            }
+            self.batch.staged_ready_count = self
+                .batch
+                .staged_ready_count
+                .checked_sub(1)
+                .ok_or_else(|| AppError::new("WRITER_PROTOCOL", "暂存候选计数不一致"))?;
+            let bytes = row
+                .2
+                .capacity()
+                .saturating_add(metadata.identity.as_ref().map_or(0, String::capacity));
+            // Oversized/depth-limited candidates stay in this packet and use
+            // the original committed queue after its successful transaction.
+            if row.3 >= 4096 || bytes > BATCH_PATH_BYTES / in_flight_limit.max(1) {
+                continue;
+            }
+            if self.port.ledger_count >= self.port.ledger_limit {
+                return Err(AppError::new("WRITER_PROTOCOL", "扫描派发记录超过内存预算"));
+            }
+            let task = staging::ReadTask::Staged(staging::StagedDirectory(row.0));
+            let id = task.id();
+            let path = row.2.clone();
+            let expected = metadata.identity.clone();
+            let depth = row.3;
+            self.connection
+                .execute("INSERT INTO dispatched_dirs(id) VALUES(?1)", [id])?;
+            self.batch.consumed.push(id);
+            self.port.ledger_count += 1;
+            #[cfg(test)]
+            {
+                let fault = TEST_FAULT
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|fault| {
+                        fault.scan_id == self.scan_id
+                            && fault.data_dir == self.service.repo.data_dir
+                            && fault.before_staged_send
+                    })
+                    .cloned();
+                if let Some(fault) = fault {
+                    fault.entered.send(()).unwrap();
+                    fault.release.recv().unwrap();
+                }
+            }
+            if requests.send((id, path, depth, expected, true)).is_err() {
+                if job.cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                return Err(AppError::new("WORKER_FAILED", "枚举线程已退出"));
+            }
+            self.staged_active.push(id);
+            *in_flight += 1;
+            self.profile.staged_directory_dispatches += 1;
+            self.profile.staged_directory_active_peak = self
+                .profile
+                .staged_directory_active_peak
+                .max(self.staged_active.len());
+        }
+        Ok(())
+    }
     fn harvest(&mut self) -> Result<()> {
         if self.port.poll(self.connection)? {
             self.queue.reset_after_flush();
@@ -449,6 +538,18 @@ impl Collector<'_> {
             self.flush_ready()?;
         }
         self.batch.heap_bytes += bytes;
+        if self.profile.staged_insert_mode.enabled()
+            && row
+                .4
+                .as_ref()
+                .is_ok_and(platform::Metadata::defer_directory_metadata)
+        {
+            self.batch.staged_ready_count += 1;
+            self.profile.staged_ready_candidate_peak = self
+                .profile
+                .staged_ready_candidate_peak
+                .max(self.batch.staged_ready_count);
+        }
         self.batch.rows.push(row);
         self.profile.peak_batch_path_bytes = self
             .profile
@@ -637,6 +738,10 @@ fn collect_directories(
         }
         collector.harvest()?;
         collector.flush_if_full()?;
+        collector.dispatch_staged(requests, &mut in_flight, in_flight_limit, job)?;
+        if job.cancel.load(Ordering::Acquire) {
+            break;
+        }
         if refill && in_flight < in_flight_limit {
             let queue_started = collector.profile.enabled.then(Instant::now);
             let limit = (in_flight_limit - in_flight)
@@ -821,10 +926,17 @@ fn collect_directories(
                     error,
                 })?;
             }
-            DirectoryMessage::Done(timings) => {
+            DirectoryMessage::Done(id, timings) => {
                 in_flight = in_flight
                     .checked_sub(1)
                     .ok_or_else(|| AppError::new("WRITER_PROTOCOL", "目录完成通知数量不一致"))?;
+                if let Some(index) = collector
+                    .staged_active
+                    .iter()
+                    .position(|active| *active == id)
+                {
+                    collector.staged_active.swap_remove(index);
+                }
                 #[cfg(test)]
                 if let Some(counter) = TEST_FAULT
                     .lock()
@@ -873,74 +985,12 @@ fn collect_directories(
                         .ok_or_else(|| AppError::new("SIZE_OUT_OF_RANGE", "节点数量超出上限"))?;
                     if let Some(metadata) = entry.hint.filter(|_| fast) {
                         collector.add_row((id, parent, path, depth + 1, Ok(metadata), encoded))?;
-                        // Speculative work is admitted only from a backend-owned
-                        // row still in the current packet. It remains invisible
-                        // to all Repository/UI/file-operation readers.
-                        if collector.profile.staged_insert_mode.enabled()
-                            && in_flight < in_flight_limit
-                            && collector.batch.staged_dispatches < staging::HOT_DIRECTORY_LIMIT
-                            && collector.batch.consumed.len() < collector.consumed_limit
-                            && depth + 1 < 4096
-                        {
-                            let row = collector.batch.rows.last().unwrap();
-                            let metadata = row.4.as_ref().unwrap();
-                            let request_bytes = row.2.capacity().saturating_add(
-                                metadata.identity.as_ref().map_or(0, String::capacity),
-                            );
-                            if metadata.defer_directory_metadata()
-                                && request_bytes <= BATCH_PATH_BYTES / in_flight_limit.max(1)
-                            {
-                                let task = staging::ReadTask::Staged(staging::StagedDirectory(id));
-                                let task_id = task.id();
-                                if collector.port.ledger_count >= collector.port.ledger_limit {
-                                    return Err(AppError::new(
-                                        "WRITER_PROTOCOL",
-                                        "扫描派发记录超过内存预算",
-                                    ));
-                                }
-                                let requested_path = row.2.clone();
-                                let expected = metadata.identity.clone();
-                                collector.connection.execute(
-                                    "INSERT INTO dispatched_dirs(id) VALUES(?1)",
-                                    [task_id],
-                                )?;
-                                collector.batch.consumed.push(task_id);
-                                collector.batch.staged_dispatches += 1;
-                                collector.profile.staged_directory_peak_per_packet = collector
-                                    .profile
-                                    .staged_directory_peak_per_packet
-                                    .max(collector.batch.staged_dispatches);
-                                collector.port.ledger_count += 1;
-                                #[cfg(test)]
-                                {
-                                    let fault = TEST_FAULT
-                                        .lock()
-                                        .unwrap()
-                                        .as_ref()
-                                        .filter(|fault| {
-                                            fault.scan_id == collector.scan_id
-                                                && fault.data_dir == collector.service.repo.data_dir
-                                                && fault.before_staged_send
-                                        })
-                                        .cloned();
-                                    if let Some(fault) = fault {
-                                        fault.entered.send(()).unwrap();
-                                        fault.release.recv().unwrap();
-                                    }
-                                }
-                                if requests
-                                    .send((task_id, requested_path, depth + 1, expected, true))
-                                    .is_err()
-                                {
-                                    if job.cancel.load(Ordering::Acquire) {
-                                        break 'collect;
-                                    }
-                                    return Err(AppError::new("WORKER_FAILED", "枚举线程已退出"));
-                                }
-                                in_flight += 1;
-                                collector.profile.staged_directory_dispatches += 1;
-                            }
-                        }
+                        collector.dispatch_staged(
+                            requests,
+                            &mut in_flight,
+                            in_flight_limit,
+                            job,
+                        )?;
                     } else {
                         // A dispatched path remains in the collection budget
                         // until its complete result is accepted into a packet.
@@ -1469,6 +1519,7 @@ pub(super) fn scan(
             profile: &mut profile,
             batch: WriteBatch::new(consumed_limit),
             queue: DirectoryQueueCursor::default(),
+            staged_active: Vec::new(),
             metadata: &metadata_rx,
             pending: 0,
             reserved_metadata: 0,
@@ -1570,7 +1621,7 @@ pub(super) fn scan(
                 profile.staged_directory_dispatches,
                 profile.staged_metadata_inserts,
                 profile.staged_internal_edges,
-                profile.staged_directory_peak_per_packet,
+                profile.staged_directory_active_peak,
             ],
         );
     }
@@ -2351,6 +2402,7 @@ mod tests {
                 profile: &mut profile,
                 batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
                 queue: DirectoryQueueCursor::default(),
+                staged_active: Vec::new(),
                 metadata: &metadata_rx,
                 pending: 0,
                 reserved_metadata: 0,
@@ -2570,13 +2622,26 @@ mod tests {
 
     #[test]
     fn staged_collector_consumes_real_done_before_commit_and_ack_without_repeating_the_directory() {
+        exercise_staged_done_collector(1);
+    }
+    #[test]
+    fn staged_active_frontier_reuses_slots_for_96_directories_in_one_uncommitted_packet() {
+        exercise_staged_done_collector(96);
+    }
+    fn exercise_staged_done_collector(directory_count: usize) {
         let _control = fault_control();
         let (_temp, service, root, id) = setup();
-        let mut child = row(2, &root, "done-child");
-        fs::write(child.2.join("inside.bin"), b"abc").unwrap();
-        let full = platform::metadata(&child.2).unwrap();
-        child.4.as_mut().unwrap().links = None;
-        child.4.as_mut().unwrap().allocated = Some(0);
+        let mut children = Vec::new();
+        let mut complete = std::collections::BTreeMap::new();
+        for index in 0..directory_count {
+            let node = index as i64 + 2;
+            let mut child = row(node, &root, &format!("done-child-{index}"));
+            fs::write(child.2.join("inside.bin"), b"abc").unwrap();
+            complete.insert(node, platform::metadata(&child.2).unwrap());
+            child.4.as_mut().unwrap().links = None;
+            child.4.as_mut().unwrap().allocated = Some(0);
+            children.push(child);
+        }
         let read = read_connection(&service);
         let c = service.repo.connect().unwrap();
         c.execute_batch("CREATE TEMP TABLE consumed_dirs(id INTEGER PRIMARY KEY);")
@@ -2627,63 +2692,71 @@ mod tests {
                 };
                 let root_task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                 assert_eq!(root_task.0, 1);
-                let bytes = child.2.capacity()
-                    + metadata_owned_bytes(child.4.as_ref().ok())
-                    + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
-                output
-                    .send_entries(
-                        1,
-                        root_task.1,
-                        0,
-                        vec![(
+                let bytes = children
+                    .iter()
+                    .map(|child| child.2.capacity() + metadata_owned_bytes(child.4.as_ref().ok()))
+                    .sum::<usize>()
+                    + directory_count
+                        * std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+                let entries = children
+                    .into_iter()
+                    .map(|child| {
+                        (
                             platform::DirectoryEntry {
                                 path: child.2,
                                 hint: child.4.ok(),
                             },
                             None,
-                        )],
-                        bytes,
-                        &reader_entries,
-                    )
+                        )
+                    })
+                    .collect();
+                output
+                    .send_entries(1, root_task.1, 0, entries, bytes, &reader_entries)
                     .unwrap();
                 output
-                    .send(DirectoryMessage::Done(ReaderTimings::default()))
+                    .send(DirectoryMessage::Done(1, ReaderTimings::default()))
                     .unwrap();
-                let task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-                assert_eq!(task.0, 2);
-                output
-                    .send(DirectoryMessage::Metadata(DirectoryMetadataUpdate {
-                        id: 2,
-                        expected_identity: task.3.unwrap(),
-                        result: Ok(full),
-                    }))
-                    .unwrap();
-                let path = task.1.join("inside.bin");
-                let metadata = platform::metadata(&path).unwrap();
-                let bytes = path.capacity()
-                    + metadata_owned_bytes(Some(&metadata))
-                    + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
-                output
-                    .send_entries(
-                        2,
-                        task.1,
-                        1,
-                        vec![(
-                            platform::DirectoryEntry {
-                                path,
-                                hint: Some(metadata),
-                            },
-                            None,
-                        )],
-                        bytes,
-                        &reader_entries,
-                    )
-                    .unwrap();
-                output
-                    .send(DirectoryMessage::Done(ReaderTimings::default()))
-                    .unwrap();
-                // The coordinator must finish after these two real Done
-                // messages. Any redispatch would produce a third request.
+                for _ in 0..directory_count {
+                    let task = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    let node = task.0;
+                    let full = complete
+                        .remove(&node)
+                        .expect("staged directory requested exactly once");
+                    output
+                        .send(DirectoryMessage::Metadata(DirectoryMetadataUpdate {
+                            id: node,
+                            expected_identity: task.3.unwrap(),
+                            result: Ok(full),
+                        }))
+                        .unwrap();
+                    let path = task.1.join("inside.bin");
+                    let metadata = platform::metadata(&path).unwrap();
+                    let bytes = path.capacity()
+                        + metadata_owned_bytes(Some(&metadata))
+                        + std::mem::size_of::<(platform::DirectoryEntry, Option<EncodedNode>)>();
+                    output
+                        .send_entries(
+                            node,
+                            task.1,
+                            1,
+                            vec![(
+                                platform::DirectoryEntry {
+                                    path,
+                                    hint: Some(metadata),
+                                },
+                                None,
+                            )],
+                            bytes,
+                            &reader_entries,
+                        )
+                        .unwrap();
+                    output
+                        .send(DirectoryMessage::Done(node, ReaderTimings::default()))
+                        .unwrap();
+                }
+                assert!(complete.is_empty());
+                // All Done messages came through the actual collector. No
+                // directory may be dispatched a second time after the ACK.
                 assert!(request_rx.recv_timeout(Duration::from_millis(300)).is_err());
             });
             let observed_service = &service;
@@ -2691,13 +2764,16 @@ mod tests {
             let observer = scope.spawn(move || {
                 let mut release = ReleaseOnDrop(Some(release));
                 entered.recv_timeout(Duration::from_secs(3)).unwrap();
-                assert_eq!(done_messages.load(Ordering::SeqCst), 2);
+                assert_eq!(done_messages.load(Ordering::SeqCst), directory_count + 1);
                 let parent = observed_service.repo.node(observed_id, "2", None).unwrap();
                 assert_eq!(parent.node.logical_total_bytes, "3");
                 assert_eq!(parent.node.file_count, "1");
                 assert_eq!(parent.node.children_count, "1");
                 assert!(parent.node.link_count.is_some());
-                assert!(observed_service.repo.node(observed_id, "3", None).is_ok());
+                assert!(observed_service
+                    .repo
+                    .node(observed_id, &(directory_count + 2).to_string(), None)
+                    .is_ok());
                 let database = observed_service.repo.connect().unwrap();
                 assert_eq!(
                     database
@@ -2724,11 +2800,15 @@ mod tests {
                 profile: &mut profile,
                 batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
                 queue: DirectoryQueueCursor::default(),
+                staged_active: Vec::new(),
                 metadata: &metadata_rx,
                 pending: 0,
                 reserved_metadata: 0,
                 consumed_limit: DEFAULT_CONSUMED_LIMIT,
             };
+            // Hold the publication deadline only in this controlled fixture;
+            // the separate byte/row/deadline test covers actual fallback.
+            collector.batch.started = Instant::now() + Duration::from_secs(60);
             collect_directories(
                 &mut collector,
                 &root,
@@ -2742,11 +2822,21 @@ mod tests {
             .unwrap();
             assert!(collector.batch.empty());
             assert_eq!(collector.port.ledger_count, 0);
+            assert_eq!(collector.port.committed_batches, 1);
+            assert!(collector.staged_active.is_empty());
             drop(collector);
             drop(requests);
             emitter.join().unwrap();
             observer.join().unwrap();
-            assert_eq!(profile.staged_directory_dispatches, 1);
+            assert_eq!(profile.staged_directory_dispatches, directory_count);
+            assert!(profile.staged_directory_active_peak <= staging::HOT_DIRECTORY_LIMIT);
+            if directory_count > staging::HOT_DIRECTORY_LIMIT {
+                assert_eq!(
+                    profile.staged_directory_active_peak,
+                    staging::HOT_DIRECTORY_LIMIT
+                );
+                assert!(profile.staged_ready_candidate_peak > staging::HOT_DIRECTORY_LIMIT);
+            }
             assert_eq!(
                 read.query_row("SELECT COUNT(*) FROM dispatched_dirs", [], |row| row
                     .get::<_, i64>(0))
@@ -2759,9 +2849,12 @@ mod tests {
             port.commands.send(WriteCommand::Finish).unwrap();
             drop(port);
             let result = writer.join().unwrap().unwrap();
-            assert_eq!(result.scan.discovered_count, "3");
-            assert_eq!(result.profile.staged_metadata_inserts, 1);
-            assert_eq!(result.profile.staged_internal_edges, 1);
+            assert_eq!(
+                result.scan.discovered_count,
+                (directory_count * 2 + 1).to_string()
+            );
+            assert_eq!(result.profile.staged_metadata_inserts, directory_count);
+            assert_eq!(result.profile.staged_internal_edges, directory_count);
         });
     }
 
@@ -2806,6 +2899,7 @@ mod tests {
                 profile: &mut profile,
                 batch: WriteBatch::new(DEFAULT_CONSUMED_LIMIT),
                 queue: DirectoryQueueCursor::default(),
+                staged_active: Vec::new(),
                 metadata: &metadata,
                 pending: 0,
                 reserved_metadata: 0,

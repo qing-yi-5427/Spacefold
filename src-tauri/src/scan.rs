@@ -60,7 +60,8 @@ struct ScanProfile {
     directory_write_mode: crate::repository::DirectoryWriteMode,
     staged_insert_mode: staging::Mode,
     staged_directory_dispatches: usize,
-    staged_directory_peak_per_packet: usize,
+    staged_directory_active_peak: usize,
+    staged_ready_candidate_peak: usize,
     staged_metadata_inserts: usize,
     staged_internal_edges: usize,
     staged_counter_storage_upper_bound_bytes: usize,
@@ -699,7 +700,7 @@ enum DirectoryMessage {
         stage: &'static str,
         error: AppError,
     },
-    Done(ReaderTimings),
+    Done(i64, ReaderTimings),
     Fatal(AppError),
 }
 impl DirectoryMessage {
@@ -714,7 +715,7 @@ impl DirectoryMessage {
             Self::Entries { path, .. } => path.capacity(),
             Self::Error { path, error, .. } => path.capacity() + error_bytes(error),
             Self::Fatal(error) => error_bytes(error),
-            Self::Done(_) => 0,
+            Self::Done(..) => 0,
         }
     }
 }
@@ -801,7 +802,7 @@ impl ReaderOutput<'_> {
                 let kind = match &message.message {
                     DirectoryMessage::Metadata(_) => 0,
                     DirectoryMessage::Entries { .. } => 1,
-                    DirectoryMessage::Done(_) => 2,
+                    DirectoryMessage::Done(..) => 2,
                     DirectoryMessage::Error { .. } => 3,
                     DirectoryMessage::Fatal(_) => 4,
                 };
@@ -921,7 +922,10 @@ fn read_directories(
                             break;
                         }
                         if failed {
-                            if output.send(DirectoryMessage::Done(timings)).is_err() {
+                            if output
+                                .send(DirectoryMessage::Done(parent, timings))
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -939,7 +943,10 @@ fn read_directories(
                 {
                     break;
                 }
-                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                if output
+                    .send(DirectoryMessage::Done(parent, timings))
+                    .is_err()
+                {
                     break;
                 }
                 continue;
@@ -987,7 +994,10 @@ fn read_directories(
                 {
                     break;
                 }
-                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                if output
+                    .send(DirectoryMessage::Done(parent, timings))
+                    .is_err()
+                {
                     break;
                 }
                 continue;
@@ -1004,7 +1014,10 @@ fn read_directories(
                 break;
             }
             if failed {
-                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                if output
+                    .send(DirectoryMessage::Done(parent, timings))
+                    .is_err()
+                {
                     break;
                 }
                 continue;
@@ -1029,7 +1042,10 @@ fn read_directories(
                 {
                     break;
                 }
-                if output.send(DirectoryMessage::Done(timings)).is_err() {
+                if output
+                    .send(DirectoryMessage::Done(parent, timings))
+                    .is_err()
+                {
                     break;
                 }
                 continue;
@@ -1116,7 +1132,10 @@ fn read_directories(
         {
             break;
         }
-        if output.send(DirectoryMessage::Done(timings)).is_err() {
+        if output
+            .send(DirectoryMessage::Done(parent, timings))
+            .is_err()
+        {
             break;
         }
     }
@@ -1704,7 +1723,7 @@ fn scan_sync_serial_with_queue_capacity(
                             stage,
                             error,
                         } => record_error(service, &c, scan_id, parent, &path, stage, error)?,
-                        DirectoryMessage::Done(timings) => {
+                        DirectoryMessage::Done(_id, timings) => {
                             in_flight -= 1;
                             profile.enumerate_ms += timings.enumerate_ms;
                             profile.directory_check_ms += timings.directory_check_ms;
@@ -3117,10 +3136,13 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         sender
             .send(ReaderMessage {
-                message: DirectoryMessage::Done(ReaderTimings {
-                    enumerate_ms: 0.0,
-                    ..Default::default()
-                }),
+                message: DirectoryMessage::Done(
+                    0,
+                    ReaderTimings {
+                        enumerate_ms: 0.0,
+                        ..Default::default()
+                    },
+                ),
                 auxiliary_permit: None,
             })
             .unwrap();
@@ -3140,10 +3162,13 @@ mod tests {
             };
             for value in [1.0, 2.0] {
                 if output
-                    .send(DirectoryMessage::Done(ReaderTimings {
-                        enumerate_ms: value,
-                        ..Default::default()
-                    }))
+                    .send(DirectoryMessage::Done(
+                        0,
+                        ReaderTimings {
+                            enumerate_ms: value,
+                            ..Default::default()
+                        },
+                    ))
                     .is_err()
                 {
                     return value;
@@ -3160,7 +3185,7 @@ mod tests {
         }
         assert_eq!(probe.snapshot().active_waiters[1], 1);
         for expected in [0.0, 1.0] {
-            let DirectoryMessage::Done(timing) = receiver
+            let DirectoryMessage::Done(_, timing) = receiver
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .message
@@ -3171,10 +3196,13 @@ mod tests {
         }
         filler
             .send(ReaderMessage {
-                message: DirectoryMessage::Done(ReaderTimings {
-                    enumerate_ms: 99.0,
-                    ..Default::default()
-                }),
+                message: DirectoryMessage::Done(
+                    0,
+                    ReaderTimings {
+                        enumerate_ms: 99.0,
+                        ..Default::default()
+                    },
+                ),
                 auxiliary_permit: None,
             })
             .unwrap();
